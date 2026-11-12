@@ -539,6 +539,29 @@ class IntegrationTest(unittest.TestCase):
                     _tmux("display-message", "-p", "-t", pane_id, "#{pane_id}")[1].strip()
                     == pane_id, "v1 pane %s survived the migration" % pane_id)
 
+    def test_worker_window_counts_for_zero_through_eight_workers(self):
+        for count in (0, 1, 2, 3, 4, 8):
+            with self.subTest(workers=count):
+                with Sandbox() as box:
+                    if count:
+                        box.add_delegation("deleg_cnt%05d" % count,
+                                           [{"goal": "w%d" % i} for i in range(count)])
+                    self.assertEqual(box.cli("up"), 0)
+                    self.assertTrue(wait_for(
+                        lambda: len(box.layout().get("tail_panes") or {}) == count,
+                        timeout=20))
+                    overview = box.window("hx:workers")
+                    self.assertEqual(len(box.panes_of(overview["id"])), 1,
+                                     "overview window must hold one pane")
+                    worker_wins = [w for w in box.windows()
+                                   if w["name"].startswith("hx:worker-")]
+                    self.assertEqual(len(worker_wins), (count + 1) // 2,
+                                     "%d workers must fill ceil(%d/2) windows"
+                                     % (count, count))
+                    for win in worker_wins:
+                        self.assertLessEqual(len(box.panes_of(win["id"])), 2,
+                                             "%s has more than two panes" % win["name"])
+
     # ---- 3. events -------------------------------------------------------
     def test_up_rebuilds_a_lost_overview_without_repurposing_survivors(self):
         with Sandbox() as box:

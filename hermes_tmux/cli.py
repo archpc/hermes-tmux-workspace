@@ -551,8 +551,15 @@ def cmd_worker(args) -> int:
     if idx < 1 or idx > len(panes):
         print("hermes-tmux: no worker pane %d (have %d)" % (idx, len(panes)))
         return 1
-    tmuxio.select_pane(panes[idx - 1])
-    print("hermes-tmux: focused worker pane %d (%s)" % (idx, panes[idx - 1]))
+    pane_id = panes[idx - 1]
+    # A worker lives in its own window now. `select-pane` alone does not switch
+    # the session's current window when the target is elsewhere, so focus is two
+    # explicit steps: the window, then the pane inside it.
+    window_id = tmuxio.format_of(pane_id, "#{window_id}")
+    if window_id:
+        tmuxio.select_window(window_id)
+    tmuxio.select_pane(pane_id)
+    print("hermes-tmux: focused worker pane %d (%s)" % (idx, pane_id))
     return 0
 
 
