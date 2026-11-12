@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import time
 import unittest
 
 from tests.test_tmux_integration import (
@@ -45,6 +47,45 @@ class SessionLivenessTest(unittest.TestCase):
             self.assertTrue(
                 wait_for(lambda: not _pid_alive(pid), timeout=30),
                 "the coordinator outlived the session it served (pid %s)" % pid)
+
+
+class ServerIdentityTest(unittest.TestCase):
+    """A coordinator from a crashed server must not serve the next one.
+
+    tmux servers that die without killing their jobs (SIGKILL, crash) leave the
+    coordinator running while a new server answers on the same socket. Window ids
+    on the new server come from a fresh sequence, so a coordinator that keeps
+    reconciling renames or splits into windows it never created, and duplicates
+    its own tail panes. Identity is the server pid.
+    """
+
+    def test_coordinator_exits_after_its_server_is_replaced(self):
+        with Sandbox() as box:
+            box.add_delegation("deleg_crash001", [{"goal": "crash"}])
+            self.assertEqual(box.cli("up"), 0)
+            key = next(d.name for d in (box.home / "cache/hermes-tmux/sessions").iterdir())
+            pid_file = box.home / "cache/hermes-tmux/sessions" / key / "watch.pid"
+            self.assertTrue(wait_for(pid_file.exists, timeout=10))
+            pid = int(pid_file.read_text().strip())
+            self.assertTrue(_pid_alive(pid))
+
+            server = int(_tmux("display-message", "-p", "#{pid}")[1].strip())
+            subprocess.run(["kill", "-9", str(server)], check=False)
+            time.sleep(1.0)
+
+            # A new server takes over the socket, with a window the user owns.
+            _tmux("new-session", "-d", "-s", "reborn", "-n", "notes", "exec /bin/zsh -f")
+            self.assertEqual(_tmux("list-sessions")[0], 0, "the replacement server did not start")
+            win = _tmux("list-windows", "-t", "reborn", "-F", "#{window_id}")[1].split()[0]
+            before = _tmux("list-panes", "-t", win, "-F", "#{pane_id}")[1].split()
+
+            self.assertTrue(wait_for(lambda: not _pid_alive(pid), timeout=45),
+                            "the old coordinator kept serving a replaced server (pid %s)" % pid)
+
+            name = _tmux("display-message", "-p", "-t", win, "#{window_name}")[1]
+            after = _tmux("list-panes", "-t", win, "-F", "#{pane_id}")[1].split()
+            self.assertEqual(name, "notes", "the crashed server's coordinator renamed a user window")
+            self.assertEqual(after, before, "the crashed server's coordinator split into a user window")
 
 
 class ForeignWindowGuardTest(unittest.TestCase):

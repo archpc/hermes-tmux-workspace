@@ -472,6 +472,12 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
         return 0  # another watcher already owns this session
 
     pid_path(key, home).write_text(str(os.getpid()), encoding="utf-8")
+    # The server that owns us. A tmux server that dies without killing its jobs
+    # (crash, SIGKILL) leaves this process running while a NEW server answers on
+    # the same socket; that server's window ids come from a different sequence,
+    # so continuing to reconcile would rename or split into windows we never
+    # created. Identity is the server pid, not the socket path.
+    owner_pid = tmuxio.server_pid()
     layout = read_layout(key, home)
     session_label = layout.get("session_name") or tmuxio.current_session_name() or ""
 
@@ -500,6 +506,9 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
                 tmuxio.rename_window(window_id, badge_name(workers))
 
             fired = watcher.wait(_SESSION_CHECK_S)
+            live_pid = tmuxio.server_pid()
+            if owner_pid and live_pid and live_pid != owner_pid:
+                return 0          # a different server now answers this socket
             if not tmuxio.session_alive(layout.get("session_id") or ""):
                 return 0          # the session this coordinator serves is gone
             if fired:

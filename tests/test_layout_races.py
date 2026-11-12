@@ -17,6 +17,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -60,6 +61,56 @@ class LayoutTransactionTest(unittest.TestCase):
         finally:
             import shutil
             shutil.rmtree(home, ignore_errors=True)
+
+    def test_aux_does_not_write_back_a_layout_it_read_before_the_window(self):
+        """Deterministic version of the reported race.
+
+        `cmd_aux` reads layout.json, creates the window, then writes. A writer
+        that publishes in that gap must not be reverted. The window creation is
+        slowed down here so the gap is guaranteed; the old code writes the stale
+        document back and loses `tail_panes`.
+        """
+        with Sandbox() as box:
+            box.add_delegation("deleg_race0002", [{"goal": "stale"}])
+            self.assertEqual(box.cli("up"), 0)
+            key = next(d.name for d in (box.home / "cache/hermes-tmux/sessions").iterdir())
+
+            program = (
+                "import sys, time\n"
+                "import hermes_tmux.tmuxio as t\n"
+                "orig = t.new_window\n"
+                "def slow(*a, **k):\n"
+                "    time.sleep(0.6)\n"
+                "    return orig(*a, **k)\n"
+                "t.new_window = slow\n"
+                "from hermes_tmux.cli import main\n"
+                "sys.exit(main(['logs']))\n"
+            )
+            script = box.home / "slow_logs.py"
+            script.write_text(program)
+            info = _tmux("display-message", "-p", "#{socket_path}|#{pid}")[1]
+            sock, server = info.split("|")
+            env = dict(os.environ, TMUX="%s,%s,0" % (sock, server), TMUX_PANE=box.pane_id,
+                       HERMES_HOME=str(box.home), HERMES_TMUX="1", PYTHONPATH=str(REPO))
+            aux = subprocess.Popen([PY, str(script)], env=env, cwd=str(REPO),
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            # Wait until the aux command has read the layout (it sleeps inside
+            # new_window next), then publish a change it never saw.
+            time.sleep(0.15)
+            publish = (
+                "from pathlib import Path\n"
+                "from hermes_tmux import watch\n"
+                "watch.update_layout(%r, lambda lay: lay.__setitem__('tail_panes', "
+                "{'%%7777': 'deleg_race0002#0'}), Path(%r))\n" % (key, str(box.home))
+            )
+            subprocess.run([PY, "-c", publish], env=env, cwd=str(REPO), check=True, timeout=60)
+            aux.communicate(timeout=90)
+            self.assertEqual(aux.returncode, 0)
+
+            layout = box.layout()
+            self.assertIn("%7777", (layout.get("tail_panes") or {}),
+                          "the aux command reverted a concurrent update: %r" % layout)
+            self.assertIn("logs", (layout.get("aux") or {}), layout)
 
     def test_logs_after_up_keeps_the_tail_pane_record(self):
         with Sandbox() as box:

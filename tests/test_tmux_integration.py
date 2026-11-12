@@ -614,9 +614,14 @@ class IntegrationTest(unittest.TestCase):
             self.assertTrue(wait_for(lambda: _watcher_pid(box) is not None))
             pid = _watcher_pid(box)
 
-            # Kill only this sandbox's session: the watcher is a detached child.
+            # Keep the server alive with a second session: killing the only
+            # session kills the server, and a server death proves nothing about
+            # session liveness (tmux then takes the run-shell child with it).
+            _tmux("new-session", "-d", "-s", box.name + "_keep", "exec /bin/zsh -f")
             _tmux("kill-session", "-t", box.name)
             box.created = False
+            self.assertEqual(_tmux("list-sessions")[0], 0,
+                             "the server died; this test needs it alive")
 
             self.assertTrue(
                 wait_for(lambda: not _pid_alive(pid), timeout=40),
