@@ -60,7 +60,7 @@ Rules that follow from "never fabricate progress":
   window when a neighbour starts or finishes;
 - at most two worker panes per window; a new window (`hx:worker-N`) is opened
   only when every existing worker window already holds two;
-- up to 16 worker panes are shown, running workers first, then the most recent
+- up to 8 worker panes are shown, running workers first, then the most recent
   completions; a completed worker keeps its pane while capacity remains;
 - a worker window with no worker panes left is retired, never one holding a pane
   the user created;

@@ -44,9 +44,10 @@ STATE_DIR_NAME = "hermes-tmux"
 #: every pane wide enough to be readable and bounds visual churn: a window is
 #: created only when both slots of every existing worker window are taken.
 WORKERS_PER_WINDOW = 2
-#: Hard cap on worker panes across all windows. Delegations are read up to 40
-#: records; without a cap a long session accumulates windows without limit.
-MAX_VISIBLE = 16
+#: Hard cap on worker panes across all windows. Eight fills four two-pane
+#: windows, keeps the window bar readable, and still shows every worker of a
+#: typical delegation wave. Older settled workers remain in the overview.
+MAX_VISIBLE = 8
 WORKER_WINDOW_PREFIX = "hx:worker-"
 _DEBOUNCE_S = 0.12
 #: Floor between event-driven passes. state.db-wal is written on every Hermes
