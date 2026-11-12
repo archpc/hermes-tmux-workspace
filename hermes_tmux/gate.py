@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import os
 
-#: Flipped to True only after the end-to-end tmux validation suite passed.
-DEFAULT_ENABLED = False
+#: Flipped to True after the end-to-end tmux validation suite and the installed
+#: launcher passed on this machine. `HERMES_TMUX=0` still opts out per shell.
+DEFAULT_ENABLED = True
 
 _TRUTHY = {"1", "true", "yes", "on", "enable", "enabled"}
 _FALSEY = {"0", "false", "no", "off", "disable", "disabled"}
