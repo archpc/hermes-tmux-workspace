@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+"""Launcher for the Hermes tmux workspace.
+
+Runs from the repository it lives in, so a symlink in ~/.local/bin works without
+PYTHONPATH and without an install step.
+"""
+
+import os
+import sys
+
+_REPO = os.path.dirname(os.path.realpath(__file__))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+
+from hermes_tmux.cli import main  # noqa: E402  (path set above)
+
+if __name__ == "__main__":
+    sys.exit(main())

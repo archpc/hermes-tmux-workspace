@@ -1,0 +1,23 @@
+{
+  "delegation_id": "deleg_fixt0001",
+  "started": "2026-11-12 09:00:00",
+  "task_count": 2,
+  "model": "deepseek/deepseek-v4.1-flash-1017",
+  "provider": "nous",
+  "tasks": [
+    {
+      "index": 0,
+      "goal": "Implement the tmux state reader and unit tests.",
+      "log": "FIXTURE_ROOT/deleg_fixt0001/task-0.log",
+      "status": "running"
+    },
+    {
+      "index": 1,
+      "goal": "Implement the renderer and unit tests.",
+      "log": "FIXTURE_ROOT/deleg_fixt0001/task-1.log",
+      "status": "completed",
+      "exit_reason": "completed",
+      "model": "z-ai/glm-5.3-flash"
+    }
+  ]
+}
