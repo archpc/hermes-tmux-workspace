@@ -260,6 +260,18 @@ def cmd_down(args) -> int:
         return 0
     key = tmuxio.session_key()
     layout = watch.read_layout(key)
+    # Stop the coordinator first. Closing panes while it is alive lets it
+    # reconcile the empty window set and reopen worker windows between our pane
+    # closes and the window close, which looked like `down` leaving them behind.
+    pid = _watcher_pid(key)
+    if pid is not None:
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+        deadline = time.time() + 2.0
+        while time.time() < deadline and _watcher_alive(key):
+            time.sleep(0.02)
     closed_panes = 0
     before_windows = {win["window_id"] for win in
                       tmuxio.list_windows(tmuxio.current_session_id() or "")}
@@ -305,12 +317,6 @@ def cmd_down(args) -> int:
             + list((layout.get("aux") or {}).values()):
         if window_id:
             tmuxio.close_window(window_id)
-    pid = _watcher_pid(key)
-    if pid is not None:
-        try:
-            os.kill(pid, 15)
-        except OSError:
-            pass
     # This session's state directory belongs to a workspace that no longer
     # exists. Removing it here is what keeps `sessions/` from growing one dead
     # directory per server restart (the key includes the server pid).
