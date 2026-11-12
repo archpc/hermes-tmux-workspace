@@ -19,6 +19,7 @@ import json
 import os
 import pty
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -295,6 +296,25 @@ class Sandbox:
         with open(log, "a", encoding="utf-8") as fh:
             fh.write("%s %-9s| %s\n" % (stamp, role, text))
 
+    def write_db_state(self, delegation_id: str, state: str) -> None:
+        """Write a terminal row into state.db the way Hermes does.
+
+        This is the lifecycle path that never touches the manifest or a
+        transcript, and it is what a DB-only completion looks like.
+        """
+        path = self.home / "state.db"
+        connection = sqlite3.connect(str(path), timeout=5)
+        try:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS async_delegations "
+                "(delegation_id TEXT PRIMARY KEY, state TEXT)")
+            connection.execute(
+                "INSERT OR REPLACE INTO async_delegations (delegation_id, state) "
+                "VALUES (?, ?)", (delegation_id, state))
+            connection.commit()
+        finally:
+            connection.close()
+
     def write_review(self, delegation_id: str, task_index: Optional[int],
                      status: str = "recorded") -> None:
         path = self.home / "cache" / "hermes-tmux" / "reviews.json"
@@ -446,6 +466,79 @@ class IntegrationTest(unittest.TestCase):
             self.assertEqual(after.get(first_pane), first_worker,
                              "an existing pane was repointed at a different worker")
 
+    def test_worker_command_focuses_the_pane_in_stable_slot_order(self):
+        with Sandbox() as box:
+            box.add_delegation("deleg_aaa00019",
+                               [{"goal": "w%d" % i} for i in range(3)])
+            self.assertEqual(box.cli("up"), 0)
+            self.assertTrue(wait_for(lambda: len(box.layout().get("tail_panes") or {}) == 3))
+            layout = box.layout()
+            assign = layout["worker_assign"]
+            order = sorted(
+                layout["tail_panes"],
+                key=lambda p: (int(assign[layout["tail_panes"][p]]),
+                               int(p.lstrip("%"))))
+            self.assertEqual(box.cli("worker", "2"), 0)
+            active = _tmux("display-message", "-p", "-t", box.name, "#{pane_id}")[1].strip()
+            self.assertEqual(active, order[1],
+                             "worker 2 did not focus the second worker in slot order")
+            active_window = _tmux("display-message", "-p", "-t", box.name,
+                                  "#{window_id}")[1].strip()
+            self.assertEqual(active_window,
+                             _tmux("display-message", "-p", "-t", active,
+                                   "#{window_id}")[1].strip())
+
+    def test_v1_layout_migrates_worker_panes_out_of_the_overview_window(self):
+        """An installed v1 layout keeps worker panes in hx:workers.
+
+        On upgrade the overview window must end up overview-only and the worker
+        panes must reappear in hx:worker-* windows, without killing a pane the
+        user split into that window.
+        """
+        with Sandbox() as box:
+            box.add_delegation("deleg_v1mig001", [{"goal": "a"}, {"goal": "b"}])
+            self.assertEqual(box.cli("up"), 0)
+            self.assertTrue(wait_for(lambda: len(box.layout().get("tail_panes") or {}) == 2))
+            overview = box.window("hx:workers")
+            layout = box.layout()
+            old_panes = list(layout["tail_panes"])
+            # Move the two panes into the overview window, as v1 had them, and
+            # rewrite layout.json into the v1 shape.
+            for pane_id in old_panes:
+                _tmux("join-pane", "-d", "-s", pane_id, "-t", overview["id"])
+            self.assertTrue(wait_for(
+                lambda: len(box.panes_of(overview["id"])) == 3, timeout=10))
+            for win in [w for w in box.windows() if w["name"].startswith("hx:worker-")]:
+                _tmux("kill-window", "-t", win["id"])
+            _tmux("split-window", "-d", "-t", overview["id"], "-h")
+            user_pane = [p["id"] for p in box.panes_of(overview["id"])
+                         if p["id"] not in old_panes
+                         and p["id"] != layout["overview_pane"]][0]
+            self.assertTrue(user_pane)
+            sessions = box.home / "cache" / "hermes-tmux" / "sessions"
+            path = next(sessions.iterdir()) / "layout.json"
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data.pop("worker_windows", None)
+            data.pop("worker_assign", None)
+            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+            box.append_event("deleg_v1mig001", 0, "tool", "-> terminal(ls)")
+            self.assertTrue(wait_for(
+                lambda: len(box.layout().get("worker_windows") or {}) == 1, timeout=20),
+                "worker windows were not rebuilt: %r" % box.layout())
+            overview_panes = box.panes_of(overview["id"])
+            self.assertEqual(len([p for p in overview_panes if p["id"] in old_panes]), 0,
+                             "overview window still holds our worker panes")
+            self.assertIn(user_pane, [p["id"] for p in overview_panes],
+                          "migration destroyed a user pane in the overview window")
+            worker_wins = [w for w in box.windows() if w["name"].startswith("hx:worker-")]
+            self.assertEqual(len(worker_wins), 1)
+            self.assertEqual(len(box.panes_of(worker_wins[0]["id"])), 2)
+            for pane_id in old_panes:
+                self.assertFalse(
+                    _tmux("display-message", "-p", "-t", pane_id, "#{pane_id}")[1].strip()
+                    == pane_id, "v1 pane %s survived the migration" % pane_id)
+
     # ---- 3. events -------------------------------------------------------
     def test_up_rebuilds_a_lost_overview_without_repurposing_survivors(self):
         with Sandbox() as box:
@@ -519,6 +612,43 @@ class IntegrationTest(unittest.TestCase):
             box.append_event("deleg_aaa00008", 0, "tool", "-> terminal(ls)")
             self.assertTrue(wait_for(lambda: "terminal" in box.render_text()),
                             "render.txt did not follow the transcript event")
+
+    def test_state_db_completion_refreshes_overview_without_a_transcript_write(self):
+        """A task can finish only in state.db. That must still repaint.
+
+        Before the database was watched, the row kept its old running state
+        until an unrelated transcript append happened to fire the coordinator.
+        """
+        with Sandbox() as box:
+            box.add_delegation("deleg_db00001", [{"goal": "db driven"}])
+            self.assertEqual(box.cli("up"), 0)
+            self.assertTrue(wait_for(lambda: len(box.layout().get("tail_panes") or {}) == 1))
+            pane = list(box.layout()["tail_panes"])[0]
+            box.append_event("deleg_db00001", 0, "tool", "-> terminal(ls)")
+            self.assertTrue(wait_for(lambda: " run " in box.pane_title(pane), timeout=10),
+                            "fixture did not start as running: %r" % box.pane_title(pane))
+
+            box.write_db_state("deleg_db00001", "completed")
+            self.assertTrue(wait_for(lambda: " done " in box.pane_title(pane), timeout=15),
+                            "pane label did not follow the state.db completion")
+            self.assertTrue(wait_for(lambda: "done 1" in box.render_text(), timeout=15),
+                            "overview did not follow the state.db completion: %r"
+                            % box.render_text().splitlines()[:2])
+
+    def test_overview_title_is_not_scrolled_off_in_a_short_pane(self):
+        """Writing exactly `height` lines with a trailing newline scrolls one
+        line: the title (running/total, age) vanished and the pane looked dead.
+        """
+        with Sandbox(columns=100, rows=8) as box:
+            box.add_delegation("deleg_short0001",
+                               [{"goal": "w%d" % i} for i in range(3)])
+            self.assertEqual(box.cli("up"), 0)
+            self.assertTrue(wait_for(lambda: len(box.layout().get("tail_panes") or {}) == 3))
+            overview = box.layout()["overview_pane"]
+            self.assertTrue(wait_for(
+                lambda: "hermes subagents" in box.capture(overview), timeout=10),
+                "the overview title scrolled out of a short pane: %r"
+                % box.capture(overview).splitlines()[:3])
 
     # ---- 4. failure ------------------------------------------------------
     def test_failed_task_renders_as_failure_not_success(self):

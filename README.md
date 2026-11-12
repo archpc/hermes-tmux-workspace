@@ -49,13 +49,21 @@ legend: STATE from Hermes state; review only when an entry was recorded.
 
 Per-worker panes each run `tail -F` on that worker's real append-only
 transcript, so they show the actual tool calls and results as they happen.
-Pane titles carry worker id, task index, and model.
+`hx:workers` holds the overview and nothing else. Transcripts live in
+`hx:worker-1`, `hx:worker-2`, ... windows, at most two panes each, grouped by
+delegation order. Pane titles carry worker id, task index, state, and model.
 
 Rules that follow from "never fabricate progress":
 
 - a pane is bound to one worker key for as long as that worker is visible; it is
-  never repointed at a different worker mid-run;
-- at most four worker panes; the overview always lists every worker;
+  never repointed at a different worker mid-run, and it does not move to another
+  window when a neighbour starts or finishes;
+- at most two worker panes per window; a new window (`hx:worker-N`) is opened
+  only when every existing worker window already holds two;
+- up to 16 worker panes are shown, running workers first, then the most recent
+  completions; a completed worker keeps its pane while capacity remains;
+- a worker window with no worker panes left is retired, never one holding a pane
+  the user created;
 - workers with no transcript on disk get no pane rather than an empty one.
 
 ## Auxiliary panes

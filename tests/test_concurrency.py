@@ -143,6 +143,23 @@ def _titled_workers(box: Sandbox, window_id: str) -> Set[str]:
     return out
 
 
+def _workspace_titles(box: Sandbox) -> Set[str]:
+    """Titles across every worker window of one session (not the overview)."""
+    out: Set[str] = set()
+    for win in box.windows():
+        if win["name"].startswith("hx:worker-"):
+            out |= _titled_workers(box, win["id"])
+    return out
+
+
+def _workspace_panes(box: Sandbox) -> Set[str]:
+    panes: Set[str] = set()
+    for win in box.windows():
+        if win["name"].startswith(("hx:workers", "hx:worker-")):
+            panes |= {row["id"] for row in box.panes_of(win["id"])}
+    return panes
+
+
 def _client_ttys() -> str:
     return _tmux("list-clients", "-F", "#{client_tty}")[1].strip()
 
@@ -241,14 +258,14 @@ class ConcurrencyIsolationTest(unittest.TestCase):
             self.assertIsNotNone(win_b, "session b has no workers window")
             self.assertNotEqual(win_a["id"], win_b["id"])
 
-            self.assertTrue(wait_for(lambda: _titled_workers(a, win_a["id"]) == {TAG_A},
+            self.assertTrue(wait_for(lambda: _workspace_titles(a) == {TAG_A},
                                      timeout=15),
-                            "session a's window is not titled for its own worker: %r"
-                            % _titled_workers(a, win_a["id"]))
-            self.assertTrue(wait_for(lambda: _titled_workers(b, win_b["id"]) == {TAG_B},
+                            "session a's worker windows are not titled for its own worker: %r"
+                            % _workspace_titles(a))
+            self.assertTrue(wait_for(lambda: _workspace_titles(b) == {TAG_B},
                                      timeout=15),
-                            "session b's window is not titled for its own worker: %r"
-                            % _titled_workers(b, win_b["id"]))
+                            "session b's worker windows are not titled for its own worker: %r"
+                            % _workspace_titles(b))
             layout_a, layout_b = _layout_at(a, key_a), _layout_at(b, key_b)
             self.assertNotEqual(layout_a.get("overview_pane"), layout_b.get("overview_pane"),
                                 "both sessions address the same overview pane")
@@ -256,8 +273,7 @@ class ConcurrencyIsolationTest(unittest.TestCase):
                              "the two layouts address a shared pane")
 
             # down in a must be a private act.
-            panes_before = {row["id"]: _pane_pid(row["id"])
-                            for row in b.panes_of(win_b["id"])}
+            panes_before = {pane: _pane_pid(pane) for pane in _workspace_panes(b)}
             self.assertTrue(panes_before, "session b has no panes to preserve")
             self.assertTrue(wait_for(lambda: _watch_pid_at(b, key_b) is not None, timeout=10))
             coordinator_b = _watch_pid_at(b, key_b)
@@ -266,8 +282,14 @@ class ConcurrencyIsolationTest(unittest.TestCase):
             self.assertEqual(a.cli("down"), 0)
             self.assertTrue(wait_for(lambda: a.window("hx:workers") is None),
                             "down left session a's window standing")
+            self.assertTrue(wait_for(lambda: not a.windows() or all(
+                not w["name"].startswith(("hx:workers", "hx:worker-"))
+                for w in a.windows())),
+                "down left session a's worker windows standing")
             self.assertIsNotNone(b.window("hx:workers"),
                                  "down in one session closed the other session's window")
+            self.assertTrue([w for w in b.windows() if w["name"].startswith("hx:worker-")],
+                            "down in one session closed the other session's worker windows")
             for pane_id, pid in panes_before.items():
                 self.assertEqual(_pane_pid(pane_id), pid,
                                  "down in one session disturbed pane %s of the other"

@@ -284,8 +284,12 @@ def collect_paths(home: Optional[Path] = None) -> Tuple[List[Path], List[Path]]:
     # Without a watch on the database a task that finishes only there kept its
     # old "running" row until an unrelated transcript event happened to fire.
     # The WAL is where SQLite writes first; both are heap files, so a vnode
-    # watch is enough and no polling is needed.
-    db = hermes_home(home) / "state.db"
+    # watch is enough and no polling is needed. The home directory is watched
+    # too so creating state.db (first run, first delegation) raises an event.
+    base = hermes_home(home)
+    if base.is_dir():
+        dirs.append(base)
+    db = base / "state.db"
     for suffix in ("", "-wal"):
         candidate = Path(str(db) + suffix)
         if candidate.exists():
@@ -509,6 +513,12 @@ def reconcile_panes(key: str, workers: Sequence, home: Optional[Path] = None) ->
             tail_panes.pop(pane_id, None)
             by_worker.pop(wkey, None)
             changed = True
+
+    # Recount: a pane closed above must not hold a slot open.
+    slot_panes = {
+        slot: [p["pane_id"] for p in tmuxio.list_panes(wid) if p["ours"]]
+        for slot, wid in windows.items()
+    }
 
     # 4. Place every desired worker that has no pane yet: lowest free slot in
     #    an existing window, else a new window. Order is the stable worker

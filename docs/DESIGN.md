@@ -47,7 +47,8 @@ hermes-tmux  (python3, stdlib only, single process per tmux session)
         ▼
 tmux session (user's existing config untouched)
   agent window   (user's own; never renamed, never touched)
-  hx:workers     pane1 overview (hermes-tmux follow) + up to 4 x tail -F task-N.log
+  hx:workers     overview only (hermes-tmux follow)
+  hx:worker-N    up to 2 x tail -F task-N.log per window, grouped by delegation
   hx:logs        lazy, on demand
   hx:tests       lazy, on demand
   hx:debug       lazy, on demand
@@ -76,7 +77,7 @@ Why this and not the alternatives:
 | tool call / tool result / thinking / assistant text | appended line | immediate | file `NOTE_EXTEND` → redraw; `tail -F` for raw |
 | task finishes | `final` marker in log; manifest status flip | immediate | file `NOTE_EXTEND` |
 | delegation completes | `manifest.completed` | immediate | dir `NOTE_WRITE` |
-| DB terminal state | `async_delegations.state` | on next FS event | read at render |
+| DB terminal state | `async_delegations.state` | immediate (1 s floor) | `state.db`/`-wal` `NOTE_WRITE` → redraw |
 | review recorded | registry file write | immediate | dir `NOTE_WRITE` |
 | Hermes crashes mid-delegation | no further events | n/a | UI keeps last phase, marks `stalled` after manifest age > 10 min |
 
