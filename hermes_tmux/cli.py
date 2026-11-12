@@ -228,6 +228,12 @@ def cmd_up(args) -> int:
         print("hermes-tmux: rebuilt the overview pane (%s)" % overview)
     layout["overview_pane"] = overview
 
+    # The overview window is overview-only in this layout. Version 1 kept worker
+    # tail panes here; retire ours so the window holds exactly the overview.
+    # Never touches a pane the user split into the window.
+    watch.trim_overview_window(dict(layout, workers_window=window_id,
+                                    overview_pane=overview))
+
     # Pane borders carry worker identity: id, task, model.
     tmuxio.window_option(window_id, "pane-border-status", "top")
     tmuxio.window_option(window_id, "pane-border-format",
@@ -261,11 +267,17 @@ def cmd_down(args) -> int:
     # not closed as a whole (that would kill their shell with it), but our own
     # panes in it still go.
     targets: List[str] = []
+    session = tmuxio.current_session_id() or ""
     for name in [WORKERS_WINDOW] + ["hx:" + r for r in AUX_ROLES]:
-        win = tmuxio.find_window_by_name(tmuxio.current_session_id() or "", name)
+        win = tmuxio.find_window_by_name(session, name)
         if win:
             targets.append(win["window_id"])
-    for window_id in [layout.get("workers_window")] + list((layout.get("aux") or {}).values()):
+    # Worker windows are recorded by slot, but a layout that lost an entry still
+    # has a name: close those too, only when the marker says they are ours.
+    targets.extend(tmuxio.windows_by_prefix(session, watch.WORKER_WINDOW_PREFIX))
+    for window_id in [layout.get("workers_window")] \
+            + list((layout.get("worker_windows") or {}).values()) \
+            + list((layout.get("aux") or {}).values()):
         if window_id and tmuxio.window_exists(window_id):
             targets.append(window_id)
     for window_id in dict.fromkeys(targets):
@@ -275,7 +287,7 @@ def cmd_down(args) -> int:
                 closed_panes += 1
 
     for name in [WORKERS_WINDOW] + ["hx:" + r for r in AUX_ROLES]:
-        win = tmuxio.find_window_by_name(tmuxio.current_session_id() or "", name)
+        win = tmuxio.find_window_by_name(session, name)
         if not win:
             continue
         # A window that still holds any pane we did not create is left standing:
@@ -288,7 +300,9 @@ def cmd_down(args) -> int:
         tmuxio.close_window(win["window_id"])
     # Also close by recorded id: a window may have been renamed since, and the
     # id is the address that survives renumbering.
-    for window_id in [layout.get("workers_window")] + list((layout.get("aux") or {}).values()):
+    for window_id in [layout.get("workers_window")] \
+            + list((layout.get("worker_windows") or {}).values()) \
+            + list((layout.get("aux") or {}).values()):
         if window_id:
             tmuxio.close_window(window_id)
     pid = _watcher_pid(key)
@@ -517,12 +531,22 @@ def cmd_worker(args) -> int:
         return 0
     key = tmuxio.session_key()
     layout = watch.read_layout(key)
-    # Numeric order: string order would put %10 before %2.
+
     def _order(pane_id: str) -> int:
         digits = pane_id.lstrip("%")
         return int(digits) if digits.isdigit() else 0
 
-    panes = sorted((layout.get("tail_panes") or {}).keys(), key=_order)
+    assign = layout.get("worker_assign") or {}
+    tail_panes = layout.get("tail_panes") or {}
+
+    def _slot(pane_id: str) -> int:
+        slot = assign.get(tail_panes.get(pane_id, ""), "")
+        text = str(slot).lstrip("0")
+        return int(text) if text.isdigit() else 0
+
+    # Worker order is the layout's own: window slot first, then pane order, so
+    # "worker 2" names the same transcript across a detach or a lifecycle change.
+    panes = sorted(tail_panes.keys(), key=lambda pane_id: (_slot(pane_id), _order(pane_id)))
     idx = args.index
     if idx < 1 or idx > len(panes):
         print("hermes-tmux: no worker pane %d (have %d)" % (idx, len(panes)))

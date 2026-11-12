@@ -360,9 +360,17 @@ class IntegrationTest(unittest.TestCase):
             self.assertEqual(box.cli("up"), 0)
             self.assertTrue(wait_for(lambda: len(box.layout().get("tail_panes") or {}) == 3),
                             "expected 3 tail panes, got %r" % (box.layout().get("tail_panes")))
-            win = box.window("hx:workers")
-            panes = box.panes_of(win["id"])
-            self.assertEqual(len(panes), 4, "expected overview + 3 worker panes")
+            overview_win = box.window("hx:workers")
+            self.assertEqual(len(box.panes_of(overview_win["id"])), 1,
+                             "the overview window must hold the overview only")
+            worker_wins = sorted(
+                (w for w in box.windows() if w["name"].startswith("hx:worker-")),
+                key=lambda w: w["name"])
+            self.assertEqual(len(worker_wins), 2, "3 workers need 2 windows of at most 2")
+            panes = [p for w in worker_wins for p in box.panes_of(w["id"])]
+            self.assertEqual(len(panes), 3, "expected one pane per worker across windows")
+            self.assertTrue(all(len(box.panes_of(w["id"])) <= 2 for w in worker_wins),
+                            "a worker window exceeded two panes")
             titles = " ".join(p["title"] for p in panes)
             self.assertIn("t0", titles)
             self.assertIn("t2", titles)
@@ -396,18 +404,25 @@ class IntegrationTest(unittest.TestCase):
                             "completed worker still labelled running: %r"
                             % box.pane_title(pane))
 
-    def test_max_four_visible_and_titles_carry_identity(self):
+    def test_max_two_panes_per_window_and_titles_carry_identity(self):
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00004",
                                [{"goal": "w%d" % i} for i in range(6)])
             self.assertEqual(box.cli("up"), 0)
-            self.assertTrue(wait_for(lambda: len(box.layout().get("tail_panes") or {}) == 4,
-                            timeout=15),
-                            "expected cap of 4 panes, got %r" % (box.layout().get("tail_panes")))
-            win = box.window("hx:workers")
-            self.assertEqual(len(box.panes_of(win["id"])), 5, "must be 1 overview + 4 workers")
-            self.assertIn("deepseek-v4.1-flash", " ".join(
-                p["title"] for p in box.panes_of(win["id"])))
+            self.assertTrue(wait_for(lambda: len(box.layout().get("tail_panes") or {}) == 6,
+                            timeout=20),
+                            "expected six panes, got %r" % (box.layout().get("tail_panes")))
+            overview_win = box.window("hx:workers")
+            self.assertEqual(len(box.panes_of(overview_win["id"])), 1)
+            worker_wins = [w for w in box.windows() if w["name"].startswith("hx:worker-")]
+            self.assertEqual(len(worker_wins), 3, "6 workers must fill 3 windows")
+            titles = []
+            for win in worker_wins:
+                panes = box.panes_of(win["id"])
+                self.assertLessEqual(len(panes), 2,
+                                     "window %s has more than two panes" % win["name"])
+                titles.extend(p["title"] for p in panes)
+            self.assertIn("deepseek-v4.1-flash", " ".join(titles))
 
     def test_new_worker_gets_its_own_pane_and_old_pane_is_not_stolen(self):
         with Sandbox() as box:
@@ -438,13 +453,16 @@ class IntegrationTest(unittest.TestCase):
             self.assertEqual(box.cli("up"), 0)
             win = box.window("hx:workers")
             old_overview = box.layout()["overview_pane"]
-            self.assertTrue(wait_for(lambda: len(box.panes_of(win["id"])) >= 2, timeout=15),
-                            "no worker pane was created for the delegation")
+            self.assertTrue(wait_for(
+                lambda: len(box.layout().get("tail_panes") or {}) == 1, timeout=15),
+                "no worker pane was created for the delegation")
 
+            worker_wins = [w for w in box.windows() if w["name"].startswith("hx:worker-")]
+            self.assertTrue(worker_wins, "expected a worker window")
             survivors = {p["id"]: _tmux("display-message", "-p", "-t", p["id"],
                                         "#{pane_pid}")[1].strip()
-                         for p in box.panes_of(win["id"]) if p["id"] != old_overview}
-            self.assertTrue(survivors, "expected at least one surviving pane")
+                         for w in worker_wins for p in box.panes_of(w["id"])}
+            self.assertTrue(survivors, "expected at least one surviving worker pane")
 
             _tmux("kill-pane", "-t", old_overview)
             time.sleep(0.3)
@@ -600,7 +618,10 @@ class IntegrationTest(unittest.TestCase):
                              "watcher was restarted by an idempotent up")
             win = box.window("hx:workers")
             self.assertIsNotNone(win)
-            self.assertTrue(len(box.panes_of(win["id"])) >= 2)
+            self.assertEqual(len(box.panes_of(win["id"])), 1,
+                             "the overview window must still hold only the overview")
+            worker_wins = [w for w in box.windows() if w["name"].startswith("hx:worker-")]
+            self.assertTrue(worker_wins, "worker windows did not survive a reattach")
 
     def test_coordinator_exits_when_its_session_disappears(self):
         """run-shell children outlive the server; the watcher must not.

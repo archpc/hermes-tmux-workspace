@@ -34,14 +34,25 @@ import shlex
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import tmuxio
 from .gate import enabled
 
 STATE_DIR_NAME = "hermes-tmux"
-MAX_VISIBLE = 4
+#: At most two live worker transcripts in one window. One window per pair keeps
+#: every pane wide enough to be readable and bounds visual churn: a window is
+#: created only when both slots of every existing worker window are taken.
+WORKERS_PER_WINDOW = 2
+#: Hard cap on worker panes across all windows. Delegations are read up to 40
+#: records; without a cap a long session accumulates windows without limit.
+MAX_VISIBLE = 16
+WORKER_WINDOW_PREFIX = "hx:worker-"
 _DEBOUNCE_S = 0.12
+#: Floor between event-driven passes. state.db-wal is written on every Hermes
+#: event, so an unthrottled vnode loop would re-read 40 transcripts many times a
+#: second. One second still reads as live and keeps the coordinator cheap.
+_MIN_RENDER_INTERVAL_S = 1.0
 _TIMER_WAKE_S = 60.0
 #: Upper bound on how long the pane may go without re-reading state. Only used so
 #: the pane degrades (stale but truthful) instead of freezing when nothing fires.
@@ -269,23 +280,126 @@ def collect_paths(home: Optional[Path] = None) -> Tuple[List[Path], List[Path]]:
         candidate = reviews / "reviews.json"
         if candidate.exists():
             files.append(candidate)
+    # Terminal state and token/cost data live in state.db, not in the manifest.
+    # Without a watch on the database a task that finishes only there kept its
+    # old "running" row until an unrelated transcript event happened to fire.
+    # The WAL is where SQLite writes first; both are heap files, so a vnode
+    # watch is enough and no polling is needed.
+    db = hermes_home(home) / "state.db"
+    for suffix in ("", "-wal"):
+        candidate = Path(str(db) + suffix)
+        if candidate.exists():
+            files.append(candidate)
     return dirs, files
 
 
 # --------------------------------------------------------------------------- pick
 
-def pick_visible(workers: Sequence, limit: int = MAX_VISIBLE) -> List:
-    """Running workers first, then everything else in input order."""
-    running = [w for w in workers if getattr(w, "state", "") == "running"]
-    other = [w for w in workers if getattr(w, "state", "") != "running"]
-    return (running + other)[:limit]
+def _task_index(worker) -> int:
+    try:
+        return int(getattr(worker, "task_index", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
-def _pane_order(pane_id: str) -> int:
-    """Numeric pane order. String order puts %10 before %2."""
-    digits = pane_id.lstrip("%")
-    return int(digits) if digits.isdigit() else 0
+def worker_order(workers: Sequence) -> List:
+    """Stable order: newest delegation first, task index ascending within one.
 
+    Deliberately independent of run state. Ordering by state made a worker that
+    finished jump position and drag its pane (and its window neighbours) with
+    it, which is exactly the reshuffle this layout must avoid.
+    """
+    ordered = [w for w in workers if getattr(w, "key", "")]
+    try:
+        ordered.sort(
+            key=lambda w: (str(getattr(w, "delegation_started", "") or ""),
+                           str(getattr(w, "delegation_id", "") or "")),
+            reverse=True,
+        )
+        # Rank delegations by that order, then sort tasks inside each one. A
+        # plain second sort on task index alone would interleave delegations.
+        rank = {}
+        for w in ordered:
+            pair = (str(getattr(w, "delegation_started", "") or ""),
+                    str(getattr(w, "delegation_id", "") or ""))
+            rank.setdefault(pair, len(rank))
+        ordered.sort(key=lambda w: (
+            rank[(str(getattr(w, "delegation_started", "") or ""),
+                  str(getattr(w, "delegation_id", "") or ""))],
+            _task_index(w),
+        ))
+    except Exception:                             # pragma: no cover - defensive
+        return ordered
+    return ordered
+
+
+def select_visible(workers: Sequence, assigned: Iterable[str] = (),
+                   limit: int = MAX_VISIBLE) -> List:
+    """Workers that get a pane: running ones first, then newest, stable order.
+
+    ``assigned`` names workers that already own a pane. They are preferred over
+    unseen settled workers when the cap bites, so a display limit never closes
+    a pane the reader is already using while an older finished worker waits.
+    The result keeps ``worker_order`` so window grouping is predictable.
+    """
+    ordered = worker_order(workers)
+    if len(ordered) <= limit:
+        return ordered
+    running = [w for w in ordered if getattr(w, "state", "") == "running"]
+    keep_running = running[:limit]
+    room = limit - len(keep_running)
+    pinned = set(assigned)
+    settled = [w for w in ordered if getattr(w, "state", "") != "running"]
+    chosen = keep_running + sorted(
+        settled, key=lambda w: 0 if getattr(w, "key", "") in pinned else 1
+    )[:room]
+    chosen_keys = {getattr(w, "key", "") for w in chosen}
+    return [w for w in ordered if getattr(w, "key", "") in chosen_keys]
+
+
+def _slot_sort(slot: str) -> int:
+    text = str(slot).lstrip("0")
+    return int(text) if text.isdigit() else 0
+
+
+def _next_slot(windows: Dict[str, str]) -> str:
+    used = [_slot_sort(slot) for slot in windows] or [0]
+    return str(max(used) + 1)
+
+
+def _log_path(worker) -> Optional[str]:
+    return getattr(worker, "log_path", None) or getattr(worker, "_log_path", None)
+
+
+def configure_worker_window(window_id: str) -> None:
+    """Border label + clean tiling for a worker window we own."""
+    tmuxio.window_option(window_id, "pane-border-status", "top")
+    tmuxio.window_option(window_id, "pane-border-format", " #{pane_title} ")
+
+
+def trim_overview_window(layout: Dict) -> bool:
+    """Close our panes in the overview window that are not the overview.
+
+    Version 1 put worker tail panes in the overview window. The overview window
+    is now overview-only, so those panes are retired here. Only panes proven to
+    be ours are closed; a user's split in the same window is left alone, and the
+    function then reports no change for it.
+    """
+    window_id = layout.get("workers_window")
+    keep = layout.get("overview_pane")
+    if not window_id or not keep or not tmuxio.window_exists(window_id) \
+            or not tmuxio.owns_window(window_id):
+        return False
+    closed = False
+    for pane in tmuxio.list_panes(window_id):
+        if pane["pane_id"] == keep:
+            continue
+        if pane["ours"] and tmuxio.close_pane(pane["pane_id"])[0]:
+            closed = True
+    return closed
+
+
+# --------------------------------------------------------------------------- watch
 
 def _pane_env() -> Dict[str, str]:
     """Env for panes this process creates (forked from the server, not from us)."""
@@ -317,95 +431,160 @@ def pane_label(worker) -> str:
 # --------------------------------------------------------------------------- watch
 
 def reconcile_panes(key: str, workers: Sequence, home: Optional[Path] = None) -> Dict:
-    """Give each visible worker its own tail pane. Idempotent and stable.
+    """Keep one overview-only window plus worker windows of at most two panes.
 
-    Identity rule: one pane per worker key, addressed by pane id. A pane is never
-    repointed at a different worker while its worker is still visible, because a
-    repointed pane loses the scrollback the user was reading. A worker that
-    leaves the visible set gives its pane up; a worker that arrives takes a free
-    pane if one exists, else gets a new split.
+    Identity and stability rules:
+
+    * the overview window holds the overview pane and nothing else of ours;
+    * a worker keeps its pane and its window for as long as it is visible. A
+      worker finishing, or another worker starting, never moves an existing
+      pane: new work fills the lowest free slot, then opens a new window;
+    * a worker that leaves the visible set gives up its pane; a window with no
+      worker panes left is retired only when every remaining pane is ours;
+    * a window that holds any pane we did not create is never split, renamed,
+      closed, or repurposed. It is simply forgotten by the layout.
     """
     layout = read_layout(key, home)
-    window_id = layout.get("workers_window")
-    # Existence is not ownership. A window id is only unique within one server,
-    # so after a server dies without killing its jobs a recorded id can name a
-    # window the user owns on the new server; splitting or renaming it would
-    # adopt their window. Stale-pane recovery made this reachable.
-    if not window_id or not tmuxio.window_exists(window_id) \
-            or not tmuxio.owns_window(window_id):
-        return layout
+    changed = trim_overview_window(layout)
 
-    visible = pick_visible(workers, MAX_VISIBLE)
-    tail_panes: Dict[str, str] = dict(layout.get("tail_panes") or {})
+    session_id = layout.get("session_id") or tmuxio.current_session_id() or ""
+    windows: Dict[str, str] = {
+        str(slot): str(wid)
+        for slot, wid in (layout.get("worker_windows") or {}).items()
+    }
+    assign: Dict[str, str] = {
+        str(wkey): str(slot)
+        for wkey, slot in (layout.get("worker_assign") or {}).items()
+    }
+    tail_panes: Dict[str, str] = {
+        str(pane_id): str(wkey)
+        for pane_id, wkey in (layout.get("tail_panes") or {}).items()
+    }
 
-    # Drop bookkeeping for panes tmux no longer has.
+    # 1. Validate what we recorded. A window id is unique only within one
+    #    server, and a stale id can name a user window on a new server.
+    for slot in list(windows):
+        wid = windows[slot]
+        if not (tmuxio.window_exists(wid) and tmuxio.owns_window(wid)):
+            windows.pop(slot, None)
+    for wkey, slot in list(assign.items()):
+        if slot not in windows:
+            assign.pop(wkey, None)
     for pane_id in list(tail_panes):
         if not tmuxio.pane_exists(pane_id):
             tail_panes.pop(pane_id, None)
 
-    desired: Dict[str, Tuple[Optional[str], str]] = {}
-    for worker in visible:
-        wkey = getattr(worker, "key", "")
-        if not wkey:
-            continue
-        log_path = getattr(worker, "log_path", None) or getattr(worker, "_log_path", None)
-        desired[wkey] = (log_path, pane_label(worker))
+    desired: Dict[str, Tuple[str, str]] = {}
+    for worker in select_visible(workers, assigned=assign.keys()):
+        wkey = str(getattr(worker, "key", ""))
+        log_path = _log_path(worker)
+        if wkey and log_path:
+            desired[wkey] = (log_path, pane_label(worker))
 
-    changed = False
-
-    # 1. Panes whose worker left the visible set become free slots. They are
-    #    held for reuse rather than closed here: closing first made the reuse
-    #    step unreachable, so a rotation of workers churned panes needlessly.
-    covered = set(tail_panes.values())
-    free = sorted((pane_id for pane_id, wkey in tail_panes.items()
-                   if wkey not in desired), key=_pane_order)
-
-    # 2. Reuse a free slot for a newly visible worker before creating any.
-    for wkey, (log_path, label) in desired.items():
-        if wkey in covered or not log_path:
-            continue
-        while free:
-            pane_id = free.pop(0)
-            if tmuxio.respawn(pane_id, tail_command(log_path)):
-                tail_panes[pane_id] = wkey
-                covered.add(wkey)
-                tmuxio.set_title(pane_id, label)
+    # 2. Exactly one pane per worker. Duplicates are a bookkeeping artefact
+    #    (a pane that survived a crash); keep the first and retire the rest.
+    by_worker: Dict[str, str] = {}
+    for pane_id, wkey in list(tail_panes.items()):
+        if wkey not in desired or wkey in by_worker:
+            if tmuxio.close_pane(pane_id)[0] or wkey not in desired:
+                tail_panes.pop(pane_id, None)
                 changed = True
-                break
+            continue
+        by_worker[wkey] = pane_id
 
-    # 3. Close slots nobody claimed (ours only), then split for what is left.
-    for pane_id in free:
+    # 3. Panes that exist but whose window binding is gone are closed, not
+    #    repointed: a repointed pane loses the scrollback the reader had.
+    slot_panes: Dict[str, List[str]] = {
+        slot: [p["pane_id"] for p in tmuxio.list_panes(wid) if p["ours"]]
+        for slot, wid in windows.items()
+    }
+    placed: Dict[str, str] = {}
+    for wkey, pane_id in list(by_worker.items()):
+        slot = assign.get(wkey)
+        if slot in windows and pane_id in slot_panes.get(slot, []):
+            placed[wkey] = pane_id
+            continue
+        assign.pop(wkey, None)
         if tmuxio.close_pane(pane_id)[0]:
             tail_panes.pop(pane_id, None)
-            changed = True
-    for wkey, (log_path, label) in desired.items():
-        if wkey in set(tail_panes.values()) or not log_path:
-            continue
-        pane_id = tmuxio.split_window(window_id, tail_command(log_path), horizontal=True,
-                                      env=_pane_env())
-        if pane_id:
-            tail_panes[pane_id] = wkey
-            tmuxio.set_title(pane_id, label)
+            by_worker.pop(wkey, None)
             changed = True
 
-    # 4. Refresh labels even when no pane was rebound. The state in the border
-    #    is a lifecycle claim that changes while a worker runs (run -> done), so
-    #    a pane that keeps its worker must still get a new label.
+    # 4. Place every desired worker that has no pane yet: lowest free slot in
+    #    an existing window, else a new window. Order is the stable worker
+    #    order, so the first pair of a delegation lands in the first window.
+    for wkey, (log_path, label) in desired.items():
+        if wkey in placed:
+            continue
+        target = ""
+        for slot in sorted(slot_panes, key=_slot_sort):
+            if slot not in windows:
+                continue
+            if len(slot_panes[slot]) < WORKERS_PER_WINDOW \
+                    and not tmuxio.foreign_panes(windows[slot]):
+                target = slot
+                break
+        if target:
+            pane_id = tmuxio.split_window(
+                windows[target], tail_command(log_path), horizontal=True,
+                env=_pane_env()) or ""
+            slot = target
+        else:
+            slot = _next_slot(windows)
+            name = tmuxio.free_window_name(
+                session_id, "%s%d" % (WORKER_WINDOW_PREFIX, int(slot)))
+            window_id = tmuxio.new_window(
+                session_id, name, cwd=str(Path.home()),
+                command=tail_command(log_path), env=_pane_env())
+            if not window_id:
+                continue
+            windows[slot] = window_id
+            slot_panes[slot] = []
+            configure_worker_window(window_id)
+            panes = tmuxio.wait_for_panes(window_id)
+            pane_id = panes[0]["pane_id"] if panes else ""
+            changed = True
+        if not pane_id:
+            continue
+        assign[wkey] = slot
+        tail_panes[pane_id] = wkey
+        placed[wkey] = pane_id
+        slot_panes.setdefault(slot, []).append(pane_id)
+        tmuxio.set_title(pane_id, label)
+        changed = True
+
+    # 5. Retire worker windows that no longer hold any worker pane. The guard in
+    #    close_window refuses a window with even one foreign pane, and such a
+    #    window is dropped from our map instead of being retried forever.
+    for slot in list(windows):
+        window_id = windows[slot]
+        if any(p["ours"] for p in tmuxio.list_panes(window_id)):
+            continue
+        if tmuxio.close_window(window_id)[0]:
+            changed = True
+        windows.pop(slot, None)
+
+    # 6. Refresh border labels even when nothing moved: the state in a label is
+    #    a lifecycle claim that changes while the worker runs (run -> done).
     retitled = False
-    titles = {pane["pane_id"]: pane["title"] for pane in tmuxio.list_panes(window_id)}
-    for pane_id, wkey in tail_panes.items():
-        want = desired.get(wkey, (None, ""))[1]
-        if want and titles.get(pane_id, "") != want:
-            if tmuxio.set_title(pane_id, want):
+    for slot, window_id in windows.items():
+        titles = {p["pane_id"]: p["title"] for p in tmuxio.list_panes(window_id)}
+        for pane_id, wkey in tail_panes.items():
+            want = desired.get(wkey, (None, ""))[1]
+            if assign.get(wkey) != slot or not want:
+                continue
+            if titles.get(pane_id, "") != want and tmuxio.set_title(pane_id, want):
                 retitled = True
+        if changed:
+            tmuxio.run("select-layout", "-t", window_id, "tiled")
 
     if changed or retitled:
         def _apply(current: Dict) -> Dict:
             current["tail_panes"] = tail_panes
+            current["worker_windows"] = windows
+            current["worker_assign"] = assign
             return current
         layout = update_layout(key, _apply, home)
-    if changed:
-        tmuxio.run("select-layout", "-t", window_id, "tiled")
     return layout
 
 
@@ -483,8 +662,22 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
 
     watcher = WatchSet()
     last_sig = None
+    last_pass = 0.0
     try:
         while True:
+            # state.db-wal fires on every Hermes write. Cap the pass rate so a
+            # busy session cannot turn the coordinator into a re-read loop; the
+            # first pass is never delayed.
+            if last_pass:
+                remaining = _MIN_RENDER_INTERVAL_S - (time.time() - last_pass)
+                if remaining > 0:
+                    watcher.wait(min(remaining, _SESSION_CHECK_S))
+                    live_pid = tmuxio.server_pid()
+                    if owner_pid and live_pid and live_pid != owner_pid:
+                        return 0
+                    if not tmuxio.session_alive(layout.get("session_id") or ""):
+                        return 0
+            last_pass = time.time()
             # Reconcile BEFORE blocking. The first pass must run immediately:
             # `up` starts this process after writing the layout, and a delegation
             # that already existed raised no vnode event, so waiting first would
@@ -557,9 +750,14 @@ def _draw(text: str, pane_id: str) -> None:
     if len(lines) > height:
         lines = lines[:height]
     buf = ["\033[H"]
-    for line in lines:
+    for index, line in enumerate(lines):
         buf.append(line[:width])
-        buf.append("\033[K\r\n")
+        buf.append("\033[K")
+        # No newline after the last line: with one, writing exactly `height`
+        # lines scrolls the pane by one row and the title (running/total, age)
+        # silently disappears, which reads as a frozen overview.
+        if index < len(lines) - 1:
+            buf.append("\r\n")
     buf.append("\033[J")
     try:
         sys.stdout.write("".join(buf))

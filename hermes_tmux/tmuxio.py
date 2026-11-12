@@ -239,6 +239,12 @@ def find_window_by_name(session: str, name: str) -> Optional[dict]:
     return None
 
 
+def windows_by_prefix(session: str, prefix: str) -> List[str]:
+    """Ids of our windows whose name starts with ``prefix`` (never foreign)."""
+    return [win["window_id"] for win in list_windows(session)
+            if win["ours"] and win["name"].startswith(prefix)]
+
+
 def free_window_name(session: str, base: str) -> str:
     """A window name that no foreign window in this session is using."""
     taken = {win["name"] for win in list_windows(session) if not win["ours"]}
