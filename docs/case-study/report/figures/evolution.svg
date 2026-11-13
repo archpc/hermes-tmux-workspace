@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 836 372" width="836" height="372" font-family="SF NS, Helvetica Neue, Helvetica, sans-serif">
+<text x="0" y="22" font-size="20" font-weight="600" fill="#1D1D1F">Version 1</text>
+<text x="0" y="46" font-size="15.5" fill="#6E6E73">13:32 · one window</text>
+<rect x="0" y="60" width="256" height="216" rx="5" fill="#F5F5F7" stroke="#C7C7CC"/>
+<rect x="0" y="248" width="256" height="28" fill="#E5E5EA"/>
+<rect x="8" y="68" width="92" height="174" rx="2" fill="#FFFFFF" stroke="#C7C7CC"/>
+<text x="15" y="88" font-size="14.5" fill="#6E6E73">overview</text>
+<rect x="106" y="68" width="142" height="40" rx="2" fill="#FFFFFF" stroke="#C7C7CC"/>
+<text x="113" y="88" font-size="14.5" fill="#6E6E73">tail -F worker 1</text>
+<rect x="106" y="112" width="142" height="40" rx="2" fill="#FFFFFF" stroke="#C7C7CC"/>
+<text x="113" y="132" font-size="14.5" fill="#6E6E73">tail -F worker 2</text>
+<rect x="106" y="156" width="142" height="40" rx="2" fill="#FFFFFF" stroke="#C7C7CC"/>
+<text x="113" y="176" font-size="14.5" fill="#6E6E73">tail -F worker 3</text>
+<rect x="106" y="200" width="142" height="40" rx="2" fill="#FFFFFF" stroke="#C7C7CC"/>
+<text x="113" y="220" font-size="14.5" fill="#6E6E73">tail -F worker 4</text>
+<text x="12" y="267" font-size="13.5" fill="#6E6E73">hermes</text>
+<rect x="66" y="252" width="88" height="20" rx="2" fill="#FFFFFF" stroke="#C7C7CC"/>
+<text x="72" y="267" font-size="13.5" fill="#1D1D1F">hx:workers</text>
+<text x="0" y="302" font-size="15.5" fill="#1D1D1F">Panes narrow as workers</text>
+<text x="0" y="323" font-size="15.5" fill="#1D1D1F">are added. Identity is</text>
+<text x="0" y="344" font-size="15.5" fill="#1D1D1F">a border label.</text>
+<text x="290" y="22" font-size="20" font-weight="600" fill="#1D1D1F">Version 2</text>
+<text x="290" y="46" font-size="15.5" fill="#6E6E73">17:33 · two per window</text>
+<rect x="290" y="60" width="256" height="216" rx="5" fill="#F5F5F7" stroke="#C7C7CC"/>
+<rect x="290" y="248" width="256" height="28" fill="#E5E5EA"/>
+<rect x="298" y="68" width="240" height="84" rx="2" fill="#FFFFFF" stroke="#C7C7CC"/>
+<text x="305" y="88" font-size="14.5" fill="#6E6E73">tail -F worker 1</text>
+<rect x="298" y="158" width="240" height="84" rx="2" fill="#FFFFFF" stroke="#C7C7CC"/>
+<text x="305" y="178" font-size="14.5" fill="#6E6E73">tail -F worker 2</text>
+<text x="302" y="267" font-size="13.5" fill="#6E6E73">hx:workers</text>
+<rect x="387" y="252" width="95" height="20" rx="2" fill="#FFFFFF" stroke="#C7C7CC"/>
+<text x="393" y="267" font-size="13.5" fill="#1D1D1F">hx:worker-1</text>
+<text x="491" y="267" font-size="13.5" fill="#6E6E73">hx:wor…</text>
+<text x="290" y="302" font-size="15.5" fill="#1D1D1F">Readable width, numbered</text>
+<text x="290" y="323" font-size="15.5" fill="#1D1D1F">tabs. Finished work keeps</text>
+<text x="290" y="344" font-size="15.5" fill="#1D1D1F">its window.</text>
+<text x="580" y="22" font-size="20" font-weight="600" fill="#1D1D1F">Version 3</text>
+<text x="580" y="46" font-size="15.5" fill="#6E6E73">19:22 · one worker per tab</text>
+<rect x="580" y="60" width="256" height="216" rx="5" fill="#F5F5F7" stroke="#C7C7CC"/>
+<rect x="580" y="248" width="256" height="28" fill="#E5E5EA"/>
+<rect x="588" y="68" width="240" height="174" rx="2" fill="#FFFFFF" stroke="#0071E3"/>
+<text x="595" y="88" font-size="14.5" fill="#1D1D1F">RUNNING  Port the test suite</text>
+<rect x="598" y="104" width="204" height="5" rx="2.5" fill="#C7C7CC"/>
+<rect x="598" y="123" width="172" height="5" rx="2.5" fill="#C7C7CC"/>
+<rect x="598" y="142" width="216" height="5" rx="2.5" fill="#C7C7CC"/>
+<rect x="598" y="161" width="122" height="5" rx="2.5" fill="#C7C7CC"/>
+<rect x="598" y="180" width="190" height="5" rx="2.5" fill="#C7C7CC"/>
+<rect x="598" y="199" width="152" height="5" rx="2.5" fill="#C7C7CC"/>
+<rect x="598" y="218" width="96" height="5" rx="2.5" fill="#C7C7CC"/>
+<text x="592" y="267" font-size="13.5" fill="#6E6E73">agents</text>
+<rect x="646" y="252" width="126" height="20" rx="2" fill="#FFFFFF" stroke="#C7C7CC"/>
+<text x="667" y="267" font-size="13.5" fill="#1D1D1F">Port test s…</text>
+<text x="781" y="267" font-size="13.5" fill="#6E6E73">Review…</text>
+<circle cx="657" cy="262" r="4" fill="#1B7F4B"/>
+<text x="580" y="302" font-size="15.5" fill="#1D1D1F">Tab named for the task,</text>
+<text x="580" y="323" font-size="15.5" fill="#1D1D1F">state as a glyph. Tabs exist</text>
+<text x="580" y="344" font-size="15.5" fill="#1D1D1F">only for live work.</text>
+</svg>

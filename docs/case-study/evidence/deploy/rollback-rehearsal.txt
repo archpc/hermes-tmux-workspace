@@ -1,0 +1,21 @@
+== rollback rehearsal 19:29:16 (private socket hxlab, session rb)
+-- v3 up
+hermes-tmux: workspace ready  (@101)
+  1 zsh panes=1
+  2 agents panes=1
+-- v3 down
+hermes-tmux: closed 1 pane(s) and 1 window(s)
+-- checkout tag v2-two-per-window, up
+hermes-tmux: workspace ready  (@102)
+  1 zsh panes=1
+  2 hx:workers panes=1
+  3 hx:worker-1 panes=1
+-- v2 down
+hermes-tmux: closed 2 pane(s) and 2 window(s)
+-- back to v3, up
+hermes-tmux: workspace ready  (@104)
+  1 zsh panes=1
+  2 agents panes=1
+hermes-tmux: closed 1 pane(s) and 1 window(s)
+  left: 1 zsh
+user pane alive: %104 zsh

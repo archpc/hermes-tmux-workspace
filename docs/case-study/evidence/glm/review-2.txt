@@ -1,0 +1,32 @@
+│ cache/scratch/glm_r2_fit_probe.py
+│ @@ -0,0 +1,7 @@
+│ +import sys
+│ +sys.path.insert(0, "/Users/sein/Code/hermes-tmux-workspace-ux")
+│ +from hermes_tmux.transcript import Formatter
+│ +f = Formatter(40, colour=False, ascii_mode=True)
+│ +for room in (0, 3, 8, 40):
+│ +    print(room, repr(f._fit("x" * 100, room)))
+│ +print("40 with marker fits:", repr(f._fit("y" * 100, 40)))
+VERDICT: PASS
+
+BLOCKERS: none.
+
+Round-1 BLOCKER 1 is closed. Traced `watch.py:_merge` (watch.py:742-756) against the snapshot `tabs0/dismissed0` (watch.py:606-607), applied under lock in `_apply` (watch.py:728-737):
+
+(a) open publishes K while K sat in the snapshot's dismissed map: tabs merge never touches K (absent from both `tabs0` and `tabs`), open's record survives; dismissed merge sees K unchanged (`before.get(K) == value`), so open's pop of `dismissed[K]` (cli.py:637) is preserved. Clean. (b) pass retires K while open re-creates it: tabs Phase B requires `current.get(K) == tabs0[K]`; open's new record differs, so it survives. The pass sets `dismissed[K]=now` in `_retire`, but blocked (watch.py:751-752) suppresses re-adding it when K now has a live tab and was not in `dismissed0`. Critically, the pass's step 5 also sees `wkey in dismissed` (set at `_retire`, watch.py:648) and does not open a second window. Clean. (c) two keys changed: per-key diff, independent. (d) user closes a tab mid-pass: layout was never updated by the kill, so `_apply` rewrites the same stale record; next pass step 1 dismisses it. No loss, no duplication. Regression test (tests/test_tab_merge.py) places the race inside `new_window` via a hook and fails under wholesale replacement; runs green. Residual: pass and `open` both *creating* K's first tab concurrently is last-writer-wins on the same key, leaving one decorated orphan window until `down` (NB below).
+
+NON-BLOCKING:
+
+1. Q5, real leak: `quiet_tty` (transcript.py:287-297) never restores termios, and `run_tail` calls it before the follow check (transcript.py:318-319). `tail` is a user-facing subcommand with `--no-follow` (cli.py:906-908), so `hermes-tmux tail f --no-follow` in a user's own interactive shell exits leaving ECHO off in their shell (recoverable with `reset`). Worker/coordinator panes are safe: the pane's pty is destroyed with the process, dead panes accept no input, and tmux never reuses a pty for a new shell. Fix: call `quiet_tty` only when following, or restore in a `finally` for the non-follow path.
+2. Q3: step 1 (watch.py:616-623) cannot distinguish a real mismatch from a transient tmux failure — `format_of` returns `""` on any non-zero rc (tmuxio.py:132-134), and a failed `show-options` reads as "not ours". One failed call forgets a healthy tab: work is hidden until `open`, the follower keeps running unrecorded, `down` still reaps it by marker. Rare and self-healing, so acceptable, but a single retry before dismissing would separate transient from real.
+3. Same-key race residual above: two windows for one worker if `open` and the coordinator's step 5 both create its first tab. Window is the length of one `new_window`; orphan is decorated and reaped by `down`.
+4. Q4: the probe race is real. `_lock_held` (cli.py:89-102) holds `LOCK_EX` between flock and unlock; a coordinator starting inside that window fails its `LOCK_EX|LOCK_NB` (watch.py:865-867) and exits 0 silently. Window is microseconds, the probe runs once per `down`, and the consequence is only a missed start the user retries — not state corruption. Worth an inline comment.
+5. Case (b) side effect: when K was already in `dismissed0`, the pass overwrites open's cleared entry with `now` — inert while the tab lives, so harmless.
+6. Stale rationale: tmuxio.py:347-349 and the `_killable` docstring claim pane options are inherited by splits; the experiment disproves that on tmux 3.8. Harmless belt-and-suspenders, but the comment states a false fact.
+7. tests/test_tmux_integration.py carries uncommitted working-tree modifications (docstring/imports) beyond HEAD.
+
+NB 1 (round 1): refuted by experiment. Commands on private socket `glm_probe_r2 -f /dev/null`: new-session; `set-option -w -t @0 @hx 1`; `set-option -p -t %0 @hx 1`; `split-window -d -t @0 'sleep 300'`; `show-options -p -t %1 @hx` → `invalid option: @hx`, rc=1 (first pane `%0` → `@hx 1`, rc=0); format read `#{@hx}` on %1 falls back to `1`; `#{pane_start_command}` → `"sleep 300"`. Server killed. The split pane has no own `@hx`, so `_has_own_option` is false and `_killable` returns "not ours" before any command check. My round-1 claim does not stand.
+
+Q6: no new invariant violations. Kill-safety holds (per-pane proof intact; recorded ids only nominate, filtered by `window_exists`, stale ids carry no killable pane). Nothing is written to windows the pass does not own (moved-pane test asserts zero writes to `@user`). All suite runs green: 19 (tab_merge+tabs), 33 integration, 106 transcript/render/lifecycle/existence, 33 races/concurrency/honesty/isolation. `_fit` verified by execution: room 0/3 → bare `...`, room 8 → `xxxxx...`, room 40 → whole marker, never over width.
+
+VERIFIED: all of the above (experiment, traces, test runs, `_fit` probe). INFERRED: the microsecond size of the `_lock_held` window and the rarity of transient tmux command failures; the both-sides-open interleaving was traced, not reproduced.

@@ -1,0 +1,8 @@
+- ported tests/test_tmux_integration.py to v3 tab model (agents window, layout.tabs, @hx_head/@hx_glyph)
+- run 1: Ran 33 tests, OK, 42.9s (TMUX_TMPDIR=mktemp -d, private -L socket)
+- replaced: test_max_two_panes_per_window... -> test_every_worker_tab_holds_one_pane_and_its_header_carries_identity
+- replaced: test_v1_layout_migrates... -> test_stale_v1_layout_naming_user_panes_causes_no_damage
+- final: tests.test_tmux_integration Ran 33 tests, OK, ~41-43s (5 clean runs)
+- dependants OK: concurrency+existence+isolation_guards+lifecycle+layout_races = 15 tests, OK, ~30s
+- pgrep -fl hx_it_ : nothing; no sockets left in TMUX_TMPDIR or /tmp/tmux-<uid>
+- only tests/test_tmux_integration.py modified; not committed

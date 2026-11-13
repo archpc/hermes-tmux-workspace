@@ -1,0 +1,13 @@
+       HERMES AGENTS · main                                                                                            idle
+
+       Nothing running.
+
+       RECENT
+       ✓ Reconstruct the v1 and v2 history of the Hermes tmux workspace from its repository                  30s ago  tab 4
+         3m18s · deepseek-v4.1-flash · Written and verified. File: /Users/sein/.hermes/artifacts/hermes-tmux-w…  98adce95#0
+
+       ✓ Compile a sourced evidence inventory for version 3 of the Hermes tmux workspace                     30s ago  tab 5
+         6m54s · deepseek-v4.1-flash · Done. File: /Users/sein/.hermes/artifacts/hermes-tmux-workspace/case-st…  98adce95#1
+
+       ✓ Check the workspace docs for stale statements                                                              11m ago
+captured 2026-11-12 19:39:33

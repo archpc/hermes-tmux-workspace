@@ -1,0 +1,53 @@
+Thu Nov 12 19:22:42 EST 2026
+1 @0 python3.14 panes=1 active=1 @hx=
+2 @2 zsh panes=1 active=0 @hx=
+3 @4 hx:worker-1 panes=2 active=0 @hx=1
+4 @5 hx:worker-2 panes=2 active=0 @hx=1
+5 @7 hx:worker-4 panes=2 active=0 @hx=1
+6 @8 hx:worker-5 panes=2 active=0 @hx=1
+%0 1 python3.14 mode=0
+%6 2 zsh mode=0
+%9 3 tail mode=0
+%17 3 tail mode=0
+%18 4 tail mode=0
+%22 4 tail mode=0
+%16 5 tail mode=0
+%19 5 tail mode=0
+%20 6 tail mode=0
+%21 6 tail mode=0
+{
+  "overview_pane": "%7",
+  "session_id": "$0",
+  "session_name": "main",
+  "tail_panes": {
+    "%16": "deleg_3548b63e#0",
+    "%17": "deleg_c2a09088#0",
+    "%18": "deleg_6b70e59d#0",
+    "%19": "deleg_f78636e3#0",
+    "%20": "deleg_f78636e3#1",
+    "%21": "deleg_f78636e3#2",
+    "%22": "deleg_d673e672#0",
+    "%9": "deleg_cd95a770#0"
+  },
+  "updated": "2026-11-12 19:13:54",
+  "worker_assign": {
+    "deleg_3548b63e#0": "4",
+    "deleg_427f4b2c#0": "2",
+    "deleg_6b70e59d#0": "2",
+    "deleg_c2a09088#0": "1",
+    "deleg_cd95a770#0": "1",
+    "deleg_d673e672#0": "2",
+    "deleg_f0b03414#0": "4",
+    "deleg_f0b03414#1": "4",
+    "deleg_f78636e3#0": "4",
+    "deleg_f78636e3#1": "5",
+    "deleg_f78636e3#2": "5"
+  },
+  "worker_windows": {
+    "1": "@4",
+    "2": "@5",
+    "4": "@7",
+    "5": "@8"
+  },
+  "workers_window": "@3"
+}

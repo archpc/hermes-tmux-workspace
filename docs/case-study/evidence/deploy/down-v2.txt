@@ -1,0 +1,1 @@
+hermes-tmux: closed 8 pane(s) and 4 window(s)

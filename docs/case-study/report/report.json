@@ -1,0 +1,19 @@
+{
+  "title": "Hermes tmux Workspace",
+  "subtitle": "Designing an Observable Multi-Agent Development Environment",
+  "kind": "Case Study",
+  "topic": "Agent tooling · Terminal UX",
+  "report_id": "RR-2026-1112-HX",
+  "version": "1.0",
+  "date": "2026-11-12",
+  "classification": "Internal",
+  "baseline": "v2 · two transcripts per window · a17522d",
+  "target": "v3 · one worker per tab · ade244b",
+  "baseline_short": "v2",
+  "target_short": "v3",
+  "prepared_by": "Sein",
+  "source": "Repository history, design record, review transcripts, journal, window captures",
+  "short_title": "Hermes tmux Workspace",
+  "standfirst": "Three layouts in one day. The third stopped arranging transcripts and started showing work: one worker per tab, named for its task, gone when it is no longer live.",
+  "section_breaks": false
+}

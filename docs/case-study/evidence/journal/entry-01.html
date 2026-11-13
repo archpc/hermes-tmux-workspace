@@ -1,0 +1,8 @@
+<div><b>2026-11-12 18:05 — Baseline and assumptions challenged</b></div>
+<ul>
+<li><b>Progress:</b> Inspected repo (main a17522d, layout v2), live session, and a faithful v2 render on a private tmux socket. Baseline screenshots taken.</li>
+<li><b>Baseline findings:</b> 4 tabs named hx:worker-1..4 hold 8 finished transcripts up to 9 h old; nothing running. Overview is a 7-column table keyed by opaque ids, monochrome, 40 history rows, half the pane empty. Attention badge "!" is permanent (2 old failures never clear). Transcripts are raw tail -F: no colour, no hanging indent, kickoff line is a wall of text.</li>
+<li><b>Assumptions challenged:</b> (1) two workers per window — pairing forces slot packing, tiled reflow and an aggregate tab state; (2) settled workers keep a tab forever; (3) a user-killed worker window is recreated; (4) numeric tab names; (5) tail -F as the only honest renderer; (6) overview as a table; (7) actual client is Ghostty as well as iTerm2 — design targets native tmux, not an emulator.</li>
+<li><b>Evidence:</b> ~/.hermes/artifacts/hermes-tmux-workspace/ux-redesign/baseline/ (v2-overview.png, v2-worker-1.png, v2-worker-3.png, status.txt)</li>
+<li><b>Next:</b> build v3 slice in worktree ~/Code/hermes-tmux-workspace-ux (branch feat/ux-v3); installed v2 untouched until validated.</li>
+</ul>

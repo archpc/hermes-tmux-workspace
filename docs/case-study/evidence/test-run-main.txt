@@ -1,0 +1,12 @@
+repo: /Users/sein/Code/hermes-tmux-workspace
+commit: ce69f1cd5298c800287c5e13f5d7633e5e9e3c02 (v2-two-per-window-2-gce69f1c)
+started: 2026-11-12 19:33:55 EST
+command: TMUX_TMPDIR=$(mktemp -d) python3 -m unittest discover -s tests -t .
+....hermes-tmux: running the suite in hx:tests
+....................................................................................................................................................................................................................................................................................
+----------------------------------------------------------------------
+Ran 308 tests in 109.503s
+
+OK
+finished: 2026-11-12 19:35:44 EST
+leftover private tmux servers: 0
