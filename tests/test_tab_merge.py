@@ -69,6 +69,9 @@ class FakeTmux:
     def current_session_id(self):
         return "$0"
 
+    def group_sessions(self, session_id):
+        return [session_id]      # no grouped sessions in this model
+
     def pane_exists(self, pane_id):
         return pane_id in self.windows.values()
 

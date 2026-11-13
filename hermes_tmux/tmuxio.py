@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -113,18 +114,94 @@ def server_pid() -> str:
     return out.strip() if rc == 0 else ""
 
 
+#: Window option on the overview window: the key of the workspace it belongs to.
+#: Windows are what a session group shares, so this is where identity can live
+#: without depending on which session a command happens to resolve to.
+KEY_OPTION = "@hx_key"
+
+
+def _server_digest() -> str:
+    sock = socket_path()
+    material = "%s|%s" % (sock, server_pid())
+    return hashlib.sha1(material.encode("utf-8", "replace")).hexdigest()[:8] if sock else "nosock"
+
+
+def group_sessions(session_id: str) -> List[str]:
+    """Every session that shares its windows with ``session_id``, itself included, lowest id first.
+
+    ``new-session -t <session>`` puts both sessions in one group with one set of
+    windows. A session outside any group is its own list.
+    """
+    if not session_id:
+        return []
+    rc, out = run("list-sessions", "-F", "#{session_id}\t#{session_group}")
+    rows = [line.split("\t") for line in out.splitlines()] if rc == 0 else []
+    group = next((row[1] for row in rows if len(row) > 1 and row[0] == session_id), "")
+    members = [row[0] for row in rows if group and len(row) > 1 and row[1] == group]
+    if session_id not in members:
+        members.append(session_id)
+
+    def _number(sid: str) -> int:
+        try:
+            return int(sid.lstrip("$"))
+        except ValueError:
+            return 1 << 30
+    return sorted(set(members), key=_number)
+
+
+def marked_key(session_id: str) -> Optional[str]:
+    """Key recorded on a window of ours among this session's windows, if any.
+
+    Believed only on a window that carries our own marker, read as that window's
+    own option (a format read would fall back to a session or global value), and
+    only when it names this server instance.
+    """
+    if not session_id:
+        return None
+    wanted = re.compile(r"^%s-[A-Za-z0-9_]+$" % re.escape(_server_digest()))
+    for win in list_windows(session_id):
+        if not win["ours"]:
+            continue
+        rc, out = run("show-options", "-wv", "-t", win["window_id"], KEY_OPTION)
+        value = out.strip() if rc == 0 else ""
+        if wanted.match(value):
+            return value
+    return None
+
+
+def mark_key(window_id: str, key: str) -> bool:
+    return window_option(window_id, KEY_OPTION, key)
+
+
 def session_key(environ=None, session_id: Optional[str] = None) -> str:
-    """Filesystem-safe, per-server-instance, per-session isolation key.
+    """Filesystem-safe isolation key of the workspace this process belongs to.
+
+    Identity belongs to the workspace, not to a session or a client. With
+    grouped sessions a pane is in several sessions at once and tmux resolves it
+    to whichever was active last, so "the session of this pane" is not stable.
+    Resolution, in order:
+
+    1. the key recorded on the workspace's own overview window (``KEY_OPTION``),
+       which every session of the group sees;
+    2. otherwise, for a workspace that does not exist yet (or was built before
+       the marker existed), the lowest session id of the group. That is the
+       original session, and for an ungrouped session it is the session itself,
+       so keys written before this rule are still found.
 
     The server pid is part of the key on purpose: tmux session ids (``$0``,
     ``$1``) start over when a server restarts, so a key built from the socket
     path and the id alone collides with the previous incarnation and makes a
     new session adopt a dead session's layout, including its pane ids.
     """
-    sock = socket_path()
-    material = "%s|%s" % (sock, server_pid())
-    digest = hashlib.sha1(material.encode("utf-8", "replace")).hexdigest()[:8] if sock else "nosock"
-    sid = session_id or current_session_id() or "unknown"
+    digest = _server_digest()
+    if session_id is None:
+        current = current_session_id()
+        marked = marked_key(current) if current else None
+        if marked:
+            return marked
+        members = group_sessions(current) if current else []
+        session_id = members[0] if members else None
+    sid = session_id or "unknown"
     safe = "".join(ch if ch.isalnum() else "_" for ch in sid)
     return "%s-%s" % (digest, safe)
 

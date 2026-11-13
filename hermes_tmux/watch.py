@@ -575,6 +575,18 @@ def _active_window(session_id: str) -> str:
     return parts[1]
 
 
+def _windows_in_view(session_id: str) -> set:
+    """Windows some reader is looking at: one per attached session of the group.
+
+    Sessions of one group share the windows but each has its own current
+    window, so a tab can be on screen in a second terminal while the session
+    the workspace is anchored to shows something else.
+    """
+    views = {_active_window(sid) for sid in (tmuxio.group_sessions(session_id) or [session_id])}
+    views.discard("")
+    return views
+
+
 def _settled_at(worker) -> Optional[float]:
     from .render import _activity_at
     activity = _activity_at(worker)
@@ -644,9 +656,9 @@ def reconcile_tabs(key: str, workers: Sequence, home: Optional[Path] = None,
             dismissed[wkey] = now
 
     # 2. Looking at a tab acknowledges it and restarts its linger clock.
-    active = _active_window(session_id)
+    active = _windows_in_view(session_id)
     for wkey, tab in tabs.items():
-        if active and tab.get("window") == active:
+        if tab.get("window") in active:
             tab["seen"] = now
 
     # 3. Note when each tab's worker settled (coordinator clock, so linger is
@@ -673,7 +685,7 @@ def reconcile_tabs(key: str, workers: Sequence, home: Optional[Path] = None,
     def _retirable(wkey: str) -> bool:
         tab = tabs[wkey]
         return ("settled" in tab and not tab.get("pinned")
-                and tab.get("window") != active and wkey not in unknown)
+                and tab.get("window") not in active and wkey not in unknown)
 
     # 4. Let finished work leave.
     for wkey in list(tabs):

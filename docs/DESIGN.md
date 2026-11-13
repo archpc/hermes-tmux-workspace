@@ -278,6 +278,30 @@ A dim `×` at the end of the worker tab in view. Clicking it closes the view.
 | How the handler runs | `run-shell -b`, silent, always exit 0 | tmux prints a run-shell job's output, or a line about a non-zero exit, into the active pane in view mode: the reader's own pane. |
 | Opt-out | `HERMES_TMUX_CLOSE_MARK=0` | Leaves the binding and the formats alone. |
 
-Known limit: commands that derive the session from `TMUX_PANE` (`up`, `open`) can pick the
-wrong session while a grouped session (`new-session -t`) shares the windows, because a pane
-then belongs to both. `close` does not depend on it: it finds the tab through the layouts.
+## 7. Workspace identity is not session identity
+
+Found while deploying the close mark: with a grouped session present (`tmux new-session -t main`),
+`up` or `open` from a shell could build a second workspace beside the first: second state
+directory, second overview, second coordinator.
+
+Root cause. The key was `server digest + session id`, and the session id came from
+`display-message -t $TMUX_PANE '#{session_id}'`. Sessions of one group share every window, so the
+pane is in all of them, and tmux resolves it to the session with the latest activity. The answer
+changes when a second terminal is used, or merely when a grouped session is created. That answer
+is right for focus (it is where the reader is) and wrong for identity.
+
+| Question | Decision | Why |
+|---|---|---|
+| What identifies a workspace | Its own overview window carries the key (`@hx_key`), believed only on a window with our marker, read as the window's own option, and only for this server instance | Windows are exactly what a group shares. Every session of the group resolves the same key, and the key survives any one session ending. |
+| Before a workspace exists, or one built before the marker | Lowest session id of the group | That is the original session. For an ungrouped session it is the session itself, so existing keys are found unchanged and nothing needs migrating. |
+| Which session the coordinator is tied to | The recorded one while it lives; otherwise the oldest of the group. Never the session tmux resolved the pane to | A view coming and going must not stop the coordinator. If the anchor session itself ends, the coordinator stops as before, and the next `up` from a surviving session re-anchors the same workspace. |
+| In view | The current window of every attached session of the group | A tab on screen in a second terminal is being looked at, whatever the anchor session shows. |
+| Focus (`open`, `worker N`, aux) | Unchanged: tmux picks the most recently active session | That is the terminal the command was typed in. |
+| Concurrent `up` | One at a time under a lock file | Independent of groups: six concurrent `up` calls built six overview windows. Found by the same test run. |
+
+Not changed: ownership proofs, pane closing, `down`, coordinator exit rules, key format.
+
+Known limits. If the overview window is closed by hand and the original session is also gone, the
+marker is lost and a later `up` keys a new workspace; the old tabs are still ours and `down`
+closes them. Linking the overview window into an unrelated session (`link-window`) makes that
+session resolve to this workspace; its anchor is left where it was.

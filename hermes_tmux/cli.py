@@ -8,6 +8,8 @@ kills a pane, window, or session it did not create.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -186,11 +188,47 @@ def cmd_up(args) -> int:
         print("  status still works outside tmux:  hermes-tmux status")
         return 0
 
+    # One `up` at a time: two that both find no overview would each
+    # build one, and the click binding is wrapped by check-then-bind.
+    with _server_lock():
+        return _up()
+
+
+@contextlib.contextmanager
+def _server_lock():
+    root = watch.state_root()     # beside sessions/, whose entries are all session directories
+    root.mkdir(parents=True, exist_ok=True)
+    with open(str(root / "up.lock"), "a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _anchor(layout: Dict) -> Tuple[str, str]:
+    """(id, name) of the session the workspace's coordinator is tied to.
+
+    Any session of the group can address the shared windows; the anchor only
+    decides whose end stops the coordinator. Keep the recorded one while it
+    lives, so a second terminal coming and going changes nothing. Otherwise
+    take the oldest session of the group, never the one tmux resolved this
+    pane to: that is whichever was active last, often a short-lived view.
+    """
+    recorded = layout.get("session_id") or ""
+    if recorded and tmuxio.session_alive(recorded):
+        session_id = recorded
+    else:
+        members = tmuxio.group_sessions(tmuxio.current_session_id() or "")
+        session_id = members[0] if members else ""
+    return session_id, (tmuxio.format_of(session_id, "#{session_name}") if session_id else "")
+
+
+def _up() -> int:
     key = tmuxio.session_key()
     _ensure_state_dir(key)
     layout = watch.read_layout(key)
-    session_id = tmuxio.current_session_id() or ""
-    session_name = tmuxio.current_session_name() or ""
+    session_id, session_name = _anchor(layout)
     layout["session_id"] = session_id
     layout["session_name"] = session_name
 
@@ -217,6 +255,8 @@ def cmd_up(args) -> int:
 
     layout["workers_window"] = window_id
     tmuxio.mark_window(window_id)
+    # The workspace's identity travels with its own window from here on.
+    tmuxio.mark_key(window_id, key)
 
     panes = tmuxio.wait_for_panes(window_id)
     if not panes:
