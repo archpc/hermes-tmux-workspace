@@ -23,6 +23,8 @@ hermes-tmux status        # the overview once; works outside tmux too
 hermes-tmux status --all  # every recorded worker, not only the recent ones
 hermes-tmux worker 2      # focus the 2nd worker tab
 hermes-tmux open 427f4b2c#1   # open the transcript of any worker, old ones too
+hermes-tmux close         # close the worker tab you are in (the view, never the worker)
+hermes-tmux close-mark off    # remove the clickable × and restore the click binding (on | off | status)
 hermes-tmux logs          # open/focus hx:logs   (also: tests debug rea)
 hermes-tmux debug-report  # windows, panes, ownership flags, watcher pid
 hermes-tmux down          # close only panes this tool created; a window that
@@ -87,6 +89,10 @@ Rules the display keeps:
 - **Closing a tab is yours to decide.** A tab you close is not reopened. The
   worker stays listed in `agents`, and `hermes-tmux open <id>` brings its
   transcript back as a tab that stays until you close it.
+- **The × on the tab in view closes the view, not the worker.** Click it, or run
+  `hermes-tmux close`. The worker keeps running and the status line says so. It
+  appears only on a worker tab, only while that tab is the one in view. There is
+  no way to cancel a worker from here, and the × is not one.
 - **At most eight worker tabs.** A new running worker takes the place of the
   oldest finished tab; a running tab is never closed to make room.
 - **How a run ended is not a verdict on the work.** `run ended: provider_error`
@@ -105,6 +111,7 @@ Environment:
 | `HERMES_TMUX=0` | tool off for this shell |
 | `HERMES_TMUX_TRANSCRIPT=raw` | worker panes run `tail -F` instead of the styled follower |
 | `HERMES_TMUX_LINGER_S=<n>` | seconds a finished worker keeps its tab (default 300) |
+| `HERMES_TMUX_CLOSE_MARK=0` | no × on worker tabs and the status-line click binding is left alone |
 | `HERMES_TMUX_ASCII=1` | ASCII glyphs (`*` `~` `+` `x`, `...`); automatic when the locale is not UTF-8 |
 | `NO_COLOR=1` | no colour in the overview and transcripts |
 

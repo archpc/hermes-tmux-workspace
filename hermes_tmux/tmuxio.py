@@ -113,7 +113,7 @@ def server_pid() -> str:
     return out.strip() if rc == 0 else ""
 
 
-def session_key(environ=None) -> str:
+def session_key(environ=None, session_id: Optional[str] = None) -> str:
     """Filesystem-safe, per-server-instance, per-session isolation key.
 
     The server pid is part of the key on purpose: tmux session ids (``$0``,
@@ -124,7 +124,7 @@ def session_key(environ=None) -> str:
     sock = socket_path()
     material = "%s|%s" % (sock, server_pid())
     digest = hashlib.sha1(material.encode("utf-8", "replace")).hexdigest()[:8] if sock else "nosock"
-    sid = current_session_id() or "unknown"
+    sid = session_id or current_session_id() or "unknown"
     safe = "".join(ch if ch.isalnum() else "_" for ch in sid)
     return "%s-%s" % (digest, safe)
 

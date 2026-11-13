@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from . import gate, tmuxio, watch
+from . import closemark, gate, tmuxio, watch
 from .env import pane_env, python as _env_python, repo_root as _env_repo_root
 
 WORKERS_WINDOW = watch.OVERVIEW_WINDOW
@@ -257,6 +257,10 @@ def cmd_up(args) -> int:
     # and no border line above a pane that already has its own heading.
     from . import labels
     watch.decorate_window(window_id, header=False, ascii_mode=labels.ascii_only())
+    if closemark.enabled():
+        ok, why = closemark.install(_close_handler())
+        if not ok:
+            print("hermes-tmux: close mark not installed (%s)" % why)
 
     def _apply(current):
         current["session_id"] = session_id
@@ -336,6 +340,10 @@ def cmd_down(args) -> int:
         sdir.rmdir()
     except OSError:
         pass
+    if not any(_watcher_alive(other) for other in _server_keys() if other != key):
+        # The click binding is per server. It goes when the last workspace on
+        # this server goes; until then it falls through for every other click.
+        closemark.restore()
     closed_windows = sum(1 for window_id in before_windows
                          if not tmuxio.window_exists(window_id))
     print("hermes-tmux: closed %d pane(s) and %d window(s)"
@@ -647,6 +655,126 @@ def cmd_open(args) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- close mark
+
+def _close_handler() -> str:
+    """Shell command the status-line binding runs for a click on a mark.
+
+    Silent and always 0: tmux shows the output of a ``run-shell`` job, and a
+    line about one that ends non-zero, in the active pane in view mode, which
+    is the reader's own pane.
+    """
+    command = _self_command("close", "--quiet", "--client", "#{client_name}",
+                            "#{mouse_status_range}").replace("&& exec env ", "&& env ", 1)
+    return "%s >/dev/null 2>&1; true" % command
+
+
+def _server_keys() -> List[str]:
+    """Session keys with state on disk for the tmux server we are talking to."""
+    digest = tmuxio.session_key(session_id="x").split("-", 1)[0]
+    try:
+        return sorted(p.name for p in (watch.state_root() / "sessions").iterdir()
+                      if p.is_dir() and p.name.startswith(digest + "-"))
+    except OSError:
+        return []
+
+
+def _tab_of_window(window_id: str) -> Tuple[str, str, Dict]:
+    """(session key, worker key, tab record) of the worker tab in ``window_id``.
+
+    Looked up in the layouts, not derived from the window's session: with
+    grouped sessions one window belongs to several, and only one of them is
+    the session the workspace was built in.
+    """
+    for key in _server_keys():
+        for wkey, tab in (watch.read_layout(key).get("tabs") or {}).items():
+            if isinstance(tab, dict) and tab.get("window") == window_id:
+                return key, wkey, tab
+    return "", "", {}
+
+
+def cmd_close(args) -> int:
+    """Close the view of one worker tab. The worker itself is not touched."""
+    quiet = bool(getattr(args, "quiet", False))
+    client = getattr(args, "client", "") or ""
+
+    def say(text: str, code: int) -> int:
+        if client:
+            tmuxio.run("display-message", "-c", client, text)
+        if not quiet:
+            print("hermes-tmux: %s" % text)
+        return 0 if quiet else code
+
+    if not gate.enabled():
+        return say(gate.disabled_reason(), 0)
+    if not tmuxio.in_tmux():
+        return say("not inside tmux.", 0)
+    raw = getattr(args, "target", "") or ""
+    if raw:
+        window_id = closemark.parse_target(raw)
+        if window_id is None:
+            return say("not a close target: %r" % raw, 2)
+    else:
+        window_id = tmuxio.format_of(os.environ.get("TMUX_PANE") or "", "#{window_id}").strip()
+    if not window_id or not tmuxio.window_exists(window_id):
+        return say("no such window: %s" % (window_id or "?"), 3)
+    key, wkey, tab = _tab_of_window(window_id)
+    if not wkey:
+        # Not a worker tab: the reader's own windows, the overview, the aux
+        # panes. Nothing is closed and nothing is asked of tmux.
+        return say("not a worker tab: left alone", 4)
+    closed = 0
+    for pane in tmuxio.list_panes(window_id):
+        if tmuxio.close_pane(pane["pane_id"])[0]:
+            closed += 1
+    if not closed:
+        return say("no pane of ours in that tab: left alone", 4)
+
+    def _apply(current):
+        tabs = current.get("tabs") or {}
+        if (tabs.get(wkey) or {}).get("window") == window_id:
+            tabs.pop(wkey, None)
+        current.setdefault("dismissed", {})[wkey] = time.time()
+        return current
+    watch.update_layout(key, _apply)
+
+    ref = wkey.replace("deleg_", "")
+    ref = "%s#%s" % (ref.split("#", 1)[0][-8:], ref.split("#", 1)[1]) if "#" in ref else ref[-8:]
+    text = "view closed"
+    if "settled" not in tab:
+        text += "; worker still running"
+    text += " (reopen: hermes-tmux open %s)" % ref
+    if tmuxio.window_exists(window_id):
+        text += "; your pane in that tab was left"
+    return say(text, 0)
+
+
+def cmd_close_mark(args) -> int:
+    """Turn the clickable mark on or off for this server without rebuilding anything."""
+    if not tmuxio.in_tmux():
+        print("hermes-tmux: not inside tmux.")
+        return 0
+    from . import labels
+    windows = [tab.get("window") for key in _server_keys()
+               for tab in (watch.read_layout(key).get("tabs") or {}).values()
+               if isinstance(tab, dict) and tab.get("window")]
+    windows = [wid for wid in windows if tmuxio.window_exists(wid) and tmuxio.owns_window(wid)]
+    if args.action == "status":
+        marked = sum(1 for wid in windows if closemark.has_mark(closemark._own_format(wid)))
+        print("hermes-tmux: close mark binding %s; %d of %d worker tab(s) marked"
+              % ("installed" if closemark.installed() else "not installed", marked, len(windows)))
+        return 0
+    if args.action == "on":
+        ok, why = closemark.install(_close_handler())
+        changed = sum(1 for wid in windows if closemark.mark_window(wid, labels.ascii_only()))
+        print("hermes-tmux: close mark %s; %d tab(s) marked" % (why, changed))
+        return 0 if ok else 1
+    ok, why = closemark.restore()
+    changed = sum(1 for wid in windows if closemark.unmark_window(wid))
+    print("hermes-tmux: close mark %s; %d tab(s) unmarked" % (why, changed))
+    return 0 if ok else 1
+
+
 def cmd_tail(args) -> int:
     from .transcript import run_tail
     return run_tail(args.log, follow=not args.no_follow)
@@ -908,6 +1036,16 @@ def build_parser() -> argparse.ArgumentParser:
     openp = sub.add_parser("open", help="open the transcript tab of any worker by id")
     openp.add_argument("ref", help="delegation id or id#task, as shown by `status`")
     openp.set_defaults(func=cmd_open)
+    closep = sub.add_parser("close", help="close a worker's tab (the view, never the worker)")
+    closep.add_argument("target", nargs="?", default="",
+                        help="window id (@N); default: the tab this command runs in")
+    closep.add_argument("--client", default="", help="client to show the result to")
+    closep.add_argument("--quiet", action="store_true",
+                        help="print nothing and exit 0 (how the click binding calls it)")
+    closep.set_defaults(func=cmd_close)
+    markp = sub.add_parser("close-mark", help="clickable close mark on worker tabs: on, off, status")
+    markp.add_argument("action", choices=["on", "off", "status"])
+    markp.set_defaults(func=cmd_close_mark)
     tailp = sub.add_parser("tail", help="print a transcript readably and follow it")
     tailp.add_argument("log")
     tailp.add_argument("--no-follow", action="store_true")

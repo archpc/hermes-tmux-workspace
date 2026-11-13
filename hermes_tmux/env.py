@@ -27,7 +27,8 @@ def python() -> str:
 #: Reader preferences that must reach every process this tool starts. They are
 #: read from the shell that ran the command; the tmux server's environment is
 #: older and does not have them.
-_PASSTHROUGH = ("HERMES_TMUX_TRANSCRIPT", "HERMES_TMUX_LINGER_S", "NO_COLOR")
+_PASSTHROUGH = ("HERMES_TMUX_TRANSCRIPT", "HERMES_TMUX_LINGER_S", "HERMES_TMUX_CLOSE_MARK",
+                "NO_COLOR")
 
 
 def pane_env() -> Dict[str, str]:

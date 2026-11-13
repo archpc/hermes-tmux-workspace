@@ -183,7 +183,10 @@ real and are fixed here:
 - No launching of subagents from the tmux layer.
 - This tool never edits `tmux.conf` and sets no global tmux options: the only options
   it writes are on windows and panes it created (`@hx`, `@hx_glyph`, `@hx_head`,
-  `pane-border-*`, and a `window-status-format` derived from the user's own). (The
+  `pane-border-*`, and a `window-status-format` derived from the user's own). One
+  exception since the close mark (section 6): the server's `MouseDown1Status` binding
+  is wrapped, with the previous binding kept as its else-branch and recorded in the
+  server option `@hx_prev_mouse1` so it can be put back exactly. (The
   user's `tmux.conf` was hardened separately during the shell-integration audit; that
   work is described in `docs/NOTES-tmux.md`, not done by the CLI.)
 - No killing of pre-existing sessions, windows, or panes.
@@ -260,3 +263,21 @@ a transcript cannot be set up, a `think` preview is shown as well as the message
 it previews; with several clients of different sizes attached, tmux sizes each
 window for the client that used it last.
 
+## 6. Close mark on the tab in view
+
+A dim `×` at the end of the worker tab in view. Clicking it closes the view.
+
+| Question | Decision | Why |
+|---|---|---|
+| What it closes | The pane that follows the transcript, by the same ownership proof as everything else (`tmuxio.close_pane`) | The worker is a Hermes subagent in another process. It keeps running, stays in the overview, and `open <id>` brings the tab back. This is the existing "a tab the reader closed stays closed" rule, reachable by mouse. |
+| Cancel | Not offered | This tool has no cancel API (S4 is bound to the TUI transport). A mark that looked like "stop" would lie. The message after a close says "worker still running" when it is. |
+| Which tabs | Worker tabs only, and only the one in view (`window-status-current-format`) | Compared with a mark on every tab: four more crosses beside the failed-state glyph, and a slip while aiming at a tab name would close instead of select. You can only close what you are looking at. Cost: closing a background tab is two clicks. |
+| Which window a click names | The window id travels in the range argument (`range=user\|hxc@N`) | For a user range tmux's mouse target `=` is the current window, not the clicked one (measured). |
+| What a close may touch | A window recorded as a worker tab in a layout of this server, then each pane on its own proof | A forged or stale target cannot close the reader's windows, the overview, or an aux pane. A pane the reader split into a tab stays. |
+| The binding | `MouseDown1Status` wrapped in `if -F '#{m:hxc@*,#{mouse_status_range}}'`; previous binding verbatim as the else-branch; restored by `close-mark off` and by the last `down` on the server | tmux gives a click a behaviour only through a key binding, and bindings are per server. Every click that is not on a mark behaves exactly as before. |
+| How the handler runs | `run-shell -b`, silent, always exit 0 | tmux prints a run-shell job's output, or a line about a non-zero exit, into the active pane in view mode: the reader's own pane. |
+| Opt-out | `HERMES_TMUX_CLOSE_MARK=0` | Leaves the binding and the formats alone. |
+
+Known limit: commands that derive the session from `TMUX_PANE` (`up`, `open`) can pick the
+wrong session while a grouped session (`new-session -t`) shares the windows, because a pane
+then belongs to both. `close` does not depend on it: it finds the tab through the layouts.

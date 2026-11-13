@@ -539,8 +539,13 @@ def _tab_format(option: str, ascii_mode: bool = False, worker: bool = True) -> s
 def decorate_window(window_id: str, header: bool = True,
                     ascii_mode: bool = False) -> None:
     """Window-scoped presentation for a window we created (never global)."""
+    from . import closemark
     for option in ("window-status-format", "window-status-current-format"):
         fmt = _tab_format(option, ascii_mode, worker=header)
+        # Worker tabs only, and only the tab in view: one quiet mark, and a
+        # click aimed at another tab's name can never close it instead.
+        if fmt and header and option == "window-status-current-format" and closemark.enabled():
+            fmt = closemark.with_mark(fmt, window_id, ascii_mode)
         if fmt:
             tmuxio.window_option(window_id, option, fmt)
     if header:
