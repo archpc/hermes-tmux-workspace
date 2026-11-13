@@ -36,7 +36,7 @@ MAX_CONTENT_WIDTH = 118
 _FAIL_STATES = ("failed", "fail", "error", "errored", "crashed", "interrupted",
                 "cancelled", "canceled", "timeout", "timed_out", "killed")
 
-_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
 
 # --------------------------------------------------------------------------- #

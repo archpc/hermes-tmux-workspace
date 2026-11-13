@@ -19,7 +19,20 @@ _ARTICLES = {"the", "a", "an", "please"}
 _CLAUSE_BREAKS = (". ", " \u2014 ", " -- ", " - ", ": ", "\n")
 _DATE_SUFFIX = re.compile(r"-\d{4,8}$")
 _WS = re.compile(r"\s+")
-_CTRL = re.compile(r"[\x00-\x1f\x7f]")
+_CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+#: A complete terminal escape sequence: CSI, OSC, DCS/SOS/PM/APC, or a short
+#: two-character escape. An unterminated OSC/DCS swallows the rest of the line:
+#: there is no way to show the remainder safely.
+_ESCAPE_SEQ = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]"
+    r"|\][^\x07\x1b]*(?:\x07|\x1b\\)?"
+    r"|[PX^_][^\x1b]*(?:\x1b\\)?"
+    r"|[@-_])"
+)
+#: C0 (except tab), DEL and C1 controls, and the bidi overrides that reorder
+#: what a reader sees without changing the bytes.
+_CTRL_ALL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+_BIDI = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
 #: state -> (unicode glyph, ascii glyph, 256-colour index, word)
 _STATES: Dict[str, Tuple[str, str, int, str]] = {
@@ -80,6 +93,21 @@ def clean(value: Any) -> str:
     return _WS.sub(" ", _CTRL.sub(" ", _text(value))).strip()
 
 
+def defuse(value: Any) -> str:
+    """Make transcript text inert before it reaches a terminal.
+
+    The file is untrusted input: a tool result, a quoted file, or a model can
+    put ESC sequences in it. A raw OSC 52 writes the reader's clipboard, OSC 8
+    forges a link, CSI moves the cursor or clears the screen, and bidi controls
+    reorder what is displayed without changing what is stored. Escape sequences
+    become a space, other C0/C1 controls become a space, bidi controls are
+    dropped. Tabs survive; ``clean`` is still the one-line normaliser.
+    """
+    text = _ESCAPE_SEQ.sub(" ", _text(value))
+    text = _CTRL_ALL.sub(" ", text)
+    return _BIDI.sub("", text)
+
+
 def title(goal: Any) -> str:
     """The first clause of a goal: what the parent asked for, in its words."""
     raw = _text(goal)
@@ -90,7 +118,7 @@ def title(goal: Any) -> str:
         # end of the thought; cutting there would leave a one-word title.
         if 12 <= at < best:
             best = at
-    text = clean(raw[:best]).rstrip(".:;,")
+    text = clean(defuse(raw[:best])).rstrip(".:;,")
     return text or "(no goal recorded)"
 
 
