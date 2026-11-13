@@ -1,6 +1,6 @@
 # hermes-tmux — design decision record
 
-Status: validated design, implementation in progress.
+Status: implemented and deployed. Sections 1 to 4 record the earlier versions; section 5 is the current design.
 Date: 2026-11-12. Author: parent session (Sein), reviewed independently.
 
 ## 1. What was actually observable (evidence, not assumption)
@@ -83,7 +83,7 @@ Why this and not the alternatives:
 | delegation completes | `manifest.completed` | immediate | dir `NOTE_WRITE` |
 | DB terminal state | `async_delegations.state` | immediate (1 s floor) | `state.db`/`-wal` `NOTE_WRITE` → redraw |
 | review recorded | registry file write | immediate | dir `NOTE_WRITE` |
-| Hermes crashes mid-delegation | no further events | n/a | UI keeps last phase, marks `stalled` after manifest age > 10 min |
+| Hermes crashes mid-delegation | no further events | n/a | UI keeps last phase, marks the worker silent after 10 minutes without a transcript event (`STALL_AFTER_S`) |
 
 `stalled` is a display-only derived label with the rule stated in the pane footer. It is
 not a claim that the task failed.
@@ -110,8 +110,8 @@ not a claim that the task failed.
 ### Gate
 
 `HERMES_TMUX=0` disables everything (all commands become no-ops or read-only status).
-Before validation the default is **off** (`HERMES_TMUX=1` required); the default flips to
-on only after the test suite passes end to end. The default lives in
+The default is **on** (it was off until the suite passed end to end); `HERMES_TMUX=0` opts
+one shell out. The default lives in
 `hermes_tmux/gate.py:DEFAULT_ENABLED`, one boolean, and the flip is covered by a test.
 
 ## 3. Defects found while validating (all fixed, each with a test)
@@ -201,7 +201,7 @@ started from those captures, not from the layout.
 
 | Question | Decision | Why |
 |---|---|---|
-| Grouping | One worker per window, one pane | A tab's state is exactly one worker's state; the transcript gets the whole window; slot packing, tiled reflow and "which pane" disappear. Stays under the two-per-window ceiling. |
+| Grouping | One worker per window, one pane | A tab's state is exactly one worker's state; the transcript gets the whole window; slot packing, tiled reflow and "which pane" disappear. One pane per window, so the earlier two-per-window ceiling no longer applies. |
 | Role tabs (Protocol / Implementation / Review) | Rejected | Hermes records no role for a task. Role tabs would need a classifier reading prose, and a wrong label is worse than none. |
 | One window per delegation | Rejected | Three siblings either break the ceiling or get split anyway; the tab becomes an aggregate. |
 | Tab name | First clause of the goal the parent wrote; articles dropped, paths to basename, words shared by all siblings dropped | The parent already named the task. Stable: decided once, the sibling set is fixed at dispatch. |
