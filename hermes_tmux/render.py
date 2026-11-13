@@ -1,12 +1,18 @@
-"""Pure, deterministic, plain-ASCII renderer for Hermes subagent worker state.
+"""Pure, deterministic renderer for the agents overview.
 
-No imports from ``hermes_tmux.state``: this module accepts any object exposing the
-documented attributes (plain ``getattr`` with defaults), so it is testable in
-isolation with a local stub.
+No imports from ``hermes_tmux.state``: this module accepts any object exposing
+the documented attributes (plain ``getattr`` with defaults), so it is testable
+in isolation with a local stub.
 
-Output is a fixed-width block that is safe to paint into a tmux pane: ASCII only,
-no ANSI escapes, no unicode box drawing, no trailing whitespace, and every line is
-at most ``width`` characters.
+The overview answers three questions in this order and gives each a section:
+what is running now, what needs a look, and what finished recently. A worker is
+named by the task it was given; model, elapsed time and location are secondary
+and sit on a dimmer line. History is one restrained line per worker and never
+pushes live work off the pane.
+
+Every line is at most ``width`` columns and has no trailing whitespace. Colour
+is optional (``colour=True`` adds SGR sequences); the uncoloured text is the
+same characters, so ``status`` in a pipe and the pane agree.
 """
 
 from __future__ import annotations
@@ -15,29 +21,20 @@ import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-#: Kept short on purpose: this is painted on one line and clipped at the pane
-#: width, so a sentence-length legend would silently lose its ending.
-LEGEND = (
-    "legend: STATE from Hermes state; review only when an entry was recorded."
-)
+from . import labels
 
 STALL_AFTER_S = 600  # 10 minutes; display-only, never a failure claim
+#: A failure nobody looked at stops asking for attention after this long. An
+#: alert that can never clear is not an alert: before this rule two failures
+#: from the previous day kept the badge lit permanently.
+ATTENTION_TTL_S = 2 * 3600
+#: Recent-history rows shown by default. Enough to see the last wave of work.
+RECENT_ROWS = 6
+#: Text is easier to scan in a column than across a 188-column pane.
+MAX_CONTENT_WIDTH = 118
 
-# (name, desired width, minimum width). 'goal' takes whatever is left.
-_COLUMNS = (
-    ("key", 11, 8),
-    ("role", 5, 4),
-    ("state", 5, 5),
-    ("model", 16, 8),
-    ("tool", 11, 6),
-    ("age", 5, 3),
-)
-
-# Shrink order: the goal text is the reason the pane exists, so trim the
-# peripheral columns before giving up entirely on a column.
-_SHRINK_ORDER = ("model", "tool", "key", "age", "role", "state")
-
-_DROP_ORDER = ("tool", "model", "role", "state")
+_FAIL_STATES = ("failed", "fail", "error", "errored", "crashed", "interrupted",
+                "cancelled", "canceled", "timeout", "timed_out", "killed")
 
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -162,7 +159,7 @@ def _state_label(worker: Any, now: datetime) -> str:
         return "run"
     if raw in ("done", "completed", "complete", "success", "succeeded", "finished"):
         return "done"
-    if raw in ("failed", "fail", "error", "errored", "crashed"):
+    if raw in _FAIL_STATES:
         return "fail"
     if raw in ("stall", "stalled", "stale"):
         return "stall"
@@ -185,235 +182,348 @@ def _review_status(worker: Any) -> str:
     return "unreviewed"
 
 
-def _model_label(worker: Any) -> str:
-    model = _clean(getattr(worker, "model", None))
-    if not model:
-        return "-"
-    if "/" in model:
-        model = model.rsplit("/", 1)[-1].strip() or model
-    return model
+def _review_note(worker: Any) -> str:
+    """'review: recorded (who)' when the registry holds an entry, else ''."""
+    if _review_status(worker) != "recorded":
+        return ""
+    review = getattr(worker, "review", None)
+    reviewer = _clean(review.get("reviewer_model")) if isinstance(review, dict) else ""
+    # Name the reviewer when one was recorded: an unattributed badge cannot be
+    # told apart from a self-assessment. A manual record has no model.
+    return "review: recorded (%s)" % (reviewer.rsplit("/", 1)[-1] if reviewer else "manual")
 
 
-def _tool_label(worker: Any, width: int) -> str:
-    tool = _clean(getattr(worker, "last_tool", None))
-    # Prefer the explicit "latest call failed" flag. Fall back to the presence
-    # of any recorded error for objects that predate the flag.
-    pending = getattr(worker, "error_pending", None)
-    if isinstance(pending, bool):
-        has_error = pending
-    else:
-        error = getattr(worker, "last_error", None)
-        has_error = error is not None and _clean(error) != ""
-    base = tool or "-"
-    if not has_error:
-        return _clip_cell(base, width)
-    if width <= 1:
-        return "!"
-    # '!' marks a recorded error on the last tool call. One column is reserved
-    # for it, otherwise _fit_line would truncate the marker away at the pane edge.
-    base = _clip_cell(base, width - 1)
-    return base + "!"
-
-
-def _age_label(worker: Any, now: datetime) -> str:
-    started = _parse_dt(getattr(worker, "started", None))
-    if started is None:
-        return "?"
-    return _humanise((now - started).total_seconds())
-
-
-def _key_label(worker: Any, width: int = 11) -> str:
+def _key_label(worker: Any) -> str:
+    """Short handle for commands: last 8 of the delegation id, '#', task index."""
     delegation_id = _clean(getattr(worker, "delegation_id", "")) or "-"
     index = getattr(worker, "task_index", "")
-    if index is None:
-        index = ""
-    tail = "#" + (_as_text(index).strip() or "-")
-    if width <= 0:
+    return "%s#%s" % (delegation_id[-8:], _as_text("" if index is None else index).strip() or "-")
+
+
+def _elapsed(worker: Any, now: datetime) -> Optional[float]:
+    started = _parse_dt(getattr(worker, "started", None))
+    if started is None:
+        return None
+    return max(0.0, (now - started).total_seconds())
+
+
+def _ran_for(worker: Any) -> Optional[float]:
+    duration = getattr(worker, "duration_s", None)
+    if isinstance(duration, (int, float)):
+        return float(duration)
+    started = _parse_dt(getattr(worker, "started", None))
+    ended = _parse_dt(getattr(worker, "last_event", None))
+    if started is not None and ended is not None and ended >= started:
+        return (ended - started).total_seconds()
+    return None
+
+
+def _ago(worker: Any, now: datetime) -> str:
+    activity = _activity_at(worker)
+    if activity is None:
         return ""
-    full = delegation_id[-8:] + tail
-    if len(full) <= width:
-        return full
-    if len(tail) >= width:
-        return tail[:width]
-    # Narrow column: keep the task index, trim the delegation suffix.
-    return delegation_id[-(width - len(tail)):] + tail
+    return _humanise((now - activity).total_seconds()) + " ago"
 
 
-# --------------------------------------------------------------------------- #
-# layout
-# --------------------------------------------------------------------------- #
+def _error_pending(worker: Any) -> bool:
+    pending = getattr(worker, "error_pending", None)
+    if isinstance(pending, bool):
+        return pending
+    return bool(_clean(getattr(worker, "last_error", None)))
 
 
-def _separators(n_cols: int) -> int:
-    """n-1 single gaps between columns plus a 2-space gap before GOAL."""
-    if n_cols <= 0:
-        return 0
-    return (n_cols - 1) + 2
+def classify(workers: Iterable[Any], now: Optional[datetime] = None,
+             seen: Iterable[str] = (), since: Any = None) -> Dict[str, List[Any]]:
+    """Split workers into running / attention / recent.
 
-
-def _total_width(cols: Sequence[Tuple[str, int, int]]) -> int:
-    return sum(width for _, width, _ in cols) + _separators(len(cols))
-
-
-def _layout(width: int) -> Tuple[List[Tuple[str, int, int]], int]:
-    """Return (columns, goal_width) for the given total width.
-
-    Shrink peripheral columns toward their minimums first, and only then drop
-    columns outright, so a narrow pane keeps the widest useful GOAL.
+    ``attention`` is a failure nobody has opened yet and that is still fresh.
+    ``seen`` names workers whose tab the reader has looked at; it comes from the
+    workspace layout and is empty when there is none (``status`` outside tmux).
+    ``since`` is when the workspace came up (epoch seconds): a run that ended
+    before then is history, the same rule that decides it gets no tab.
+    Stalled workers stay under ``running``: they have not finished, and the
+    silence is shown on their row.
     """
-    cols: List[Tuple[str, int, int]] = list(_COLUMNS)
-    goal_min = max(3, min(10, width // 6))
-
-    def shrink_once() -> bool:
-        for name in _SHRINK_ORDER:
-            for i, (col_name, desired, minimum) in enumerate(cols):
-                if col_name == name and desired > minimum:
-                    cols[i] = (col_name, desired - 1, minimum)
-                    return True
-        return False
-
-    while _total_width(cols) + goal_min > width:
-        if not shrink_once():
-            break
-
-    while _total_width(cols) + goal_min > width and len(cols) > 2:
-        dropped = False
-        for name in _DROP_ORDER:
-            if len(cols) <= 2:
-                break
-            if any(col[0] == name for col in cols):
-                cols = [col for col in cols if col[0] != name]
-                dropped = True
-                break
-        if not dropped:
-            break
-        while _total_width(cols) + goal_min > width:
-            if not shrink_once():
-                break
-
-    goal_width = max(0, width - _total_width(cols))
-    return cols, goal_width
-
-
-def _rule(width: int) -> str:
-    return "-" * max(0, width)
-
-
-def _header_line(cols: Sequence[Tuple[str, int, int]], goal_width: int) -> str:
-    """Header aligned to the same column widths the rows use."""
-    chunks = [name.upper().ljust(width) for name, width, _minimum in cols]
-    line = " ".join(chunks)
-    if goal_width > 0:
-        line += "  " + "GOAL".ljust(goal_width)
-    return line.rstrip()
-
-
-def _counts(workers: Sequence[Any], now: datetime) -> Tuple[Dict[str, int], int]:
-    counts: Dict[str, int] = {}
-    running = 0
+    now = now or datetime.now()
+    seen = set(seen)
+    try:
+        floor = datetime.fromtimestamp(float(since)) if since else None
+    except (TypeError, ValueError, OverflowError, OSError):
+        floor = None
+    groups: Dict[str, List[Any]] = {"running": [], "attention": [], "recent": []}
     for worker in workers:
-        label = _state_label(worker, now)
-        counts[label] = counts.get(label, 0) + 1
-        if label in ("run", "stall"):
-            running += 1
-    return counts, running
+        if worker is None:
+            continue
+        kind = labels.state_kind(_state_label(worker, now))
+        if kind in ("run", "stall"):
+            groups["running"].append(worker)
+            continue
+        if kind == "fail" and str(getattr(worker, "key", "")) not in seen:
+            activity = _activity_at(worker)
+            fresh = activity is None or (now - activity).total_seconds() <= ATTENTION_TTL_S
+            if fresh and not (floor is not None and activity is not None and activity < floor):
+                groups["attention"].append(worker)
+                continue
+        groups["recent"].append(worker)
+
+    def _started(worker: Any) -> datetime:
+        return _parse_dt(getattr(worker, "started", None)) or datetime.min
+
+    def _latest(worker: Any) -> datetime:
+        return _activity_at(worker) or datetime.min
+
+    groups["running"].sort(key=_started)                 # oldest first: stable rows
+    groups["attention"].sort(key=_latest, reverse=True)
+    groups["recent"].sort(key=_latest, reverse=True)
+    return groups
 
 
-def _summary_line(counts: Dict[str, int], total: int) -> str:
-    order = ["run", "stall", "done", "fail"]
-    parts: List[str] = []
-    for label in order:
-        if counts.get(label):
-            parts.append("%s %d" % (label, counts[label]))
-    for label in sorted(counts):
-        if label not in order and counts[label]:
-            parts.append("%s %d" % (label, counts[label]))
-    if not parts:
-        return "total 0"
-    return "total %d: %s" % (total, ", ".join(parts))
+def summary(groups: Dict[str, List[Any]], now: Optional[datetime] = None) -> Dict[str, int]:
+    """Counts behind the header and the tab badge (one definition for both)."""
+    now = now or datetime.now()
+    stalled = sum(1 for w in groups["running"] if _state_label(w, now) == "stall")
+    return {"running": len(groups["running"]) - stalled, "stalled": stalled,
+            "attention": len(groups["attention"]) + stalled}
 
 
-def _title_line(
-    running: int,
-    total: int,
-    width: int,
-    now: datetime,
-    session_label: str,
-    newest: Optional[datetime],
-) -> str:
-    left = "hermes subagents"
+# --------------------------------------------------------------------------- #
+# drawing
+# --------------------------------------------------------------------------- #
+
+BOLD, DIM = "1", "2"
+# Colour policy: primary text is the terminal's own foreground (bold for
+# emphasis), so it is legible on any theme, light or dark. Secondary text is a
+# mid grey from the 256-colour cube that holds up on both. Accents are fixed
+# 256-colour indexes, the same ones the status line uses. Nothing here needs
+# truecolor.
+
+
+class _Pen:
+    """Builds lines from styled segments while tracking the visible width."""
+
+    def __init__(self, width: int, colour: bool) -> None:
+        self.width = max(1, width)
+        self.colour = colour
+        self.lines: List[str] = []
+
+    def style(self, text: str, *codes: str) -> str:
+        if not self.colour or not text or not codes:
+            return text
+        return "\033[%sm%s\033[0m" % (";".join(codes), text)
+
+    def line(self, *segments: Tuple[str, Tuple[str, ...]]) -> None:
+        """Append one line; segments are (text, codes). Clipped to the width."""
+        room = self.width
+        out: List[str] = []
+        plain = ""
+        for text, codes in segments:
+            text = _CTRL_RE.sub(" ", text)
+            if room <= 0:
+                break
+            text = text[:room]
+            room -= len(text)
+            plain += text
+            out.append((text, codes))
+        # Trailing whitespace is dropped from the last segments so a pane never
+        # repaints blank cells and a pipe never carries padding.
+        keep = len(plain.rstrip())
+        rendered, used = "", 0
+        for text, codes in out:
+            if used >= keep:
+                break
+            text = text[:keep - used]
+            used += len(text)
+            rendered += self.style(text, *codes)
+        self.lines.append(rendered)
+
+    def blank(self) -> None:
+        self.lines.append("")
+
+    def split(self, left: Sequence[Tuple[str, Tuple[str, ...]]],
+              right: Sequence[Tuple[str, Tuple[str, ...]]]) -> None:
+        """Left segments, then right segments flush against the content edge."""
+        right_len = sum(len(t) for t, _ in right)
+        left_room = max(0, self.width - right_len - (2 if right_len else 0))
+        fitted: List[Tuple[str, Tuple[str, ...]]] = []
+        used = 0
+        for text, codes in left:
+            text = text[:max(0, left_room - used)]
+            used += len(text)
+            fitted.append((text, codes))
+        pad = self.width - used - right_len
+        self.line(*fitted, (" " * max(0, pad), ()), *right)
+
+
+def _fg(index: int) -> str:
+    return "38;5;%d" % index
+
+
+def _fit(text: str, width: int, ascii_mode: bool) -> str:
+    return labels.clip(text, width, "..." if ascii_mode else "\u2026")
+
+
+def _tab_segment(worker: Any, tabs: Optional[Dict[str, Any]],
+                 spaced: bool = False) -> List[Tuple[str, Tuple[str, ...]]]:
+    index = (tabs or {}).get(str(getattr(worker, "key", "")))
+    if index in (None, ""):
+        return []
+    return [(("  " if spaced else "") + "tab %s" % index, (_fg(39),))]
+
+
+def _meta(parts: Iterable[str], ascii_mode: bool) -> str:
+    sep = " | " if ascii_mode else " \u00b7 "
+    return sep.join(part for part in parts if part)
+
+
+_MD = re.compile(r"\*{1,3}|`|^#+\s*|^\s*[-\u2022]\s+")
+
+
+def _excerpt(text: Any) -> str:
+    """A worker's own words as one plain line (markdown markers removed).
+
+    A report usually opens with its conclusion and continues with headings and
+    tables; the excerpt stops where those begin.
+    """
+    raw = _as_text(text)
+    for mark in ("\n#", " ## ", " | ", "```"):
+        at = raw.find(mark)
+        if at > 12:
+            raw = raw[:at]
+    return _clean(_MD.sub("", raw)).rstrip(" :-")
+
+
+def _title_line(pen: _Pen, worker: Any, kind: str, tabs: Optional[Dict[str, Any]],
+                ascii_mode: bool, right: Sequence[Tuple[str, Tuple[str, ...]]] = (),
+                title_codes: Tuple[str, ...] = (BOLD,),
+                glyph_colour: Optional[int] = None) -> None:
+    """Glyph, task title, and whatever is pinned to the right edge."""
+    right = list(right) + _tab_segment(worker, tabs, bool(right))
+    room = pen.width - 4 - sum(len(t) for t, _ in right) - (2 if right else 0)
+    colour = labels.colour(kind) if glyph_colour is None else glyph_colour
+    pen.split([("  ", ()), (labels.glyph(kind, ascii_mode) + " ", (_fg(colour),)),
+               (_fit(labels.title(getattr(worker, "goal", "")), room, ascii_mode), title_codes)],
+              right)
+
+
+def _running_rows(pen: _Pen, worker: Any, now: datetime,
+                  tabs: Optional[Dict[str, Any]], ascii_mode: bool) -> None:
+    kind = labels.state_kind(_state_label(worker, now))
+    _title_line(pen, worker, kind, tabs, ascii_mode)
+    sep = " | " if ascii_mode else " \u00b7 "
+    wide, narrow = pen.width >= 90, pen.width < 60
+    tools = getattr(worker, "tool_count", 0) or 0
+    # Secondary facts leave in order of how little they are missed: the id,
+    # the tool count, then the model. Elapsed time and the current call stay.
+    parts = [] if narrow else [labels.model_short(getattr(worker, "model", None))]
+    parts.append(labels.duration(_elapsed(worker, now)))
+    if wide:
+        parts.append("%d tool%s" % (tools, "" if tools == 1 else "s") if tools else "starting")
+    left: List[Tuple[str, Tuple[str, ...]]] = [("    " + _meta(parts, ascii_mode), (_fg(244),))]
+    key = _key_label(worker) if wide else ""
+    room = pen.width - len(left[0][0]) - len(sep) - (len(key) + 2 if key else 0)
+    call = _clean(getattr(worker, "last_call", None)) or _clean(getattr(worker, "last_tool", None))
+    if kind == "stall":
+        activity = _activity_at(worker)
+        quiet = _humanise((now - activity).total_seconds()) if activity else "?"
+        left.append((sep + "no output for %s" % quiet, (_fg(214),)))
+    elif _error_pending(worker):
+        left.append((sep + _fit("last call failed: %s" % (call or "?"), room, ascii_mode),
+                     (_fg(203),)))
+    elif call:
+        left.append((sep + _fit(call, room, ascii_mode), ()))
+    note = _review_note(worker)
+    if note and wide:
+        left.append((sep + note, (_fg(244),)))
+    pen.split(left, [(key, (_fg(243),))] if key else [])
+
+
+def _attention_rows(pen: _Pen, worker: Any, now: datetime,
+                    tabs: Optional[Dict[str, Any]], ascii_mode: bool) -> None:
+    _title_line(pen, worker, "fail", tabs, ascii_mode)
+    reason = _clean(getattr(worker, "exit_reason", None)) or _clean(getattr(worker, "state", ""))
+    # "run ended", not "task failed": this line states how the agent run
+    # stopped, which Hermes recorded. Whether the work itself is good is not
+    # something this tool knows; the worker's last report is quoted below so
+    # the reader can weigh the two.
+    parts = ["run ended: %s after %s" % (reason or "error", labels.duration(_ran_for(worker))),
+             _ago(worker, now)]
+    if pen.width >= 90:
+        parts += [labels.model_short(getattr(worker, "model", None)), _key_label(worker),
+                  _review_note(worker)]
+    pen.line(("    " + _fit(_meta(parts, ascii_mode), pen.width - 4, ascii_mode), (_fg(214),)))
+    error = labels.error_text(getattr(worker, "last_error", None))
+    if error:
+        pen.line(("    " + _fit(error, pen.width - 4, ascii_mode), (_fg(203),)))
+    said = _excerpt(getattr(worker, "last_message", None))
+    if said:
+        lead = "    last report: "
+        pen.line((lead, (_fg(244),)),
+                 (_fit(said, pen.width - len(lead), ascii_mode), ()))
+
+
+def _recent_rows(pen: _Pen, worker: Any, now: datetime, tabs: Optional[Dict[str, Any]],
+                 ascii_mode: bool, detail: bool) -> None:
+    kind = labels.state_kind(_state_label(worker, now))
+    reason = _clean(getattr(worker, "exit_reason", None)).lower()
+    cut_short = kind == "done" and reason not in ("", "completed", "done", "success")
+    _title_line(pen, worker, kind, tabs, ascii_mode,
+                right=[(_ago(worker, now), (_fg(244),))], title_codes=(),
+                glyph_colour=214 if cut_short else None)
+    if not detail:
+        return
+    sep = " | " if ascii_mode else " \u00b7 "
+    parts = [labels.duration(_ran_for(worker))]
+    if pen.width >= 72:
+        parts.append(labels.model_short(getattr(worker, "model", None)))
+    left: List[Tuple[str, Tuple[str, ...]]] = [("    " + _meta(parts, ascii_mode), (_fg(244),))]
+    if (cut_short or kind == "fail") and reason:
+        left.append((sep + reason, (_fg(214),)))
+    note = _review_note(worker)
+    if note:
+        left.append((sep + note, (_fg(244),)))
+    # What came out of it, in the worker's words: the line that makes a row a
+    # task instead of a table entry.
+    said = _excerpt(getattr(worker, "summary", None) or getattr(worker, "last_message", None))
+    key = _key_label(worker) if pen.width >= 90 else ""
+    room = pen.width - sum(len(t) for t, _ in left) - len(sep) - (len(key) + 2 if key else 0)
+    if said and room >= 16:
+        left.append((sep, (_fg(243),)))
+        left.append((_fit(said, room, ascii_mode), (_fg(246),)))
+    pen.split(left, [(key, (_fg(243),))] if key else [])
+
+
+def _header(pen: _Pen, counts: Dict[str, int], session_label: str, ascii_mode: bool) -> None:
+    sep = " | " if ascii_mode else " \u00b7 "
+    left: List[Tuple[str, Tuple[str, ...]]] = [("  HERMES AGENTS", (BOLD,))]
     label = _clean(session_label)
-    if label:
-        left += " - " + label
-    left += "   %d running / %d total" % (running, total)
-
-    right = ""
-    if newest is not None:
-        right = _humanise((now - newest).total_seconds())
-
-    if right:
-        pad = width - len(left) - len(right)
-        if pad >= 1:
-            line = left + (" " * pad) + right
-        else:
-            keep = max(0, width - len(right) - 1)
-            line = left[:keep] + " " + right
-    else:
-        line = left
-    return line
+    if label and pen.width >= 70:
+        left.append((sep + label, (_fg(244),)))
+    right: List[Tuple[str, Tuple[str, ...]]] = []
+    if counts["running"]:
+        right.append(("%d running" % counts["running"], (BOLD, _fg(114))))
+    if counts["attention"]:
+        if right:
+            right.append((sep, (_fg(244),)))
+        words = "need%s attention" % ("s" if counts["attention"] == 1 else "") \
+            if pen.width >= 70 else "attention"
+        right.append(("%d %s" % (counts["attention"], words), (BOLD, _fg(203))))
+    if not right:
+        right.append(("idle", (_fg(244),)))
+    pen.split(left, right)
 
 
-def _worker_row(worker: Any, cols: Sequence[Tuple[str, int, int]], goal_width: int, now: datetime) -> str:
-    reviewer = _is_reviewer(worker)
-    cells: Dict[str, str] = {
-        "key": _clip_cell(_key_label(worker, _col_width(cols, "key")), _col_width(cols, "key")),
-        "role": _clip_cell("*revw" if reviewer else "exec", _col_width(cols, "role")),
-        "state": _clip_cell(_state_label(worker, now), _col_width(cols, "state")),
-        "model": _clip_cell(_model_label(worker), _col_width(cols, "model")),
-        "tool": _tool_label(worker, _col_width(cols, "tool")),
-        "age": _clip_cell(_age_label(worker, now), _col_width(cols, "age")),
-    }
-
-    chunks: List[str] = []
-    for name, width, _minimum in cols:
-        cell = cells.get(name, "")
-        if len(cell) < width:
-            cell = cell.ljust(width)
-        chunks.append(cell)
-    row = " ".join(chunks)
-
-    goal = _clean(getattr(worker, "goal", "")) or "-"
-    if _review_status(worker) == "recorded":
-        # Name the reviewer when the registry recorded one: an unattributed
-        # "reviewed" badge cannot be distinguished from a self-assessment.
-        review = getattr(worker, "review", None)
-        reviewer = _clean(review.get("reviewer_model")) if isinstance(review, dict) else ""
-        goal += " | review: recorded"
-        if reviewer:
-            goal += " (%s)" % reviewer.rsplit("/", 1)[-1]
-        else:
-            # A manual record has no reviewer model; say so rather than implying
-            # an automated reviewer ran.
-            goal += " (manual)"
-    if goal_width > 0:
-        row += "  " + _clip_cell(goal, goal_width).ljust(goal_width)
-        return row.rstrip()
-
-    # No room for a GOAL column: mark reviewers distinctly instead.
-    if reviewer and (len(row) + len(" [review]")) <= _row_capacity(cols):
-        row += " [review]"
-    return row.rstrip()
+def _centre(lines: List[str], width: int, content: int) -> List[str]:
+    """Sit the block in the middle of a pane wider than the content column."""
+    margin = max(0, (width - content) // 2)
+    if not margin:
+        return lines
+    pad = " " * margin
+    return [(pad + line) if line else line for line in lines]
 
 
-def _col_width(cols: Sequence[Tuple[str, int, int]], name: str) -> int:
-    for column_name, width, _minimum in cols:
-        if column_name == name:
-            return width
-    return 0
-
-
-def _row_capacity(cols: Sequence[Tuple[str, int, int]]) -> int:
-    return _total_width(cols)
+def _section(pen: _Pen, name: str) -> None:
+    pen.blank()
+    pen.line(("  " + name, (_fg(244),)))
 
 
 # --------------------------------------------------------------------------- #
@@ -425,79 +535,108 @@ def render(
     workers: Iterable[Any],
     *,
     width: int = 110,
-    max_rows: int = 12,
+    height: Optional[int] = None,
     now: Optional[datetime] = None,
     session_label: str = "",
     live_root: Optional[str] = None,
     note: str = "",
+    colour: bool = False,
+    tabs: Optional[Dict[str, Any]] = None,
+    seen: Iterable[str] = (),
+    since: Any = None,
+    ascii_mode: bool = False,
+    recent_rows: int = RECENT_ROWS,
 ) -> str:
-    """Render worker records as a fixed-width ASCII block.
+    """Render the agents overview.
 
-    ``note`` carries an explicit failure line (for example a reader exception).
-    It is printed verbatim instead of letting an empty list imply "no workers".
+    ``tabs`` maps a worker key to the tmux window index showing its transcript.
+    ``note`` carries an explicit failure line (a reader exception); it is
+    printed instead of letting an empty list imply "no workers". ``height``
+    bounds the block: history only ever takes rows the live sections left
+    free. A pane too short for the live sections alone shows their first rows.
+    Widths are counted in characters; double-width text (CJK) in a goal can
+    overrun a line by a few columns.
     """
     width = int(width) if isinstance(width, int) else 110
-    if width < 1:
-        width = 1
-    max_rows = int(max_rows) if isinstance(max_rows, int) else 12
-    if max_rows < 0:
-        max_rows = 0
+    width = max(1, width)
     if now is None:
         now = datetime.now()
-
     worker_list: List[Any] = [w for w in workers if w is not None]
+    if not worker_list or _clean(note):
+        return render_empty(width=width, live_root=live_root, note=note,
+                            colour=colour, session_label=session_label,
+                            ascii_mode=ascii_mode)
 
-    if not worker_list:
-        return render_empty(width=width, live_root=live_root, note=note)
+    pen = _Pen(min(width, MAX_CONTENT_WIDTH), colour)
+    groups = classify(worker_list, now, seen, since)
+    _header(pen, summary(groups, now), session_label, ascii_mode)
 
-    counts, running = _counts(worker_list, now)
-    total = len(worker_list)
+    if groups["running"]:
+        _section(pen, "RUNNING")
+        for index, worker in enumerate(groups["running"]):
+            if index:
+                pen.blank()
+            _running_rows(pen, worker, now, tabs, ascii_mode)
+    else:
+        pen.blank()
+        pen.line(("  Nothing running.", ()))
 
-    timestamps = [ts for ts in (_activity_at(w) for w in worker_list) if ts is not None]
-    newest = max(timestamps) if timestamps else None
+    if groups["attention"]:
+        _section(pen, "NEEDS ATTENTION")
+        for index, worker in enumerate(groups["attention"]):
+            if index:
+                pen.blank()
+            _attention_rows(pen, worker, now, tabs, ascii_mode)
 
-    cols, goal_width = _layout(width)
+    recent = groups["recent"]
+    if recent:
+        limit = max(0, int(recent_rows))
+        detail = True
+        if height is not None:
+            # History takes what is left: the section header (2 rows) and the
+            # "older" line (1) come out first, live sections are never trimmed,
+            # and a short pane drops the second line of each row before it
+            # drops rows.
+            left = int(height) - len(pen.lines) - 3
+            detail = left >= 2 * min(limit, len(recent), 3)
+            limit = max(0, min(limit, left // (2 if detail else 1)))
+            spaced = detail and left >= 3 * min(limit, len(recent))
+        else:
+            spaced = False
+        if limit:
+            _section(pen, "RECENT")
+            for index, worker in enumerate(recent[:limit]):
+                if spaced and index:
+                    pen.blank()
+                _recent_rows(pen, worker, now, tabs, ascii_mode, detail)
+            hidden = len(recent) - limit
+            if hidden > 0:
+                pen.line(("    + %d older" % hidden, (_fg(243),)),
+                         ("  (hermes-tmux status --all)" if pen.width >= 60 else "", (_fg(243),)))
 
-    active = [w for w in worker_list if _state_label(w, now) in ("run", "stall")]
-    settled = [w for w in worker_list if _state_label(w, now) not in ("run", "stall")]
-    ordered = active + settled
-
-    lines: List[str] = []
-    lines.append(_title_line(running, total, width, now, session_label, newest))
-    lines.append(_rule(width))
-    lines.append(_header_line(cols, goal_width))
-
-    for worker in ordered[:max_rows]:
-        lines.append(_worker_row(worker, cols, goal_width, now))
-
-    lines.append(_rule(width))
-    lines.append(_summary_line(counts, total))
-
-    recorded = sum(1 for w in worker_list if _review_status(w) == "recorded")
-    lines.append("review: %d recorded, %d unreviewed" % (recorded, total - recorded))
-    lines.append(LEGEND)
-
-    return "\n".join(_fit_line(line, width) for line in lines)
+    lines = pen.lines
+    if height is not None and len(lines) > int(height):
+        lines = lines[:max(0, int(height))]
+    return "\n".join(_centre(lines, width, pen.width))
 
 
 def render_empty(*, width: int = 110, live_root: Optional[str] = None,
-                 note: str = "") -> str:
+                 note: str = "", colour: bool = False, session_label: str = "",
+                 ascii_mode: bool = False) -> str:
     """Render the block shown when no delegations are visible."""
     width = int(width) if isinstance(width, int) else 110
-    if width < 1:
-        width = 1
-
-    root = _clean(live_root) or "(unknown)"
+    pen = _Pen(min(max(1, width), MAX_CONTENT_WIDTH), colour)
+    _header(pen, {"running": 0, "stalled": 0, "attention": 0}, session_label, ascii_mode)
+    pen.blank()
     headline = _clean(note)
-    lines: List[str] = [
-        "hermes subagents",
-        _rule(width),
-        "",
-        ("  " + headline) if headline else "  no delegations found",
-        "  live root: " + root,
-        "  this is a reader failure, not an empty workspace" if headline
-        else "  waiting for subagent activity (this pane updates on file events)",
-        "",
-        LEGEND,
-    ]
-    return "\n".join(_fit_line(line, width) for line in lines)
+    root = _clean(live_root) or "(unknown)"
+    if headline:
+        pen.line(("  " + headline, (BOLD, _fg(203))))
+        pen.line(("  this is a reader failure, not an empty workspace", ()))
+    else:
+        pen.line(("  No delegations yet.", ()))
+        pen.line(("  When Hermes delegates work, each worker gets its own tab here "
+                  "and a row on this page.", (_fg(244),)))
+    pen.blank()
+    pen.line(("  live root: " + root, (_fg(243),)))
+    return "\n".join(_centre(pen.lines, max(1, width), pen.width))

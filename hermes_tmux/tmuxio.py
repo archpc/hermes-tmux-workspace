@@ -344,9 +344,12 @@ def owns_pane(pane_id: str) -> bool:
     return bool(pane_id) and _has_own_option("pane", pane_id, _SENTINEL)
 
 
-#: Foreground processes this tool itself starts in a pane. A pane option is
-#: inherited by panes a user splits inside our window, so the marker alone cannot
-#: authorise a kill; the command must also be one of these.
+#: Foreground processes this tool itself starts in a pane. A split made inside
+#: one of our windows does NOT get the pane option (measured on tmux 3.8:
+#: `show-options -p` on the new pane says "invalid option"); only a FORMAT read
+#: of `#{@hx}` falls back to the window's value, which is why ownership is read
+#: with show-options. The command check is a second, independent proof kept in
+#: case a pane ever does carry a marker it should not.
 _KILLABLE_COMMANDS = ("tail", "python", "python3", "python3.9", "python3.10",
                       "python3.11", "python3.12", "python3.13", "python3.14",
                       "python3.15")
@@ -355,8 +358,8 @@ _KILLABLE_COMMANDS = ("tail", "python", "python3", "python3.9", "python3.10",
 def _killable(pane_id: str) -> Tuple[bool, str]:
     """Is this pane something we started, not merely something marked?
 
-    Pane options are inherited by a split made inside our window, so the marker
-    alone can be forged by a user's split. Two independent properties must hold:
+    The pane's own marker is the first proof (a user's split does not have
+    one). It is not trusted alone. Two independent properties must hold:
     our marker, and provenance that matches how we launch panes — either the
     foreground process is one we run (tail / python), or the pane was started
     with an explicit command, which our panes always are and an interactive user
@@ -437,6 +440,11 @@ def select_pane(pane_id: str) -> bool:
 
 def window_option(window_id: str, option: str, value: str) -> bool:
     rc, _ = run("set-option", "-w", "-t", window_id, option, value)
+    return rc == 0
+
+
+def pane_option(pane_id: str, option: str, value: str) -> bool:
+    rc, _ = run("set-option", "-p", "-t", pane_id, option, value)
     return rc == 0
 
 

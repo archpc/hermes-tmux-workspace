@@ -3,9 +3,9 @@
 The coordinator, `up`, and every aux command rewrite layout.json. Each used to
 read at the start of its work and write the whole document back at the end, so a
 writer that was mid-flight silently reverted another process's change. Observed:
-`up` followed by `logs` dropped ``tail_panes`` and left a second, untracked tail
-pane for the same worker; the coordinator could drop an ``aux`` entry the same
-way.
+`up` followed by `logs` dropped the worker tab record and left a second,
+untracked transcript pane for the same worker; the coordinator could drop an
+``aux`` entry the same way.
 
 The concurrency test fails against the old read-modify-write shape (parallel
 processes overwrite each other); the integration test pins the reported sequence.
@@ -95,36 +95,39 @@ class LayoutTransactionTest(unittest.TestCase):
             aux = subprocess.Popen([PY, str(script)], env=env, cwd=str(REPO),
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             # Wait until the aux command has read the layout (it sleeps inside
-            # new_window next), then publish a change it never saw.
+            # new_window next), then publish a change it never saw. Two aux
+            # commands can genuinely race, and the coordinator does not own
+            # this key, so the coordinator's own reconcile cannot mask the
+            # result the way it would for a tab record.
             time.sleep(0.15)
             publish = (
                 "from pathlib import Path\n"
                 "from hermes_tmux import watch\n"
-                "watch.update_layout(%r, lambda lay: lay.__setitem__('tail_panes', "
-                "{'%%7777': 'deleg_race0002#0'}), Path(%r))\n" % (key, str(box.home))
+                "watch.update_layout(%r, lambda lay: lay.setdefault('aux', {})"
+                ".__setitem__('debug', '%%7777'), Path(%r))\n" % (key, str(box.home))
             )
             subprocess.run([PY, "-c", publish], env=env, cwd=str(REPO), check=True, timeout=60)
             aux.communicate(timeout=90)
             self.assertEqual(aux.returncode, 0)
 
             layout = box.layout()
-            self.assertIn("%7777", (layout.get("tail_panes") or {}),
+            self.assertIn("debug", (layout.get("aux") or {}),
                           "the aux command reverted a concurrent update: %r" % layout)
             self.assertIn("logs", (layout.get("aux") or {}), layout)
 
-    def test_logs_after_up_keeps_the_tail_pane_record(self):
+    def test_logs_after_up_keeps_the_worker_tab_record(self):
         with Sandbox() as box:
             box.add_delegation("deleg_race0001", [{"goal": "race"}])
             self.assertEqual(box.cli("up"), 0)
             self.assertEqual(box.cli("logs"), 0)
             layout = box.layout()
-            tail = layout.get("tail_panes") or {}
-            self.assertEqual(len(tail), 1,
-                             "the aux write clobbered tail_panes: %r" % layout)
-            pane = list(tail)[0]
+            tabs = layout.get("tabs") or {}
+            self.assertEqual(len(tabs), 1,
+                             "the aux write clobbered tabs: %r" % layout)
+            pane = list(tabs.values())[0]["pane"]
             self.assertTrue(wait_for(lambda: _tmux("display-message", "-p", "-t", pane,
                                                   "#{pane_id}")[1].strip() == pane),
-                            "the recorded tail pane does not exist")
+                            "the recorded worker tab pane does not exist")
 
             # And the coordinator must not lose the aux entry in its next pass.
             log = box.home / "cache/delegation/live/deleg_race0001/task-0.log"

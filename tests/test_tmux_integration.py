@@ -7,8 +7,27 @@ Rules enforced by this harness:
   session (``main``) can never be listed, renamed, or killed here;
 * every test owns a private ``HERMES_HOME`` under a TemporaryDirectory, so no
   real Hermes state is read or written;
-* assertions read what tmux actually painted (``capture-pane``) or what the
-  process actually wrote (layout/render files), never a claimed value.
+* assertions read what tmux actually painted (``capture-pane``), what a pane's
+  own options say (``show-options -p``), or what the process actually wrote
+  (layout/render files), never a claimed value.
+
+The contract these tests pin is the v3 tab model (one worker, one window, one
+pane) as implemented by ``hermes_tmux/watch.py:reconcile_tabs``:
+
+* ``up`` owns exactly one non-worker window, ``agents`` (``cli.WORKERS_WINDOW``),
+  holding one pane: the overview;
+* a RUNNING worker gets one window of its own, named from its goal, one pane
+  running the styled follower (``python -m hermes_tmux tail <log>``), and a
+  record in ``layout["tabs"]``;
+* work that had already finished before ``up`` gets no tab; a tab that finishes
+  afterwards keeps its window and pane and only changes glyph/header;
+* identity and state are not in ``#{pane_title}``: the pane's own
+  ``@hx_head`` option carries state word and task, the window's ``@hx_glyph``
+  option carries the state glyph;
+* ownership is the pane's/window's OWN ``@hx`` option, never a name and never a
+  format read that falls back through session/window;
+* ``down`` closes only panes it can prove it started, leaves any window that
+  still holds a user pane standing, and removes its state directory.
 
 Skipped entirely when tmux is unavailable.
 """
@@ -25,8 +44,9 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 REPO = Path(__file__).resolve().parent.parent
 _TMUX_PATH = shutil.which("tmux")
@@ -43,6 +63,9 @@ SOCKET = "hx_it_%d" % os.getpid()
 #: user's ~/.config/tmux/tmux.conf (base-index 1, per-window options, hooks) must
 #: not be able to change the outcome. Addressing is by pane/window id, never index.
 CONFIG = "/dev/null"
+
+#: The one window the workspace owns that is not a worker tab.
+AGENTS = "agents"
 
 
 def _tmux(*args: str) -> Tuple[int, str]:
@@ -120,6 +143,43 @@ def wait_for(predicate: Callable[[], bool], timeout: float = 12.0,
     return False
 
 
+# --------------------------------------------------------------------------- readers
+
+
+def _format(target: str, fmt: str) -> str:
+    rc, out = _tmux("display-message", "-p", "-t", target, fmt)
+    return out.strip() if rc == 0 else ""
+
+
+def _pane_exists(pane_id: Optional[str]) -> bool:
+    """The resolved id is the authority, not the exit status (tmux 3.8 prints
+    nothing and exits 0 for a missing target)."""
+    return bool(pane_id) and _format(pane_id, "#{pane_id}") == pane_id
+
+
+def _window_exists(window_id: Optional[str]) -> bool:
+    return bool(window_id) and _format(window_id, "#{window_id}") == window_id
+
+
+def _pane_pid(pane_id: str) -> Optional[int]:
+    text = _format(pane_id, "#{pane_pid}")
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pane_command(pane_id: str) -> str:
+    return _format(pane_id, "#{pane_current_command}")
+
+
+def _window_index(window_id: str) -> int:
+    try:
+        return int(_format(window_id, "#{window_index}"))
+    except (TypeError, ValueError):
+        return -1
+
+
 _counter = [0]
 
 
@@ -181,6 +241,11 @@ class Sandbox:
         except (OSError, ValueError):
             return -1
 
+    def export(self, name: str, value: str) -> None:
+        rc = self.run("export %s=%s" % (name, value))
+        if rc != 0:
+            raise AssertionError("could not export %s" % name)
+
     def cli(self, *args: str, timeout: float = 20.0) -> int:
         return self.run("%s -m hermes_tmux %s" % (PY, " ".join(args)), timeout=timeout)
 
@@ -188,26 +253,37 @@ class Sandbox:
         rc, out = _tmux("capture-pane", "-p", "-t", target or self.pane_id)
         return out
 
+    # -- observation --------------------------------------------------------
     def windows(self) -> List[dict]:
         rc, out = _tmux("list-windows", "-t", self.name,
-                        "-F", "#{window_id}\t#{window_name}\t#{@hx}")
+                        "-F", "#{window_id}\t#{window_name}\t#{window_index}\t#{@hx}")
         rows = []
         for line in out.splitlines():
             parts = line.split("\t")
-            if len(parts) >= 3:
+            if len(parts) >= 4:
                 rows.append({"id": parts[0], "name": parts[1],
-                             "ours": parts[2].strip() == "1"})
+                             "index": parts[2], "ours": parts[3].strip() == "1"})
         return rows
 
     def window(self, name: str) -> Optional[dict]:
-        for win in self.windows():
-            if win["name"] == name or win["name"].startswith(name + " "):
+        """A window by name: exact first, then our ``name#N`` disambiguation."""
+        windows = self.windows()
+        for win in windows:
+            if win["name"] == name:
+                return win
+        for win in windows:
+            if win["name"].startswith(name + " ") or win["name"].startswith(name + "#"):
                 return win
         return None
 
+    def windows_named(self, name: str) -> List[dict]:
+        return [win for win in self.windows() if win["name"] == name]
+
+    def own_windows(self) -> List[dict]:
+        return [win for win in self.windows() if win["ours"]]
+
     def pane_title(self, pane_id: str) -> str:
-        rc, out = _tmux("display-message", "-p", "-t", pane_id, "#{pane_title}")
-        return out.strip()
+        return _format(pane_id, "#{pane_title}")
 
     def panes_of(self, window_id: str) -> List[dict]:
         rc, out = _tmux("list-panes", "-t", window_id,
@@ -220,28 +296,54 @@ class Sandbox:
                              "title": parts[2], "command": parts[3]})
         return rows
 
+    def window_option(self, window_id: str, option: str) -> str:
+        """The value set ON this window (never inherited from the session)."""
+        rc, out = _tmux("show-options", "-w", "-t", window_id, option)
+        return _option_value(rc, out, option)
+
+    def pane_option(self, pane_id: str, option: str) -> str:
+        """The value set ON this pane (never inherited from its window)."""
+        rc, out = _tmux("show-options", "-p", "-t", pane_id, option)
+        return _option_value(rc, out, option)
+
     def layout(self) -> dict:
+        child = self.tab_dir()
+        if child is None:
+            return {}
+        try:
+            return json.loads((child / "layout.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def tab_dir(self) -> Optional[Path]:
         root = self.home / "cache" / "hermes-tmux" / "sessions"
         if not root.is_dir():
-            return {}
+            return None
         for child in root.iterdir():
-            candidate = child / "layout.json"
-            if candidate.exists():
-                try:
-                    return json.loads(candidate.read_text(encoding="utf-8"))
-                except ValueError:
-                    return {}
-        return {}
+            if (child / "layout.json").exists():
+                return child
+        return None
+
+    def key(self) -> str:
+        child = self.tab_dir()
+        if child is None:
+            raise AssertionError("no session state directory was written")
+        return child.name
+
+    def tabs(self) -> Dict[str, dict]:
+        return dict(self.layout().get("tabs") or {})
+
+    def dismissed(self) -> Dict[str, float]:
+        return dict(self.layout().get("dismissed") or {})
 
     def render_text(self) -> str:
-        root = self.home / "cache" / "hermes-tmux" / "sessions"
-        if not root.is_dir():
+        child = self.tab_dir()
+        if child is None:
             return ""
-        for child in root.iterdir():
-            candidate = child / "render.txt"
-            if candidate.exists():
-                return candidate.read_text(encoding="utf-8")
-        return ""
+        try:
+            return (child / "render.txt").read_text(encoding="utf-8")
+        except OSError:
+            return ""
 
     # -- fixtures ----------------------------------------------------------
     def live(self) -> Path:
@@ -249,9 +351,16 @@ class Sandbox:
         root.mkdir(parents=True, exist_ok=True)
         return root
 
+    def _atomic_json(self, path: Path, data: dict) -> None:
+        """Write via rename: a reader must never see a half-written manifest."""
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+
     def add_delegation(self, deleg_id: str, tasks: List[dict],
                        model: str = "deepseek/deepseek-v4.1-flash-1017",
-                       completed: Optional[str] = None) -> Path:
+                       started: Optional[str] = None) -> Path:
+        started = started or datetime.now().strftime("%Y-%m-%d 09:00:00")
         d = self.live() / deleg_id
         d.mkdir(parents=True, exist_ok=True)
         manifest_tasks = []
@@ -261,7 +370,7 @@ class Sandbox:
                 "=== Hermes subagent live transcript ===",
                 "delegation: %s   task: %d" % (deleg_id, i),
                 "goal: %s" % task.get("goal", "do the thing"),
-                "started: 2026-11-12 09:00:00",
+                "started: %s" % started,
                 "(append-only; streams while the subagent runs - tail -f me)",
                 "=" * 40,
             ]
@@ -279,22 +388,41 @@ class Sandbox:
             manifest_tasks.append(entry)
         manifest = {
             "delegation_id": deleg_id,
-            "started": "2026-11-12 09:00:00",
+            "started": started,
             "task_count": len(tasks),
             "model": model,
             "provider": "nous",
             "tasks": manifest_tasks,
         }
-        if completed:
-            manifest["completed"] = completed
-        (d / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        self._atomic_json(d / "manifest.json", manifest)
         return d
+
+    def set_task_status(self, deleg_id: str, index: int, status: str,
+                        exit_reason: Optional[str] = None) -> None:
+        path = self.live() / deleg_id / "manifest.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        found = False
+        for task in data.get("tasks", []):
+            if int(task.get("index", -1)) == index:
+                task["status"] = status
+                if exit_reason:
+                    task["exit_reason"] = exit_reason
+                found = True
+        if not found:
+            raise AssertionError("no task %d in %s" % (index, deleg_id))
+        self._atomic_json(path, data)
 
     def append_event(self, deleg_id: str, task: int, role: str, text: str) -> None:
         log = self.live() / deleg_id / ("task-%d.log" % task)
         stamp = time.strftime("%H:%M:%S")
         with open(log, "a", encoding="utf-8") as fh:
             fh.write("%s %-9s| %s\n" % (stamp, role, text))
+
+    def finish(self, deleg_id: str, index: int, status: str = "completed") -> None:
+        """Terminal state the way the writer records it: manifest + final line."""
+        self.set_task_status(deleg_id, index, status)
+        self.append_event(deleg_id, index, "final",
+                          "status=%s duration=4.0s" % status)
 
     def write_db_state(self, delegation_id: str, state: str) -> None:
         """Write a terminal row into state.db the way Hermes does.
@@ -315,229 +443,333 @@ class Sandbox:
         finally:
             connection.close()
 
-    def write_review(self, delegation_id: str, task_index: Optional[int],
-                     status: str = "recorded") -> None:
-        path = self.home / "cache" / "hermes-tmux" / "reviews.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        data = {"reviews": []}
-        if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except ValueError:
-                data = {"reviews": []}
-        data.setdefault("reviews", []).append({
-            "id": "rev_test01", "delegation_id": delegation_id,
-            "task_index": task_index, "reviewer_model": "z-ai/glm-5.3-flash",
-            "status": status, "report": None, "at": "2026-11-12 09:05:00",
-        })
-        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _option_value(rc: int, out: str, option: str) -> str:
+    if rc != 0:
+        return ""
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0] == option:
+            return parts[1].strip()
+    return ""
 
 
 @unittest.skipIf(SKIP, "tmux not installed")
 class IntegrationTest(unittest.TestCase):
     maxDiff = None
 
+    # -- shared helpers ----------------------------------------------------
+    def up(self, box: Sandbox) -> dict:
+        """``up``, asserting the one window it owns exists and is ours."""
+        rc = box.cli("up")
+        self.assertEqual(rc, 0, "up exited %s: %r" % (rc, box.capture()[-500:]))
+        win = box.window(AGENTS)
+        self.assertIsNotNone(win, "up did not create the 'agents' window: %r"
+                             % [w["name"] for w in box.windows()])
+        self.assertTrue(win["ours"], "'agents' is not marked ours")
+        panes = box.panes_of(win["id"])
+        self.assertEqual(len(panes), 1,
+                         "the overview window holds %d panes, expected 1: %r"
+                         % (len(panes), panes))
+        return win
+
+    def wait_tabs(self, box: Sandbox, count: int, timeout: float = 20.0) -> dict:
+        ok = wait_for(
+            lambda: len(box.tabs()) == count
+            and all(_pane_exists(tab.get("pane") or "") for tab in box.tabs().values()),
+            timeout=timeout)
+        if not ok:
+            raise AssertionError(
+                "expected %d live worker tabs, layout tabs=%r (windows=%r)"
+                % (count, box.tabs(), [(w["name"], w["id"]) for w in box.windows()]))
+        return box.layout()
+
+    def assert_one_pane_per_tab(self, box: Sandbox, layout: dict, name: str = "") -> None:
+        for wkey, tab in (layout.get("tabs") or {}).items():
+            panes = box.panes_of(tab["window"])
+            self.assertEqual(len(panes), 1,
+                             "%s: window %s holds %d panes, expected exactly 1: %r"
+                             % (wkey, tab["window"], len(panes), panes))
+            self.assertEqual(panes[0]["id"], tab["pane"],
+                             "%s: the tab's recorded pane is not its window's pane" % wkey)
+            self.assertEqual(box.pane_option(tab["pane"], "@hx"), "1",
+                             "%s: pane %s has no @hx of its own" % (wkey, tab["pane"]))
+            self.assertEqual(box.window_option(tab["window"], "@hx"), "1",
+                             "%s: window %s has no @hx of its own" % (wkey, tab["window"]))
+
+    def glyph(self, box: Sandbox, kind: str) -> str:
+        from hermes_tmux import labels
+        return labels.glyph(kind, bool(box.layout().get("ascii")))
+
     # ---- 1. startup ------------------------------------------------------
     def test_up_builds_workers_window_and_overview(self):
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00001", [{"goal": "audit the parser"}])
-            self.assertEqual(box.cli("up"), 0)
-            win = box.window("hx:workers")
-            self.assertIsNotNone(win, "hx:workers was not created")
-            self.assertTrue(win["ours"], "window not marked ours")
+            win = self.up(box)
+            layout = box.layout()
+            self.assertEqual(layout.get("workers_window"), win["id"])
+            self.assertEqual(layout.get("overview_pane"),
+                             box.panes_of(win["id"])[0]["id"])
+            self.assertTrue(wait_for(lambda: "HERMES AGENTS" in box.capture(win["id"])),
+                            "the overview pane never painted its header: %r"
+                            % box.capture(win["id"])[:300])
             self.assertTrue(wait_for(lambda: "audit the parser" in box.render_text()),
-                            "overview never rendered the worker")
-            self.assertTrue(wait_for(lambda: "audit the parser" in box.capture(win["id"])),
-                            "pane did not paint the render")
+                            "the overview never rendered the running worker")
+
+            # A running worker is a tab of its own, not a pane of the overview.
+            layout = self.wait_tabs(box, 1)
+            tab = layout["tabs"]["deleg_aaa00001#0"]
+            self.assertNotEqual(tab["window"], win["id"],
+                                "the worker tab was packed into the overview window")
+            self.assert_one_pane_per_tab(box, layout)
+            self.assertTrue(wait_for(lambda: "task-0.log" in box.capture(tab["pane"])),
+                            "the worker pane did not print the transcript it follows: %r"
+                            % box.capture(tab["pane"])[:300])
 
     def test_up_is_idempotent_and_reuses_panes(self):
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00002", [{"goal": "task one"}])
+            self.up(box)
+            first = self.wait_tabs(box, 1)
+            follow_pid = _pane_pid(first["overview_pane"])
+            self.assertTrue(follow_pid)
+            tab_before = dict(first["tabs"]["deleg_aaa00002#0"])
+
             self.assertEqual(box.cli("up"), 0)
-            first = box.layout()
-            self.assertTrue(wait_for(lambda: bool(box.layout().get("workers_window"))))
-            follow_pid = _tmux("display-message", "-p", "-t",
-                               first["overview_pane"], "#{pane_pid}")[1].strip()
-            self.assertEqual(box.cli("up"), 0)
-            # A second `up` must not restart the display loop: "reuses panes"
-            # means the same process, not just the same pane id.
-            self.assertTrue(wait_for(
-                lambda: _tmux("display-message", "-p", "-t",
-                              box.layout()["overview_pane"], "#{pane_pid}")[1].strip()
-                == follow_pid),
-                "the overview process was restarted by an idempotent up")
             second = box.layout()
+            # "Reuses panes" means the same process, not just the same pane id:
+            # a restarted display loop would show a different pid.
+            self.assertEqual(_pane_pid(second["overview_pane"]), follow_pid,
+                             "the overview process was restarted by an idempotent up")
             self.assertEqual(first.get("workers_window"), second.get("workers_window"))
             self.assertEqual(first.get("overview_pane"), second.get("overview_pane"))
-            workers = [w for w in box.windows() if w["name"].startswith("hx:workers")]
-            self.assertEqual(len(workers), 1, "up created a second workers window")
+            self.assertEqual(second.get("tabs"), first.get("tabs"),
+                             "a second up reopened or repointed a worker tab")
+            self.assertEqual(dict(second["tabs"]["deleg_aaa00002#0"]), tab_before)
+            agents = [w for w in box.windows()
+                      if w["name"] == AGENTS or w["name"].startswith(AGENTS + "#")]
+            self.assertEqual(len(agents), 1, "up created a second overview window")
 
-    # ---- 2. worker panes -------------------------------------------------
+    # ---- 2. worker tabs --------------------------------------------------
     def test_worker_panes_created_per_running_worker(self):
+        from hermes_tmux import labels
+        goals = ["w0", "w1", "w2"]
         with Sandbox() as box:
-            box.add_delegation("deleg_aaa00003",
-                               [{"goal": "w0"}, {"goal": "w1"}, {"goal": "w2"}])
-            self.assertEqual(box.cli("up"), 0)
-            self.assertTrue(wait_for(lambda: len(box.layout().get("tail_panes") or {}) == 3),
-                            "expected 3 tail panes, got %r" % (box.layout().get("tail_panes")))
-            overview_win = box.window("hx:workers")
-            self.assertEqual(len(box.panes_of(overview_win["id"])), 1,
+            box.add_delegation("deleg_aaa00003", [{"goal": g} for g in goals])
+            self.up(box)
+            layout = self.wait_tabs(box, 3)
+            tabs = layout["tabs"]
+            self.assertEqual(set(tabs), {"deleg_aaa00003#%d" % i for i in range(3)},
+                             "tabs are %r" % sorted(tabs))
+            self.assertEqual(len({tab["window"] for tab in tabs.values()}), 3,
+                             "two workers share a window: %r"
+                             % [tab["window"] for tab in tabs.values()])
+            windows = {win["id"]: win for win in box.windows()}
+            for i, goal in enumerate(goals):
+                wkey = "deleg_aaa00003#%d" % i
+                tab = tabs[wkey]
+                win = windows.get(tab["window"])
+                self.assertIsNotNone(win, "%s: window %s vanished" % (wkey, tab["window"]))
+                siblings = [g for j, g in enumerate(goals) if j != i]
+                self.assertEqual(win["name"], labels.tab_label(goal, siblings),
+                                 "%s: window name is %r, expected the tab label of its goal"
+                                 % (wkey, win["name"]))
+                self.assertTrue(wait_for(
+                    lambda pane=tab["pane"]: _pane_command(pane).lower().startswith("python"),
+                    timeout=8),
+                    "%s: pane runs %r, expected the styled follower (python)"
+                    % (wkey, _pane_command(tab["pane"])))
+            self.assert_one_pane_per_tab(box, layout)
+            overview = box.window(AGENTS)
+            self.assertEqual(len(box.panes_of(overview["id"])), 1,
                              "the overview window must hold the overview only")
-            worker_wins = sorted(
-                (w for w in box.windows() if w["name"].startswith("hx:worker-")),
-                key=lambda w: w["name"])
-            self.assertEqual(len(worker_wins), 2, "3 workers need 2 windows of at most 2")
-            panes = [p for w in worker_wins for p in box.panes_of(w["id"])]
-            self.assertEqual(len(panes), 3, "expected one pane per worker across windows")
-            self.assertTrue(all(len(box.panes_of(w["id"])) <= 2 for w in worker_wins),
-                            "a worker window exceeded two panes")
-            titles = " ".join(p["title"] for p in panes)
-            self.assertIn("t0", titles)
-            self.assertIn("t2", titles)
 
     def test_pane_title_distinguishes_running_from_completed(self):
-        """A pane tailing a finished transcript must say so.
+        """A tab following a finished transcript must say so.
 
-        The tail stream alone cannot distinguish "still executing" from
-        "finished, nothing new"; the border label carries the lifecycle state.
+        v3 moved the label off ``#{pane_title}``: the state word lives in the
+        pane's own ``@hx_head`` option and the glyph in the window's
+        ``@hx_glyph``. The follower's output alone cannot distinguish "still
+        executing" from "finished, nothing new", and this test still exists to
+        pin that the border/tab says which it is.
         """
         with Sandbox() as box:
             box.add_delegation("deleg_live00001", [{"goal": "still working"}])
-            self.assertEqual(box.cli("up"), 0)
-            self.assertTrue(wait_for(lambda: len(box.layout().get("tail_panes") or {}) == 1))
-            pane = list(box.layout()["tail_panes"])[0]
+            self.up(box)
+            layout = self.wait_tabs(box, 1)
+            tab = layout["tabs"]["deleg_live00001#0"]
+            pane, window = tab["pane"], tab["window"]
 
-            # A fresh event makes the worker "recently active"; the fixture's
-            # header timestamp alone is old enough to be labelled stalled.
             box.append_event("deleg_live00001", 0, "tool", "-> terminal(ls)")
-            self.assertTrue(wait_for(lambda: " run " in box.pane_title(pane)),
-                            "running worker not labelled run: %r" % box.pane_title(pane))
+            self.assertTrue(
+                wait_for(lambda: "RUNNING" in box.pane_option(pane, "@hx_head")),
+                "running worker not labelled RUNNING: %r"
+                % box.pane_option(pane, "@hx_head"))
+            self.assertIn(self.glyph(box, "run"),
+                          box.window_option(window, "@hx_glyph"),
+                          "the running tab's glyph does not say running")
 
-            # Same worker, now finished: rewrite the manifest status and append
-            # the final marker the writer emits.
-            box.add_delegation("deleg_live00001",
-                               [{"goal": "still working", "status": "completed"}],
-                               completed="2026-11-12 09:30:00")
-            box.append_event("deleg_live00001", 0, "final",
-                             "status=completed duration=3.0s")
-            self.assertTrue(wait_for(lambda: " done " in box.pane_title(pane), timeout=20),
-                            "completed worker still labelled running: %r"
-                            % box.pane_title(pane))
+            # Same worker, now finished: manifest status plus the final marker
+            # the writer emits. It keeps its window and pane; only the labels
+            # change.
+            box.finish("deleg_live00001", 0, "completed")
+            self.assertTrue(
+                wait_for(lambda: "DONE" in box.pane_option(pane, "@hx_head"), timeout=20),
+                "completed worker still labelled running: %r"
+                % box.pane_option(pane, "@hx_head"))
+            self.assertNotIn("RUNNING", box.pane_option(pane, "@hx_head"),
+                             "a completed tab still claims to be RUNNING")
+            self.assertIn(self.glyph(box, "done"),
+                          box.window_option(window, "@hx_glyph"),
+                          "the finished tab's glyph does not say done")
+            self.assertEqual(box.tabs()["deleg_live00001#0"]["window"], window,
+                             "the tab moved house on finishing")
 
-    def test_max_two_panes_per_window_and_titles_carry_identity(self):
+    def test_every_worker_tab_holds_one_pane_and_its_header_carries_identity(self):
+        """Replaces the v1/v2 "at most two panes per window" rule.
+
+        v3 gives every worker a window of its own, so the old packing invariant
+        is gone. What survives is the property behind it: a tab is exactly one
+        pane, and that pane's header and its window's glyph identify the worker
+        and its state (task, model, short key) rather than a bare ``tail``.
+        """
+        from hermes_tmux import labels
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00004",
                                [{"goal": "w%d" % i} for i in range(6)])
-            self.assertEqual(box.cli("up"), 0)
-            self.assertTrue(wait_for(lambda: len(box.layout().get("tail_panes") or {}) == 6,
-                            timeout=20),
-                            "expected six panes, got %r" % (box.layout().get("tail_panes")))
-            overview_win = box.window("hx:workers")
-            self.assertEqual(len(box.panes_of(overview_win["id"])), 1)
-            worker_wins = [w for w in box.windows() if w["name"].startswith("hx:worker-")]
-            self.assertEqual(len(worker_wins), 3, "6 workers must fill 3 windows")
-            titles = []
-            for win in worker_wins:
-                panes = box.panes_of(win["id"])
-                self.assertLessEqual(len(panes), 2,
-                                     "window %s has more than two panes" % win["name"])
-                titles.extend(p["title"] for p in panes)
-            self.assertIn("deepseek-v4.1-flash", " ".join(titles))
+            # A fixture's manifest start time is hours old; a fresh event is what
+            # makes the worker "RUNNING" rather than "SILENT" (the stall label).
+            for i in range(6):
+                box.append_event("deleg_aaa00004", i, "tool", "-> terminal(ls)")
+            self.up(box)
+            layout = self.wait_tabs(box, 6)
+            self.assert_one_pane_per_tab(box, layout)
+            self.assertEqual(len({tab["window"] for tab in layout["tabs"].values()}), 6,
+                             "six workers must have six windows, got %r"
+                             % [tab["window"] for tab in layout["tabs"].values()])
+            for wkey, tab in layout["tabs"].items():
+                head = box.pane_option(tab["pane"], "@hx_head")
+                self.assertIn("RUNNING", head, "%s: header does not carry state: %r"
+                              % (wkey, head))
+                self.assertIn("w" + wkey.rsplit("#", 1)[1], head,
+                              "%s: header does not name the task: %r" % (wkey, head))
+                self.assertIn(labels.model_short("deepseek/deepseek-v4.1-flash-1017"),
+                              head, "%s: header does not name the model: %r" % (wkey, head))
+                self.assertIn(wkey.split("#")[0][-8:], head,
+                              "%s: header does not carry the worker's id: %r" % (wkey, head))
+                self.assertIn(self.glyph(box, "run"),
+                              box.window_option(tab["window"], "@hx_glyph"),
+                              "%s: tab glyph does not carry state" % wkey)
 
     def test_new_worker_gets_its_own_pane_and_old_pane_is_not_stolen(self):
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00005", [{"goal": "first"}])
-            self.assertEqual(box.cli("up"), 0)
-            self.assertTrue(wait_for(lambda: len(box.layout().get("tail_panes") or {}) == 1))
-            panes = box.layout()["tail_panes"]
-            first_pane, first_worker = next(iter(panes.items()))
-            self.assertIn("aaa00005", first_worker)
+            self.up(box)
+            layout = self.wait_tabs(box, 1)
+            first = layout["tabs"]["deleg_aaa00005#0"]
+            first_pane, first_window = first["pane"], first["window"]
 
             box.add_delegation("deleg_bbb00006", [{"goal": "second"}])
             self.assertTrue(wait_for(
-                lambda: any("bbb00006" in (v or "")
-                            for v in (box.layout().get("tail_panes") or {}).values()),
-                timeout=15),
-                "no pane was created for the newly visible worker")
+                lambda: len(box.tabs()) == 2
+                and "deleg_bbb00006#0" in box.tabs(), timeout=15),
+                "no tab was created for the newly visible worker: %r" % box.tabs())
 
-            after = box.layout()["tail_panes"]
-            self.assertEqual(len(after), 2)
+            after = box.tabs()
+            second = after["deleg_bbb00006#0"]
+            self.assertNotEqual(second["window"], first_window,
+                                "the new worker landed in an occupied window")
+            self.assertNotEqual(second["pane"], first_pane,
+                                "the new worker took an existing pane")
             # The pane the user may be reading stays bound to its own worker.
-            self.assertEqual(after.get(first_pane), first_worker,
-                             "an existing pane was repointed at a different worker")
+            self.assertEqual(after["deleg_aaa00005#0"]["pane"], first_pane,
+                             "an existing tab was repointed at a different worker")
+            self.assertEqual(after["deleg_aaa00005#0"]["window"], first_window)
+            self.assertTrue(_pane_exists(first_pane),
+                            "the first worker's pane was destroyed for the new one")
 
     def test_worker_command_focuses_the_pane_in_stable_slot_order(self):
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00019",
                                [{"goal": "w%d" % i} for i in range(3)])
-            self.assertEqual(box.cli("up"), 0)
-            self.assertTrue(wait_for(lambda: len(box.layout().get("tail_panes") or {}) == 3))
-            layout = box.layout()
-            assign = layout["worker_assign"]
-            order = sorted(
-                layout["tail_panes"],
-                key=lambda p: (int(assign[layout["tail_panes"][p]]),
-                               int(p.lstrip("%"))))
+            self.up(box)
+            layout = self.wait_tabs(box, 3)
+            ordered = sorted(layout["tabs"].items(),
+                             key=lambda item: _window_index(item[1]["window"]))
+            self.assertEqual(len(ordered), 3)
+            target_key, target = ordered[1]
+
             self.assertEqual(box.cli("worker", "2"), 0)
-            active = _tmux("display-message", "-p", "-t", box.name, "#{pane_id}")[1].strip()
-            self.assertEqual(active, order[1],
-                             "worker 2 did not focus the second worker in slot order")
-            active_window = _tmux("display-message", "-p", "-t", box.name,
-                                  "#{window_id}")[1].strip()
-            self.assertEqual(active_window,
-                             _tmux("display-message", "-p", "-t", active,
-                                   "#{window_id}")[1].strip())
+            current = _format(box.name, "#{window_id}")
+            self.assertEqual(current, target["window"],
+                             "worker 2 selected %s, expected the second tab %s (%s)"
+                             % (current, target["window"], target_key))
+            self.assertEqual(_format(target["window"], "#{pane_id}"), target["pane"],
+                             "worker 2 did not focus the tab's pane")
 
-    def test_v1_layout_migrates_worker_panes_out_of_the_overview_window(self):
-        """An installed v1 layout keeps worker panes in hx:workers.
+    def test_stale_v1_layout_naming_user_panes_causes_no_damage(self):
+        """Replaces the v1->v2 pane migration test.
 
-        On upgrade the overview window must end up overview-only and the worker
-        panes must reappear in hx:worker-* windows, without killing a pane the
-        user split into that window.
+        The ``trim_overview_window`` migration no longer exists, and v1's
+        ``worker_windows`` / ``worker_assign`` / ``tail_panes`` keys are ignored
+        by v3. The property the old test protected still matters: a layout file
+        written by an older version must never authorise a kill, split, rename
+        or ownership marker on a pane or window the user owns, even when those
+        stale keys name them.
         """
         with Sandbox() as box:
-            box.add_delegation("deleg_v1mig001", [{"goal": "a"}, {"goal": "b"}])
-            self.assertEqual(box.cli("up"), 0)
-            self.assertTrue(wait_for(lambda: len(box.layout().get("tail_panes") or {}) == 2))
-            overview = box.window("hx:workers")
-            layout = box.layout()
-            old_panes = list(layout["tail_panes"])
-            # Move the two panes into the overview window, as v1 had them, and
-            # rewrite layout.json into the v1 shape.
-            for pane_id in old_panes:
-                _tmux("join-pane", "-d", "-s", pane_id, "-t", overview["id"])
-            self.assertTrue(wait_for(
-                lambda: len(box.panes_of(overview["id"])) == 3, timeout=10))
-            for win in [w for w in box.windows() if w["name"].startswith("hx:worker-")]:
-                _tmux("kill-window", "-t", win["id"])
-            _tmux("split-window", "-d", "-t", overview["id"], "-h")
-            user_pane = [p["id"] for p in box.panes_of(overview["id"])
-                         if p["id"] not in old_panes
-                         and p["id"] != layout["overview_pane"]][0]
-            self.assertTrue(user_pane)
-            sessions = box.home / "cache" / "hermes-tmux" / "sessions"
-            path = next(sessions.iterdir()) / "layout.json"
-            data = json.loads(path.read_text(encoding="utf-8"))
-            data.pop("worker_windows", None)
-            data.pop("worker_assign", None)
-            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            # The user's own window, with a pane they split themselves.
+            user_win = _tmux("new-window", "-d", "-P", "-F", "#{window_id}",
+                             "-t", box.name, "-n", "notes",
+                             "-c", str(REPO), "exec /bin/zsh -f")[1].strip()
+            self.assertTrue(_window_exists(user_win))
+            split = _tmux("split-window", "-d", "-P", "-F", "#{pane_id}",
+                          "-t", user_win, "-c", str(REPO), "exec sleep 600")[1].strip()
+            self.assertTrue(_pane_exists(split))
+            user_panes = sorted(p["id"] for p in box.panes_of(user_win))
+            user_pids = {p: _pane_pid(p) for p in user_panes}
 
-            box.append_event("deleg_v1mig001", 0, "tool", "-> terminal(ls)")
-            self.assertTrue(wait_for(
-                lambda: len(box.layout().get("worker_windows") or {}) == 1, timeout=20),
-                "worker windows were not rebuilt: %r" % box.layout())
-            overview_panes = box.panes_of(overview["id"])
-            self.assertEqual(len([p for p in overview_panes if p["id"] in old_panes]), 0,
-                             "overview window still holds our worker panes")
-            self.assertIn(user_pane, [p["id"] for p in overview_panes],
-                          "migration destroyed a user pane in the overview window")
-            worker_wins = [w for w in box.windows() if w["name"].startswith("hx:worker-")]
-            self.assertEqual(len(worker_wins), 1)
-            self.assertEqual(len(box.panes_of(worker_wins[0]["id"])), 2)
-            for pane_id in old_panes:
-                self.assertFalse(
-                    _tmux("display-message", "-p", "-t", pane_id, "#{pane_id}")[1].strip()
-                    == pane_id, "v1 pane %s survived the migration" % pane_id)
+            box.add_delegation("deleg_v1stale1", [{"goal": "upgrade"}])
+            self.up(box)
+            layout = self.wait_tabs(box, 1)
+            our_tab = dict(layout["tabs"]["deleg_v1stale1#0"])
+
+            # Rewrite layout.json into the v1 shape, its stale references naming
+            # the user's own window and panes.
+            path = box.tab_dir() / "layout.json"
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["worker_windows"] = {"deleg_v1stale1#0": user_win}
+            data["worker_assign"] = {"deleg_v1stale1#0": "0"}
+            data["tail_panes"] = {user_panes[-1]: "deleg_v1stale1#0"}
+            data["overview_panes"] = list(user_panes)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            os.replace(tmp, path)
+
+            # Force a full reconcile pass, which reads exactly that layout.
+            box.append_event("deleg_v1stale1", 0, "tool", "-> PROOF-OF-PASS(x)")
+            self.assertTrue(wait_for(lambda: "PROOF-OF-PASS" in box.render_text(),
+                                     timeout=15),
+                            "the coordinator never ran a pass over the stale layout")
+
+            after = box.layout()
+            self.assertEqual(after["tabs"]["deleg_v1stale1#0"]["window"],
+                             our_tab["window"],
+                             "a stale tail_panes/worker_windows entry moved the tab "
+                             "into the user's window")
+            self.assertEqual(_format(user_win, "#{window_name}"), "notes",
+                             "the user's window was renamed")
+            self.assertEqual(sorted(p["id"] for p in box.panes_of(user_win)), user_panes,
+                             "the user's panes were killed or split")
+            for pane_id, pid in user_pids.items():
+                self.assertEqual(_pane_pid(pane_id), pid,
+                                 "the user's pane %s was respawned" % pane_id)
+            self.assertEqual(box.window_option(user_win, "@hx"), "",
+                             "a stale layout made us mark the user's window as ours")
+            for pane_id in user_panes:
+                self.assertEqual(box.pane_option(pane_id, "@hx"), "",
+                                 "a stale layout made us mark the user's pane as ours")
 
     def test_worker_window_counts_for_zero_through_eight_workers(self):
         for count in (0, 1, 2, 3, 4, 8):
@@ -546,65 +778,60 @@ class IntegrationTest(unittest.TestCase):
                     if count:
                         box.add_delegation("deleg_cnt%05d" % count,
                                            [{"goal": "w%d" % i} for i in range(count)])
-                    self.assertEqual(box.cli("up"), 0)
-                    self.assertTrue(wait_for(
-                        lambda: len(box.layout().get("tail_panes") or {}) == count,
-                        timeout=20))
-                    overview = box.window("hx:workers")
+                    self.up(box)
+                    layout = self.wait_tabs(box, count)
+                    self.assertEqual(len(layout.get("tabs") or {}), count,
+                                     "%d running workers must have %d tabs, got %r"
+                                     % (count, count, sorted(layout.get("tabs") or {})))
+                    for tab in (layout.get("tabs") or {}).values():
+                        self.assertEqual(len(box.panes_of(tab["window"])), 1,
+                                         "a worker tab holds more than one pane")
+                    # One window per running worker, plus the overview.
+                    self.assertEqual(len(box.own_windows()), count + 1,
+                                     "%d workers must own %d windows, got %r"
+                                     % (count, count + 1,
+                                        [w["name"] for w in box.own_windows()]))
+                    overview = box.window(AGENTS)
+                    self.assertIsNotNone(overview)
                     self.assertEqual(len(box.panes_of(overview["id"])), 1,
                                      "overview window must hold one pane")
-                    worker_wins = [w for w in box.windows()
-                                   if w["name"].startswith("hx:worker-")]
-                    self.assertEqual(len(worker_wins), (count + 1) // 2,
-                                     "%d workers must fill ceil(%d/2) windows"
-                                     % (count, count))
-                    for win in worker_wins:
-                        self.assertLessEqual(len(box.panes_of(win["id"])), 2,
-                                             "%s has more than two panes" % win["name"])
 
     # ---- 3. events -------------------------------------------------------
     def test_up_rebuilds_a_lost_overview_without_repurposing_survivors(self):
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00106", [{"goal": "rebuild"}])
-            self.assertEqual(box.cli("up"), 0)
-            win = box.window("hx:workers")
-            old_overview = box.layout()["overview_pane"]
-            self.assertTrue(wait_for(
-                lambda: len(box.layout().get("tail_panes") or {}) == 1, timeout=15),
-                "no worker pane was created for the delegation")
-
-            worker_wins = [w for w in box.windows() if w["name"].startswith("hx:worker-")]
-            self.assertTrue(worker_wins, "expected a worker window")
-            survivors = {p["id"]: _tmux("display-message", "-p", "-t", p["id"],
-                                        "#{pane_pid}")[1].strip()
-                         for w in worker_wins for p in box.panes_of(w["id"])}
-            self.assertTrue(survivors, "expected at least one surviving worker pane")
+            self.up(box)
+            layout = self.wait_tabs(box, 1)
+            old_overview = layout["overview_pane"]
+            tab = layout["tabs"]["deleg_aaa00106#0"]
+            survivor_pid = _pane_pid(tab["pane"])
+            self.assertTrue(survivor_pid)
 
             _tmux("kill-pane", "-t", old_overview)
-            time.sleep(0.3)
+            self.assertTrue(wait_for(lambda: not _pane_exists(old_overview), timeout=5))
             self.assertEqual(box.cli("up"), 0)
 
-            new_overview = box.layout()["overview_pane"]
-            self.assertNotIn(new_overview, survivors,
-                             "up repurposed a surviving pane as the overview")
-            for pane_id, pid in survivors.items():
-                now_pid = _tmux("display-message", "-p", "-t", pane_id, "#{pane_pid}")[1].strip()
-                self.assertEqual(now_pid, pid,
-                                 "up restarted the surviving pane %s" % pane_id)
+            rebuilt = box.layout()
+            new_overview = rebuilt.get("overview_pane")
+            self.assertTrue(new_overview)
+            self.assertNotEqual(new_overview, old_overview)
+            self.assertNotEqual(new_overview, tab["pane"],
+                                "up repurposed a worker pane as the overview")
+            self.assertEqual(_pane_pid(tab["pane"]), survivor_pid,
+                             "up restarted the surviving worker pane")
             self.assertTrue(wait_for(
-                lambda: "hermes subagents" in box.capture(new_overview), timeout=10))
+                lambda: "HERMES AGENTS" in box.capture(new_overview), timeout=10),
+                "no overview was rebuilt")
+            self.assertIn("deleg_aaa00106#0", box.tabs(),
+                          "up dropped the worker tab while rebuilding the overview")
 
     def test_coordinator_is_recognised_while_it_lives(self):
         """Positive control: the identity check must say yes to the real thing."""
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00104", [{"goal": "identity"}])
-            self.assertEqual(box.cli("up"), 0)
+            self.up(box)
             self.assertTrue(wait_for(lambda: _watcher_pid(box) is not None))
-            key = None
-            for child in (box.home / "cache" / "hermes-tmux" / "sessions").iterdir():
-                if (child / "watch.pid").exists():
-                    key = child.name
-            self.assertIsNotNone(key)
+            key = box.key()
             code = ("from hermes_tmux import cli; "
                     "print('ALIVE', cli._watcher_alive(%r))" % key)
             self.assertEqual(box.run("%s -c %s" % (PY, _q(code))), 0)
@@ -614,15 +841,16 @@ class IntegrationTest(unittest.TestCase):
     def test_events_stream_in_order_into_the_worker_pane(self):
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00007", [{"goal": "ordered"}])
-            self.assertEqual(box.cli("up"), 0)
-            self.assertTrue(wait_for(lambda: len(box.layout().get("tail_panes") or {}) == 1))
-            pane = list(box.layout()["tail_panes"])[0]
+            self.up(box)
+            layout = self.wait_tabs(box, 1)
+            pane = layout["tabs"]["deleg_aaa00007#0"]["pane"]
             for i in range(3):
                 box.append_event("deleg_aaa00007", 0, "tool", "-> step%d(...)" % i)
-                time.sleep(0.05)
-            box.append_event("deleg_aaa00007", 0, "final", "status=completed duration=1.0s")
+            box.append_event("deleg_aaa00007", 0, "final",
+                             "status=completed duration=1.0s")
             self.assertTrue(wait_for(lambda: "step2" in box.capture(pane)),
-                            "worker pane never showed the appended events")
+                            "worker pane never showed the appended events: %r"
+                            % box.capture(pane)[-400:])
             painted = box.capture(pane)
             self.assertLess(painted.index("step0"), painted.index("step1"))
             self.assertLess(painted.index("step1"), painted.index("step2"))
@@ -630,113 +858,161 @@ class IntegrationTest(unittest.TestCase):
     def test_overview_updates_on_transcript_events_without_restart(self):
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00008", [{"goal": "live update"}])
-            self.assertEqual(box.cli("up"), 0)
+            self.up(box)
             self.assertTrue(wait_for(lambda: "live update" in box.render_text()))
             box.append_event("deleg_aaa00008", 0, "tool", "-> terminal(ls)")
-            self.assertTrue(wait_for(lambda: "terminal" in box.render_text()),
-                            "render.txt did not follow the transcript event")
+            self.assertTrue(wait_for(lambda: "terminal(ls)" in box.render_text()),
+                            "render.txt did not follow the transcript event: %r"
+                            % box.render_text()[:400])
 
     def test_state_db_completion_refreshes_overview_without_a_transcript_write(self):
         """A task can finish only in state.db. That must still repaint.
 
         Before the database was watched, the row kept its old running state
         until an unrelated transcript append happened to fire the coordinator.
+        v3: the pane header says DONE and the overview stops calling the worker
+        running.
         """
         with Sandbox() as box:
             box.add_delegation("deleg_db00001", [{"goal": "db driven"}])
-            self.assertEqual(box.cli("up"), 0)
-            self.assertTrue(wait_for(lambda: len(box.layout().get("tail_panes") or {}) == 1))
-            pane = list(box.layout()["tail_panes"])[0]
+            self.up(box)
+            layout = self.wait_tabs(box, 1)
+            pane = layout["tabs"]["deleg_db00001#0"]["pane"]
             box.append_event("deleg_db00001", 0, "tool", "-> terminal(ls)")
-            self.assertTrue(wait_for(lambda: " run " in box.pane_title(pane), timeout=10),
-                            "fixture did not start as running: %r" % box.pane_title(pane))
+            self.assertTrue(
+                wait_for(lambda: "RUNNING" in box.pane_option(pane, "@hx_head"), timeout=10),
+                "fixture did not start as running: %r"
+                % box.pane_option(pane, "@hx_head"))
 
             box.write_db_state("deleg_db00001", "completed")
-            self.assertTrue(wait_for(lambda: " done " in box.pane_title(pane), timeout=15),
-                            "pane label did not follow the state.db completion")
-            self.assertTrue(wait_for(lambda: "done 1" in box.render_text(), timeout=15),
-                            "overview did not follow the state.db completion: %r"
-                            % box.render_text().splitlines()[:2])
+            self.assertTrue(
+                wait_for(lambda: "DONE" in box.pane_option(pane, "@hx_head"), timeout=15),
+                "the pane header did not follow the state.db completion: %r"
+                % box.pane_option(pane, "@hx_head"))
+            self.assertTrue(
+                wait_for(lambda: "Nothing running." in box.render_text(), timeout=15),
+                "the overview still claims the worker is running: %r"
+                % box.render_text()[:400])
+            self.assertIn("RECENT", box.render_text(),
+                          "the completed worker left the overview entirely: %r"
+                          % box.render_text()[:400])
 
     def test_overview_title_is_not_scrolled_off_in_a_short_pane(self):
         """Writing exactly `height` lines with a trailing newline scrolls one
-        line: the title (running/total, age) vanished and the pane looked dead.
+        line: the title vanished and the pane looked dead.
         """
         with Sandbox(columns=100, rows=8) as box:
             box.add_delegation("deleg_short0001",
                                [{"goal": "w%d" % i} for i in range(3)])
-            self.assertEqual(box.cli("up"), 0)
-            self.assertTrue(wait_for(lambda: len(box.layout().get("tail_panes") or {}) == 3))
+            self.up(box)
+            self.wait_tabs(box, 3)
             overview = box.layout()["overview_pane"]
             self.assertTrue(wait_for(
-                lambda: "hermes subagents" in box.capture(overview), timeout=10),
+                lambda: "HERMES AGENTS" in box.capture(overview), timeout=10),
                 "the overview title scrolled out of a short pane: %r"
                 % box.capture(overview).splitlines()[:3])
 
     # ---- 4. failure ------------------------------------------------------
     def test_failed_task_renders_as_failure_not_success(self):
+        """A failed run is never painted as a completed one.
+
+        v3 splits it by time: a run that had already ended before `up` is
+        history (RECENT, no tab); one that ends afterwards is a live problem
+        (NEEDS ATTENTION). Neither is ever shown with the success glyph.
+        """
+        past = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d 09:00:00")
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00009", [{
                 "goal": "broken", "status": "failed", "exit_reason": "error",
                 "lines": [
                     "=== Hermes subagent live transcript ===",
                     "delegation: deleg_aaa00009   task: 0",
-                    "goal: broken", "started: 2026-11-12 09:00:00",
+                    "goal: broken", "started: %s" % past,
                     "(append-only)", "=" * 40,
                     "09:00:05 result   | terminal ERROR 5.0s: exit 1",
                     "09:00:06 final    | status=failed exit_reason=error",
-                ]}])
-            self.assertEqual(box.cli("up"), 0)
-            self.assertTrue(wait_for(lambda: "fail" in box.render_text()), )
+                ]}], started=past)
+            self.up(box)
+            self.assertTrue(wait_for(lambda: "broken" in box.render_text()))
             text = box.render_text()
-            self.assertIn("fail", text)
-            self.assertNotIn("done", text)
+            fail_glyph = self.glyph(box, "fail")
+            self.assertIn(fail_glyph, text, "the failed run has no failure glyph: %r" % text)
+            self.assertNotIn(self.glyph(box, "done"), text,
+                             "a failed run was painted as a success: %r" % text)
+            self.assertIn("RECENT", text,
+                          "a run that ended before `up` must be history, not attention: %r"
+                          % text)
+            self.assertNotIn("NEEDS ATTENTION", text)
+            self.assertEqual(box.tabs(), {},
+                             "a worker that had already failed before `up` got a tab")
+
+            # Same failure, but after `up`: it needs a look.
+            box.add_delegation("deleg_aaa00018", [{"goal": "breaks later"}])
+            self.assertTrue(wait_for(lambda: "breaks later" in box.render_text(), timeout=15))
+            box.finish("deleg_aaa00018", 0, "error")
+            box.set_task_status("deleg_aaa00018", 0, "error", exit_reason="error")
+            self.assertTrue(
+                wait_for(lambda: "NEEDS ATTENTION" in box.render_text(), timeout=20),
+                "a failure that happened after `up` never asked for attention: %r"
+                % box.render_text()[:600])
+            self.assertIn("run ended: error", box.render_text())
 
     def test_missing_delegation_directory_is_tolerated(self):
         with Sandbox() as box:
-            self.assertEqual(box.cli("up"), 0)
-            self.assertTrue(wait_for(lambda: "no delegations" in box.render_text().lower()))
+            self.up(box)
+            self.assertTrue(wait_for(
+                lambda: "No delegations yet." in box.render_text(), timeout=10),
+                "empty workspace not described truthfully: %r" % box.render_text())
+            self.assertIn("HERMES AGENTS", box.render_text())
             self.assertEqual(box.cli("status"), 0)
+            self.assertIn("HERMES AGENTS", box.capture())
 
     # ---- 5. review lifecycle --------------------------------------------
     def test_review_record_changes_display_and_is_listed(self):
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00010", [{"goal": "reviewable"}])
-            self.assertEqual(box.cli("up"), 0)
-            self.assertTrue(wait_for(lambda: "review" in box.render_text()))
-            self.assertIn("unreviewed", box.render_text())
+            self.up(box)
+            self.assertTrue(wait_for(lambda: "reviewable" in box.render_text()))
+            self.assertNotIn("review: recorded", box.render_text(),
+                             "the row claimed a review before one was recorded")
             self.assertEqual(box.cli("review", "record", "--delegation", "deleg_aaa00010",
                                      "--task", "0", "--status", "recorded"), 0)
-            self.assertTrue(wait_for(lambda: "1 recorded" in box.render_text()),
-                            "review record did not reach the overview: %r"
-                            % box.render_text()[:400])
+            self.assertTrue(
+                wait_for(lambda: "review: recorded (manual)" in box.render_text()),
+                "review record did not reach the overview: %r"
+                % box.render_text()[:500])
             self.assertEqual(box.cli("review", "list"), 0)
             self.assertIn("deleg_aaa00010", box.capture())
 
     def test_reviewer_role_never_inferred_from_executor(self):
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00011", [{"goal": "please review this code"}])
-            self.assertEqual(box.cli("up"), 0)
+            self.up(box)
             self.assertTrue(wait_for(lambda: "please review this code" in box.render_text()))
-            # A goal that merely mentions "review" must not make the row a reviewer.
-            self.assertNotIn("revw", box.render_text().split("please review")[0])
+            self.assertIn("RUNNING", box.render_text(),
+                          "a goal that merely mentions review stopped being a running "
+                          "executor: %r" % box.render_text()[:400])
+            self.assertNotIn("reviewer", box.render_text().lower())
+            # The role the registry implies is the authority; the goal text is not.
+            code = ("from hermes_tmux.state import load_workers; "
+                    "roles = {w.role for w in load_workers()}; "
+                    "print('ROLE-CHECK executor-only' if roles == {'executor'} "
+                    "else 'ROLE-CHECK ' + repr(sorted(roles)))")
+            self.assertEqual(box.run("%s -c %s" % (PY, _q(code))), 0)
+            self.assertIn("ROLE-CHECK executor-only", box.capture(),
+                          "a goal mentioning review made the executor a reviewer")
 
     # ---- 6. detach / reattach -------------------------------------------
     def test_detach_and_reattach_preserves_panes_and_watcher(self):
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00012", [{"goal": "survivor"}])
-            self.assertEqual(box.cli("up"), 0)
-            self.assertTrue(wait_for(lambda: len(box.layout().get("tail_panes") or {}) == 1))
-            before = box.layout()
-            pid_before = (box.home / "cache" / "hermes-tmux" / "sessions")
+            self.up(box)
+            before = self.wait_tabs(box, 1)
             self.assertTrue(wait_for(lambda: _watcher_pid(box) is not None))
             watcher_before = _watcher_pid(box)
 
             # A real detach needs a real client: `attach` fails with "not a
-            # terminal" in a test process, so run one under a pty via `script`.
-            # A real client needs a real tty that stays open. `script` exits as
-            # soon as its stdin closes, so the pty is created here and handed to
-            # the child directly.
+            # terminal" in a test process, so run one under a pty.
             child_env = {k: v for k, v in os.environ.items()
                          if k not in ("TMUX", "TMUX_PANE")}
             # tmux refuses to attach on TERM=dumb, which is what a tool-driven
@@ -766,15 +1042,19 @@ class IntegrationTest(unittest.TestCase):
 
             after = box.layout()
             self.assertEqual(before.get("workers_window"), after.get("workers_window"))
-            self.assertEqual(before.get("tail_panes"), after.get("tail_panes"))
+            self.assertEqual(
+                {k: (v.get("window"), v.get("pane")) for k, v in before["tabs"].items()},
+                {k: (v.get("window"), v.get("pane")) for k, v in after["tabs"].items()},
+                "a reattach changed a worker tab's window or pane")
+            for tab in after["tabs"].values():
+                self.assertTrue(_pane_exists(tab["pane"]),
+                                "a worker pane did not survive detach/reattach")
             self.assertEqual(_watcher_pid(box), watcher_before,
                              "watcher was restarted by an idempotent up")
-            win = box.window("hx:workers")
+            win = box.window(AGENTS)
             self.assertIsNotNone(win)
             self.assertEqual(len(box.panes_of(win["id"])), 1,
                              "the overview window must still hold only the overview")
-            worker_wins = [w for w in box.windows() if w["name"].startswith("hx:worker-")]
-            self.assertTrue(worker_wins, "worker windows did not survive a reattach")
 
     def test_coordinator_exits_when_its_session_disappears(self):
         """run-shell children outlive the server; the watcher must not.
@@ -784,7 +1064,7 @@ class IntegrationTest(unittest.TestCase):
         """
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00101", [{"goal": "lifecycle"}])
-            self.assertEqual(box.cli("up"), 0)
+            self.up(box)
             self.assertTrue(wait_for(lambda: _watcher_pid(box) is not None))
             pid = _watcher_pid(box)
 
@@ -806,37 +1086,42 @@ class IntegrationTest(unittest.TestCase):
         """Remove our panes; leave the window standing if a user pane lives in it."""
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00105", [{"goal": "mixed window"}])
-            self.assertEqual(box.cli("up"), 0)
-            win = box.window("hx:workers")
+            self.up(box)
+            win = box.window(AGENTS)
             self.assertIsNotNone(win)
 
             # The pane id comes back from the split itself: selecting by command
-            # name races the coordinator's tail-pane creation.
+            # name races the coordinator's tab creation.
             user_pane = _tmux("split-window", "-d", "-P", "-F", "#{pane_id}",
                               "-t", win["id"], "-c", str(REPO))[1].strip()
             self.assertTrue(user_pane)
-            user_pid = _tmux("display-message", "-p", "-t", user_pane,
-                             "#{pane_pid}")[1].strip()
+            user_pid = _pane_pid(user_pane)
+            self.assertTrue(user_pid)
+            overview = box.layout().get("overview_pane")
+            self.assertTrue(overview)
 
             self.assertEqual(box.cli("down"), 0)
-            time.sleep(0.5)
-
-            self.assertIsNotNone(box.window("hx:workers"),
+            self.assertTrue(
+                wait_for(lambda: [p["id"] for p in box.panes_of(win["id"])] == [user_pane],
+                         timeout=5),
+                "down left or removed the wrong panes: %r" % box.panes_of(win["id"]))
+            self.assertIsNotNone(box.window(AGENTS),
                                  "down destroyed a window containing a user pane")
-            remaining = box.panes_of(win["id"])
-            self.assertEqual([p["id"] for p in remaining], [user_pane],
-                             "down left or removed the wrong panes: %r" % remaining)
-            self.assertTrue(_pid_alive(int(user_pid)), "down killed the user's shell")
+            self.assertTrue(_pid_alive(user_pid), "down killed the user's shell")
+            self.assertFalse(_pane_exists(overview),
+                             "the overview pane survived down")
 
     def test_down_closes_only_our_windows_and_keeps_user_work(self):
         with Sandbox() as box:
             _tmux("new-window", "-d", "-t", box.name, "-n", "userwork", "exec /bin/zsh -f")
             box.add_delegation("deleg_aaa00013", [{"goal": "teardown"}])
-            self.assertEqual(box.cli("up"), 0)
+            self.up(box)
+            self.wait_tabs(box, 1)
             self.assertEqual(box.cli("logs"), 0)
             self.assertTrue(wait_for(lambda: box.window("hx:logs") is not None))
             self.assertEqual(box.cli("down"), 0)
-            self.assertTrue(wait_for(lambda: box.window("hx:workers") is None))
+            self.assertTrue(wait_for(lambda: box.window(AGENTS) is None),
+                            "down left the overview window standing")
             self.assertIsNone(box.window("hx:logs"))
             self.assertIsNotNone(box.window("userwork"),
                                  "down destroyed a window it did not create")
@@ -845,84 +1130,89 @@ class IntegrationTest(unittest.TestCase):
             self.assertEqual(left, [], "down left its state directory behind")
 
     def test_foreign_window_with_our_name_is_never_adopted(self):
-        """A user window called hx:workers must not be taken over."""
+        """A user window called 'agents' must not be taken over."""
         with Sandbox() as box:
-            _tmux("new-window", "-d", "-t", box.name, "-n", "hx:workers",
+            _tmux("new-window", "-d", "-t", box.name, "-n", AGENTS,
                   "exec /bin/zsh -f")
-            foreign = box.window("hx:workers")
+            foreign = box.window(AGENTS)
             self.assertIsNotNone(foreign)
             box.add_delegation("deleg_aaa00100", [{"goal": "name clash"}])
             self.assertEqual(box.cli("up"), 0)
+            self.assertIsNotNone(box.window(AGENTS + "#2"),
+                                 "up built no workspace window beside the foreign one: %r"
+                                 % [w["name"] for w in box.windows()])
 
-            # Two windows now: theirs, untouched, and ours under another name.
-            windows = box.windows()
-            same_name = [w for w in windows if w["name"] == "hx:workers"]
-            self.assertEqual(len(same_name), 1, windows)
+            # Their window is untouched; ours exists under a disambiguated name.
+            same_name = box.windows_named(AGENTS)
+            self.assertEqual(len(same_name), 1, [w["name"] for w in box.windows()])
             self.assertFalse(same_name[0]["ours"],
                              "the tool adopted a window it did not create")
             self.assertEqual(same_name[0]["id"], foreign["id"])
-            ours = [w for w in windows if w["ours"]]
+            ours = box.own_windows()
             self.assertTrue(ours, "no workspace window was created")
+            names = [w["name"] for w in ours]
+            self.assertIn(AGENTS + "#2", names,
+                          "the workspace did not step around the foreign name: %r" % names)
 
             self.assertEqual(box.cli("down"), 0)
-            self.assertIsNotNone(box.window("hx:workers"),
+            self.assertIsNotNone(box.window(AGENTS),
                                  "down closed a foreign window")
 
     def test_inherited_marker_on_a_user_shell_is_not_killable(self):
         """Pane options are inherited by splits, so @hx alone cannot authorise a kill."""
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00102", [{"goal": "guard"}])
-            self.assertEqual(box.cli("up"), 0)
-            win = box.window("hx:workers")
+            self.up(box)
+            win = box.window(AGENTS)
             self.assertIsNotNone(win)
 
             # A user splits their own shell INSIDE our window; the split inherits
-            # the @hx marker from the pane it was made from.
-            # A plain split (no command) is how a user opens a shell: it inherits
-            # the @hx marker and has an empty start command. Take the id from the
-            # split itself, never from a command-name search.
+            # the marker from the pane it was made from but was started without
+            # a command, so ownership provenance must still refuse the kill.
             target = _tmux("split-window", "-d", "-P", "-F", "#{pane_id}",
                            "-t", win["id"], "-c", str(REPO))[1].strip()
             self.assertTrue(target)
 
-            code = ("import sys; from hermes_tmux import tmuxio; "
+            code = ("from hermes_tmux import tmuxio; "
                     "ok, why = tmuxio.close_pane(%r); "
                     "print('RESULT', ok, why)" % target)
             self.assertEqual(box.run("%s -c %s" % (PY, _q(code))), 0)
             painted = box.capture()
             self.assertIn("RESULT False", painted,
-                          "a user shell inside our window was killable: %r" % painted[-300:])
+                          "a user shell inside our window was killable: %r"
+                          % painted[-300:])
             # Either refusal is correct; what matters is that it is refused.
             self.assertTrue("no ownership provenance" in painted or "not ours" in painted,
                             painted[-300:])
+            self.assertTrue(_pane_exists(target), "the refused kill still removed the pane")
 
     def test_up_never_respawns_a_user_pane_that_took_the_first_slot(self):
         """The overview slot is positional; a user split may occupy it."""
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00103", [{"goal": "overview slot"}])
-            self.assertEqual(box.cli("up"), 0)
-            win = box.window("hx:workers")
+            self.up(box)
+            win = box.window(AGENTS)
             self.assertIsNotNone(win)
 
             # The user opens a shell in our window and our overview dies.
             user_pane = _tmux("split-window", "-d", "-P", "-F", "#{pane_id}",
                               "-t", win["id"], "-c", str(REPO))[1].strip()
             self.assertTrue(user_pane)
-            user_pid = _tmux("display-message", "-p", "-t", user_pane,
-                             "#{pane_pid}")[1].strip()
+            user_pid = _pane_pid(user_pane)
             overview = box.layout()["overview_pane"]
             _tmux("kill-pane", "-t", overview)
-            time.sleep(0.3)
+            self.assertTrue(wait_for(lambda: not _pane_exists(overview), timeout=5))
 
             self.assertEqual(box.cli("up"), 0)
-            self.assertTrue(_pid_alive(int(user_pid)),
+            self.assertTrue(_pid_alive(user_pid),
                             "up killed the user's shell in the overview slot")
-            # And a working overview exists again.
             new_overview = box.layout().get("overview_pane")
             self.assertTrue(new_overview)
             self.assertNotEqual(new_overview, overview)
+            self.assertNotEqual(new_overview, user_pane,
+                                "up respawned the user's own shell as the overview")
             self.assertTrue(wait_for(
-                lambda: "hermes subagents" in box.capture(new_overview), timeout=10),
+                lambda: "HERMES AGENTS" in box.capture(new_overview), timeout=10),
                 "no overview was rebuilt")
 
     def test_window_marker_does_not_make_its_panes_ours(self):
@@ -933,16 +1223,16 @@ class IntegrationTest(unittest.TestCase):
         """
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00107", [{"goal": "ownership"}])
-            self.assertEqual(box.cli("up"), 0)
-            win = box.window("hx:workers")
+            self.up(box)
+            win = box.window(AGENTS)
             self.assertIsNotNone(win)
 
             new = _tmux("split-window", "-d", "-P", "-F", "#{pane_id}",
                         "-t", win["id"], "-c", str(REPO))[1].strip()
             self.assertTrue(new)
-            self.assertNotEqual(
-                _tmux("display-message", "-p", "-t", new, "#{@hx}")[1].strip(), "",
-                "the window marker is expected to leak through the format read")
+            self.assertNotEqual(_format(new, "#{@hx}"), "",
+                                "the window marker is expected to leak through the "
+                                "format read")
             code = ("from hermes_tmux import tmuxio; "
                     "print('OWNS', tmuxio.owns_pane(%r))" % new)
             self.assertEqual(box.run("%s -c %s" % (PY, _q(code))), 0)
@@ -965,7 +1255,7 @@ class IntegrationTest(unittest.TestCase):
     def test_aux_panes_are_lazy_and_reused(self):
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00014", [{"goal": "aux"}])
-            self.assertEqual(box.cli("up"), 0)
+            self.up(box)
             self.assertIsNone(box.window("hx:tests"), "tests pane must be lazy")
             self.assertEqual(box.cli("tests"), 0)
             self.assertIsNotNone(box.window("hx:tests"))
@@ -976,7 +1266,6 @@ class IntegrationTest(unittest.TestCase):
                 self.assertEqual(box.cli(role), 0)
                 self.assertTrue(wait_for(lambda r=role: box.window("hx:" + r) is not None),
                                 "hx:%s not created" % role)
-
 
     def test_aux_panes_show_real_output_not_placeholders(self):
         """Each aux pane must paint evidence from the real system."""
@@ -1062,7 +1351,7 @@ class IntegrationTest(unittest.TestCase):
             box.add_delegation("deleg_aaa00015", [{"goal": "gated"}])
             self.assertEqual(box.cli("up"), 0)
             self.assertIn("HERMES_TMUX=0", box.capture())
-            self.assertIsNone(box.window("hx:workers"))
+            self.assertIsNone(box.window(AGENTS))
             self.assertEqual(box.cli("status"), 0)
             self.assertIn("gated", box.capture())
 

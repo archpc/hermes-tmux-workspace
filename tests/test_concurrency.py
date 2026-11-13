@@ -53,9 +53,11 @@ TAG_B = "conc00002"
 TAG_C = "conc00003"
 TAG_D = "conc00004"
 
-#: ``"<delegation> t<index> <state> <model>"`` is the border label
-#: (``watch.pane_label``); only the leading delegation token is identity.
-_LABEL = re.compile(r"^([A-Za-z0-9_]+) t[0-9]+ ")
+#: ``watch.tail_command`` — the pane command of a worker tab, whose path names
+#: the delegation. The window itself is named after the task (v3), so a name
+#: prefix is no longer an identity; the transcript path is.
+_WORKER_CMD = "hermes_tmux tail"
+_LIVE_TAG = re.compile(r"/live/([A-Za-z0-9_]+)/")
 
 #: Pane ids are handed out monotonically per server but start again at ``%0``
 #: after a restart, so a numeric id can recur without any pane being adopted.
@@ -103,8 +105,9 @@ def _layout_at(box: Sandbox, key: str) -> Dict:
 
 
 def _layout_panes(layout: Dict) -> Set[str]:
-    """Pane ids a layout addresses: the overview plus every tail pane."""
-    panes = set((layout.get("tail_panes") or {}).keys())
+    """Pane ids a layout addresses: the overview plus every worker tab."""
+    panes = {tab["pane"] for tab in (layout.get("tabs") or {}).values()
+             if isinstance(tab, dict) and tab.get("pane")}
     if layout.get("overview_pane"):
         panes.add(layout["overview_pane"])
     return panes
@@ -133,29 +136,38 @@ def _server_pid(pane_id: str) -> str:
     return _tmux("display-message", "-p", "-t", pane_id, "#{pid}")[1].strip()
 
 
-def _titled_workers(box: Sandbox, window_id: str) -> Set[str]:
-    """Delegation tokens carried by the border titles in one window."""
-    out = set()
+def _pane_start_command(pane_id: str) -> str:
+    """``#{pane_start_command}``: what the pane was launched to run."""
+    return _tmux("display-message", "-p", "-t", pane_id, "#{pane_start_command}")[1].strip()
+
+
+def _window_workers(box: Sandbox, window_id: str) -> Set[str]:
+    """Delegations whose transcript a window's panes were launched to follow."""
+    out: Set[str] = set()
     for row in box.panes_of(window_id):
-        match = _LABEL.match(row["title"].strip())
+        command = _pane_start_command(row["id"])
+        if _WORKER_CMD not in command:
+            continue
+        match = _LIVE_TAG.search(command)
         if match:
             out.add(match.group(1))
     return out
 
 
-def _workspace_titles(box: Sandbox) -> Set[str]:
-    """Titles across every worker window of one session (not the overview)."""
+def _workspace_workers(box: Sandbox) -> Set[str]:
+    """Delegations with a worker tab in one session (windows are named by task)."""
     out: Set[str] = set()
     for win in box.windows():
-        if win["name"].startswith("hx:worker-"):
-            out |= _titled_workers(box, win["id"])
+        if win["ours"]:
+            out |= _window_workers(box, win["id"])
     return out
 
 
 def _workspace_panes(box: Sandbox) -> Set[str]:
+    """Panes in this session's own windows (the marker, not a name prefix)."""
     panes: Set[str] = set()
     for win in box.windows():
-        if win["name"].startswith(("hx:workers", "hx:worker-")):
+        if win["ours"]:
             panes |= {row["id"] for row in box.panes_of(win["id"])}
     return panes
 
@@ -253,19 +265,19 @@ class ConcurrencyIsolationTest(unittest.TestCase):
             self.assertFalse((_sessions_dir(a) / key_b).exists(),
                              "session a's home holds session b's directory")
 
-            win_a, win_b = a.window("hx:workers"), b.window("hx:workers")
-            self.assertIsNotNone(win_a, "session a has no workers window")
-            self.assertIsNotNone(win_b, "session b has no workers window")
+            win_a, win_b = a.window("agents"), b.window("agents")
+            self.assertIsNotNone(win_a, "session a has no overview window")
+            self.assertIsNotNone(win_b, "session b has no overview window")
             self.assertNotEqual(win_a["id"], win_b["id"])
 
-            self.assertTrue(wait_for(lambda: _workspace_titles(a) == {TAG_A},
+            self.assertTrue(wait_for(lambda: _workspace_workers(a) == {TAG_A},
                                      timeout=15),
-                            "session a's worker windows are not titled for its own worker: %r"
-                            % _workspace_titles(a))
-            self.assertTrue(wait_for(lambda: _workspace_titles(b) == {TAG_B},
+                            "session a's worker tabs are not following its own worker: %r"
+                            % _workspace_workers(a))
+            self.assertTrue(wait_for(lambda: _workspace_workers(b) == {TAG_B},
                                      timeout=15),
-                            "session b's worker windows are not titled for its own worker: %r"
-                            % _workspace_titles(b))
+                            "session b's worker tabs are not following its own worker: %r"
+                            % _workspace_workers(b))
             layout_a, layout_b = _layout_at(a, key_a), _layout_at(b, key_b)
             self.assertNotEqual(layout_a.get("overview_pane"), layout_b.get("overview_pane"),
                                 "both sessions address the same overview pane")
@@ -280,16 +292,14 @@ class ConcurrencyIsolationTest(unittest.TestCase):
             self.assertTrue(_pid_alive(coordinator_b))
 
             self.assertEqual(a.cli("down"), 0)
-            self.assertTrue(wait_for(lambda: a.window("hx:workers") is None),
-                            "down left session a's window standing")
-            self.assertTrue(wait_for(lambda: not a.windows() or all(
-                not w["name"].startswith(("hx:workers", "hx:worker-"))
-                for w in a.windows())),
-                "down left session a's worker windows standing")
-            self.assertIsNotNone(b.window("hx:workers"),
+            self.assertTrue(wait_for(lambda: a.window("agents") is None),
+                            "down left session a's overview window standing")
+            self.assertTrue(wait_for(lambda: not any(w["ours"] for w in a.windows())),
+                            "down left session a's worker tabs standing")
+            self.assertIsNotNone(b.window("agents"),
                                  "down in one session closed the other session's window")
-            self.assertTrue([w for w in b.windows() if w["name"].startswith("hx:worker-")],
-                            "down in one session closed the other session's worker windows")
+            self.assertEqual(_workspace_workers(b), {TAG_B},
+                             "down in one session closed the other session's worker tabs")
             for pane_id, pid in panes_before.items():
                 self.assertEqual(_pane_pid(pane_id), pid,
                                  "down in one session disturbed pane %s of the other"
@@ -308,8 +318,8 @@ class ConcurrencyIsolationTest(unittest.TestCase):
 
             key_before = _session_key(box)
             self.assertTrue(wait_for(
-                lambda: len(_layout_at(box, key_before).get("tail_panes") or {}) == 1,
-                timeout=15), "no tail pane was built before the restart")
+                lambda: len(_layout_at(box, key_before).get("tabs") or {}) == 1,
+                timeout=15), "no worker tab was built before the restart")
             old_layout = _layout_at(box, key_before)
             old_panes = _layout_panes(old_layout)
             self.assertTrue(old_panes)
@@ -330,8 +340,8 @@ class ConcurrencyIsolationTest(unittest.TestCase):
                 self.assertEqual(fresh.cli("up"), 0)
                 key_after = _session_key(fresh)
                 self.assertTrue(wait_for(
-                    lambda: len(_layout_at(fresh, key_after).get("tail_panes") or {}) == 1,
-                    timeout=15), "no tail pane was built after the restart")
+                    lambda: len(_layout_at(fresh, key_after).get("tabs") or {}) == 1,
+                    timeout=15), "no worker tab was built after the restart")
                 new_layout = _layout_at(fresh, key_after)
                 new_panes = _layout_panes(new_layout)
 
@@ -364,8 +374,8 @@ class ConcurrencyIsolationTest(unittest.TestCase):
             self.assertEqual(box.cli("up"), 0)
             key = _session_key(box)
             self.assertTrue(wait_for(
-                lambda: len(_layout_at(box, key).get("tail_panes") or {}) == 1,
-                timeout=15), "no tail pane was built")
+                lambda: len(_layout_at(box, key).get("tabs") or {}) == 1,
+                timeout=15), "no worker tab was built")
             before = _layout_at(box, key)
             before_panes = _layout_panes(before)
             self.assertTrue(before_panes)
@@ -407,7 +417,13 @@ class ConcurrencyIsolationTest(unittest.TestCase):
             after = _layout_at(box, key)
             self.assertEqual(after.get("workers_window"), before.get("workers_window"))
             self.assertEqual(after.get("overview_pane"), before.get("overview_pane"))
-            self.assertEqual(after.get("tail_panes"), before.get("tail_panes"))
+            # Identity, not the whole record: the coordinator legitimately adds
+            # `seen`/`settled` bookkeeping while the client is away.
+            self.assertEqual({k: (v.get("window"), v.get("pane"))
+                              for k, v in (after.get("tabs") or {}).items()},
+                             {k: (v.get("window"), v.get("pane"))
+                              for k, v in (before.get("tabs") or {}).items()},
+                             "detach replaced or dropped a worker tab")
             for pane_id, pid in pids_before.items():
                 self.assertEqual(_pane_pid(pane_id), pid,
                                  "detach replaced pane %s" % pane_id)

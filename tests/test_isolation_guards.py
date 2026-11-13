@@ -107,13 +107,18 @@ class ForeignWindowGuardTest(unittest.TestCase):
             # A layout from a dead server, pointing at an id that now names the
             # user's window.
             layout = json.loads(saved)
-            layout.update({"workers_window": user_win, "tail_panes": {},
-                           "overview_pane": "", "session_id": "$0"})
+            # Both stale references name the user's window: the overview id and
+            # a worker tab record (window and pane) left by the dead server.
+            layout.update({"workers_window": user_win, "overview_pane": "",
+                           "session_id": "$0", "dismissed": {},
+                           "tabs": {"deleg_guard001#0": {
+                               "window": user_win, "pane": before_panes[0],
+                               "opened": 1.0, "settled": 1.0}}})
             layout_path.parent.mkdir(parents=True, exist_ok=True)
             layout_path.write_text(json.dumps(layout))
 
             code = ("from hermes_tmux import watch, state\n"
-                    "watch.reconcile_panes(%r, state.load_workers(), None)\n" % key)
+                    "watch.reconcile_tabs(%r, state.load_workers(), None)\n" % key)
             info = _tmux("display-message", "-p", "#{socket_path}|#{pid}")[1]
             sock, server = info.split("|")
             import os as _os, subprocess as _sp

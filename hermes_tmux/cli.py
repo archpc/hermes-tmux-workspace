@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Tuple
 from . import gate, tmuxio, watch
 from .env import pane_env, python as _env_python, repo_root as _env_repo_root
 
-WORKERS_WINDOW = "hx:workers"
+WORKERS_WINDOW = watch.OVERVIEW_WINDOW
 AUX_ROLES = ("logs", "tests", "debug", "rea")
 
 
@@ -42,14 +42,8 @@ def _self_command(*args: str) -> str:
     ``tmux run-shell -b`` inherit the *server's* environment, not the pane's,
     so an inherited HERMES_HOME would silently point at the wrong profile.
     """
-    from .state import hermes_home
     root = _repo_root()
-    env = {
-        "HERMES_HOME": str(hermes_home()),
-        "HERMES_TMUX": "1" if gate.enabled() else "0",
-        "HX_PYTHON": _python(),
-        "PYTHONPATH": str(root),
-    }
+    env = pane_env()
     prefix = " ".join("%s=%s" % (k, shlex.quote(v)) for k, v in env.items())
     return "cd %s && exec env %s %s -m hermes_tmux %s" % (
         shlex.quote(str(root)), prefix,
@@ -90,6 +84,29 @@ def _lock_holder(key: str) -> Optional[int]:
         if line.isdigit():
             return int(line)
     return None
+
+
+def _lock_held(key: str) -> bool:
+    """True when some process holds this session's coordinator lock right now.
+
+    The probe takes the lock for an instant. A coordinator that starts inside
+    that instant sees the lock taken and exits; the cost is a missed start that
+    the next `up` repairs, never two coordinators.
+    """
+    import fcntl
+    path = watch.lock_path(key)
+    if not path.exists():
+        return False
+    try:
+        with open(path, "a+") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (OSError, IOError):
+                return True
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        return False
+    return False
 
 
 def _pid_is_watcher(pid: int, key: str = "") -> bool:
@@ -147,7 +164,15 @@ def _start_watcher(key: str) -> bool:
     """
     if _watcher_alive(key):
         return True
-    return tmuxio.run_shell_background(_self_command("watch", "--key", key))
+    # tmux shows the output of a `run-shell` job, and a line about any job that
+    # ends non-zero or on a signal, in the ACTIVE pane in view mode: that is
+    # the reader's own pane. So the coordinator's output goes to a log, and the
+    # wrapper shell (no `exec`) always ends 0. Nothing this process does, crash
+    # included, may write into a pane we do not own.
+    log = watch.session_dir(key) / "watch.log"
+    command = _self_command("watch", "--key", key).replace("&& exec env ", "&& env ", 1)
+    return tmuxio.run_shell_background(
+        "%s >>%s 2>&1; true" % (command, shlex.quote(str(log))))
 
 
 # --------------------------------------------------------------------------- up
@@ -203,8 +228,10 @@ def cmd_up(args) -> int:
     # user may have split a shell there.
     follow_cmd = _self_command("follow", "--key", key)
     overview = ""
+    recorded = layout.get("overview_pane") or ""
     for pane in panes:
-        if pane["ours"] and "python" in (pane["command"] or "").lower():
+        if pane["ours"] and "python" in (pane["command"] or "").lower() \
+                and (not recorded or pane["pane_id"] == recorded or created):
             overview = pane["pane_id"]
             break
 
@@ -217,8 +244,7 @@ def cmd_up(args) -> int:
 
     if not overview:
         # The overview was lost. Build a replacement; never repurpose a pane that
-        # survived with someone else's work in it (a user shell, or a tail pane
-        # already bound to a worker key in the layout).
+        # survived with someone else's work in it.
         overview = tmuxio.split_window(window_id, follow_cmd,
                                        horizontal=False, env=_pane_env()) or ""
         if not overview:
@@ -226,24 +252,20 @@ def cmd_up(args) -> int:
             return 1
         tmuxio.mark_pane(overview)
         print("hermes-tmux: rebuilt the overview pane (%s)" % overview)
-    layout["overview_pane"] = overview
 
-    # The overview window is overview-only in this layout. Version 1 kept worker
-    # tail panes here; retire ours so the window holds exactly the overview.
-    # Never touches a pane the user split into the window.
-    watch.trim_overview_window(dict(layout, workers_window=window_id,
-                                    overview_pane=overview))
-
-    # Pane borders carry worker identity: id, task, model.
-    tmuxio.window_option(window_id, "pane-border-status", "top")
-    tmuxio.window_option(window_id, "pane-border-format",
-                         " #{pane_title} ")
+    # Window-scoped presentation only: the state badge in this window's tab,
+    # and no border line above a pane that already has its own heading.
+    from . import labels
+    watch.decorate_window(window_id, header=False, ascii_mode=labels.ascii_only())
 
     def _apply(current):
         current["session_id"] = session_id
         current["session_name"] = session_name
         current["workers_window"] = window_id
         current["overview_pane"] = overview
+        # Work that finished before this moment is history, not a tab.
+        current.setdefault("created", time.time())
+        current["ascii"] = labels.ascii_only()
         return current
     layout = watch.update_layout(key, _apply)
     _start_watcher(key)
@@ -273,50 +295,36 @@ def cmd_down(args) -> int:
         while time.time() < deadline and _watcher_alive(key):
             time.sleep(0.02)
     closed_panes = 0
-    before_windows = {win["window_id"] for win in
-                      tmuxio.list_windows(tmuxio.current_session_id() or "")}
-    # Close our panes first, one by one. A window that also holds a user pane is
-    # not closed as a whole (that would kill their shell with it), but our own
-    # panes in it still go.
-    targets: List[str] = []
     session = tmuxio.current_session_id() or ""
-    for name in [WORKERS_WINDOW] + ["hx:" + r for r in AUX_ROLES]:
-        win = tmuxio.find_window_by_name(session, name)
-        if win:
-            targets.append(win["window_id"])
-    # Worker windows are recorded by slot, but a layout that lost an entry still
-    # has a name: close those too, only when the marker says they are ours.
-    targets.extend(tmuxio.windows_by_prefix(session, watch.WORKER_WINDOW_PREFIX))
-    for window_id in [layout.get("workers_window")] \
-            + list((layout.get("worker_windows") or {}).values()) \
-            + list((layout.get("aux") or {}).values()):
-        if window_id and tmuxio.window_exists(window_id):
-            targets.append(window_id)
+    before_windows = {win["window_id"] for win in tmuxio.list_windows(session)}
+    # Every window we created carries our marker; a window's name is the task
+    # it shows, so names are not an address. The marker only nominates a
+    # window: inside it, each pane is closed on its OWN proof of ownership, one
+    # at a time, so a shell the user split into one of our windows survives and
+    # keeps its window.
+    targets: List[str] = [win["window_id"] for win in tmuxio.list_windows(session)
+                          if win["ours"]]
+    # Recorded ids are nominated too, for a window whose marker was lost. They
+    # only nominate: a stale id that now names a user window has no pane that
+    # passes the per-pane proof, so nothing in it is closed.
+    recorded = [layout.get("workers_window")] + list((layout.get("aux") or {}).values()) \
+        + [tab.get("window") for tab in (layout.get("tabs") or {}).values()
+           if isinstance(tab, dict)]
+    targets += [wid for wid in recorded if wid and tmuxio.window_exists(wid)]
     for window_id in dict.fromkeys(targets):
-        # Remove only panes proven to be ours, one at a time.
         for pane in tmuxio.list_panes(window_id):
             if tmuxio.close_pane(pane["pane_id"])[0]:
                 closed_panes += 1
-
-    for name in [WORKERS_WINDOW] + ["hx:" + r for r in AUX_ROLES]:
-        win = tmuxio.find_window_by_name(session, name)
-        if not win:
-            continue
-        # A window that still holds any pane we did not create is left standing:
-        # closing it would take the user's shell with it. Our panes are already
-        # gone, so what remains is theirs.
-        if tmuxio.foreign_panes(win["window_id"]):
+        if tmuxio.window_exists(window_id) and tmuxio.foreign_panes(window_id):
             print("hermes-tmux: leaving %s in place; it holds a pane we do not own"
-                  % win["name"])
-            continue
-        tmuxio.close_window(win["window_id"])
-    # Also close by recorded id: a window may have been renamed since, and the
-    # id is the address that survives renumbering.
-    for window_id in [layout.get("workers_window")] \
-            + list((layout.get("worker_windows") or {}).values()) \
-            + list((layout.get("aux") or {}).values()):
-        if window_id:
-            tmuxio.close_window(window_id)
+                  % (tmuxio.format_of(window_id, "#{window_name}") or window_id))
+    if _lock_held(key):
+        # The coordinator could not be identified or did not stop (no `lsof`,
+        # a timeout). Removing its state directory now would let a second
+        # coordinator take a fresh lock beside it.
+        print("hermes-tmux: a coordinator still holds this session's lock; "
+              "state kept in %s" % watch.session_dir(key))
+        return 1
     # This session's state directory belongs to a workspace that no longer
     # exists. Removing it here is what keeps `sessions/` from growing one dead
     # directory per server restart (the key includes the server pid).
@@ -354,7 +362,18 @@ def cmd_status(args) -> int:
                           "live_root": str(live_root()),
                           "workers": rows}, indent=2))
         return 0
-    text = render_mod.render(workers, live_root=str(live_root()))
+    from . import labels
+    from .transcript import colour_enabled
+    layout = watch.read_layout(tmuxio.session_key()) if tmuxio.in_tmux() else {}
+    try:
+        width = os.get_terminal_size(sys.stdout.fileno()).columns
+    except (OSError, ValueError, AttributeError):
+        width = 110
+    text = render_mod.render(
+        workers, width=width, live_root=str(live_root()), colour=colour_enabled(),
+        tabs=watch.tab_indexes(layout), seen=watch.seen_keys(layout),
+        since=layout.get("created"), ascii_mode=labels.ascii_only(),
+        recent_rows=len(workers) if getattr(args, "all", False) else render_mod.RECENT_ROWS)
     print(text)
     if not gate.enabled():
         print()
@@ -531,42 +550,106 @@ def cmd_run(args) -> int:
         return 127
 
 
+def _tabs_in_order(layout: Dict) -> List[Tuple[str, Dict]]:
+    """Worker tabs as the status line shows them: by window index."""
+    indexes = watch.tab_indexes(layout)
+
+    def _index(item) -> int:
+        text = str(indexes.get(item[0], ""))
+        return int(text) if text.isdigit() else 10 ** 6
+
+    tabs = [(k, v) for k, v in (layout.get("tabs") or {}).items() if isinstance(v, dict)]
+    return sorted(tabs, key=_index)
+
+
 def cmd_worker(args) -> int:
     if not tmuxio.in_tmux():
         print("hermes-tmux: not inside tmux.")
         return 0
     key = tmuxio.session_key()
-    layout = watch.read_layout(key)
-
-    def _order(pane_id: str) -> int:
-        digits = pane_id.lstrip("%")
-        return int(digits) if digits.isdigit() else 0
-
-    assign = layout.get("worker_assign") or {}
-    tail_panes = layout.get("tail_panes") or {}
-
-    def _slot(pane_id: str) -> int:
-        slot = assign.get(tail_panes.get(pane_id, ""), "")
-        text = str(slot).lstrip("0")
-        return int(text) if text.isdigit() else 0
-
-    # Worker order is the layout's own: window slot first, then pane order, so
-    # "worker 2" names the same transcript across a detach or a lifecycle change.
-    panes = sorted(tail_panes.keys(), key=lambda pane_id: (_slot(pane_id), _order(pane_id)))
+    tabs = _tabs_in_order(watch.read_layout(key))
     idx = args.index
-    if idx < 1 or idx > len(panes):
-        print("hermes-tmux: no worker pane %d (have %d)" % (idx, len(panes)))
+    if idx < 1 or idx > len(tabs):
+        print("hermes-tmux: no worker tab %d (have %d)" % (idx, len(tabs)))
         return 1
-    pane_id = panes[idx - 1]
-    # A worker lives in its own window now. `select-pane` alone does not switch
-    # the session's current window when the target is elsewhere, so focus is two
-    # explicit steps: the window, then the pane inside it.
-    window_id = tmuxio.format_of(pane_id, "#{window_id}")
-    if window_id:
-        tmuxio.select_window(window_id)
-    tmuxio.select_pane(pane_id)
-    print("hermes-tmux: focused worker pane %d (%s)" % (idx, pane_id))
+    wkey, tab = tabs[idx - 1]
+    # `select-pane` alone does not switch the session's current window, so
+    # focus is two explicit steps: the window, then the pane inside it.
+    tmuxio.select_window(tab.get("window") or "")
+    tmuxio.select_pane(tab.get("pane") or "")
+    print("hermes-tmux: focused worker tab %d (%s)" % (idx, wkey))
     return 0
+
+
+def cmd_open(args) -> int:
+    """Open (or focus) the transcript tab of any worker, finished ones included.
+
+    A tab opened this way is the reader's: it stays until they close it.
+    """
+    if not gate.enabled():
+        print("hermes-tmux: %s" % gate.disabled_reason())
+        return 0
+    if not tmuxio.in_tmux():
+        print("hermes-tmux: not inside tmux.")
+        return 0
+    from . import labels
+    from .state import load_workers
+    ref = args.ref.replace("deleg_", "")
+    matches = [w for w in load_workers()
+               if ref in ("%s#%s" % (w.delegation_id[-8:], w.task_index))
+               or ref == w.delegation_id[-8:]]
+    if not matches:
+        print("hermes-tmux: no worker matches %r (ids are in `hermes-tmux status`)" % args.ref)
+        return 1
+    if len({w.key for w in matches}) > 1 and "#" not in ref:
+        matches = [w for w in matches if w.task_index == 0] or matches[:1]
+    worker = matches[0]
+    key = tmuxio.session_key()
+    _ensure_state_dir(key)
+    layout = watch.read_layout(key)
+    tab = (layout.get("tabs") or {}).get(worker.key)
+    if isinstance(tab, dict) and tmuxio.pane_exists(tab.get("pane") or ""):
+        tmuxio.select_window(tab.get("window") or "")
+        print("hermes-tmux: focused %s" % worker.key)
+        return 0
+    if not worker.log_path:
+        print("hermes-tmux: %s has no transcript on disk" % worker.key)
+        return 1
+    session_id = tmuxio.current_session_id() or ""
+    ascii_mode = labels.ascii_only()
+    window_id = tmuxio.new_window(
+        session_id,
+        tmuxio.free_window_name(session_id, labels.tab_label(
+            worker.goal, [w.goal for w in load_workers()
+                          if w.delegation_id == worker.delegation_id and w.key != worker.key],
+            ascii_mode=ascii_mode)),
+        cwd=str(Path.home()), command=watch.tail_command(worker.log_path), env=_pane_env())
+    panes = tmuxio.wait_for_panes(window_id) if window_id else []
+    if not panes:
+        print("hermes-tmux: could not open a tab for %s" % worker.key)
+        return 1
+    watch.decorate_window(window_id, ascii_mode=ascii_mode)
+    kind = watch._kind(worker)
+    record = {"window": window_id, "pane": panes[0]["pane_id"], "opened": time.time(),
+              "pinned": True, "seen": time.time(),
+              "glyph": watch.tab_glyph(kind, ascii_mode),
+              "head": watch.pane_header(worker, kind, ascii_mode)}
+    tmuxio.window_option(window_id, "@hx_glyph", record["glyph"])
+    tmuxio.pane_option(record["pane"], "@hx_head", record["head"])
+
+    def _apply(current):
+        current.setdefault("tabs", {})[worker.key] = record
+        (current.get("dismissed") or {}).pop(worker.key, None)
+        return current
+    watch.update_layout(key, _apply)
+    tmuxio.select_window(window_id)
+    print("hermes-tmux: opened %s" % worker.key)
+    return 0
+
+
+def cmd_tail(args) -> int:
+    from .transcript import run_tail
+    return run_tail(args.log, follow=not args.no_follow)
 
 
 # --------------------------------------------------------------------------- review
@@ -790,6 +873,8 @@ def build_parser() -> argparse.ArgumentParser:
                    ).set_defaults(func=cmd_down)
     status = sub.add_parser("status", help="print the subagent overview (works outside tmux)")
     status.add_argument("--json", action="store_true")
+    status.add_argument("--all", action="store_true",
+                        help="list every recorded worker, not only the recent ones")
     status.set_defaults(func=cmd_status)
     sub.add_parser("rerender", help="force one render of the overview"
                    ).set_defaults(func=cmd_rerender)
@@ -817,9 +902,16 @@ def build_parser() -> argparse.ArgumentParser:
     runp.add_argument("--hermes", default="")
     runp.set_defaults(func=cmd_run)
 
-    worker = sub.add_parser("worker", help="focus the Nth visible worker pane")
+    worker = sub.add_parser("worker", help="focus the Nth worker tab")
     worker.add_argument("index", type=int)
     worker.set_defaults(func=cmd_worker)
+    openp = sub.add_parser("open", help="open the transcript tab of any worker by id")
+    openp.add_argument("ref", help="delegation id or id#task, as shown by `status`")
+    openp.set_defaults(func=cmd_open)
+    tailp = sub.add_parser("tail", help="print a transcript readably and follow it")
+    tailp.add_argument("log")
+    tailp.add_argument("--no-follow", action="store_true")
+    tailp.set_defaults(func=cmd_tail)
 
     review = sub.add_parser("review", help="record or run an independent review")
     review.add_argument("action", choices=["record", "run", "list"])

@@ -1,274 +1,498 @@
-"""Unit tests for hermes_tmux.render — pure, deterministic fixed-width block."""
+"""Unit tests for hermes_tmux.render — the pure, deterministic agents overview.
+
+No tmux, no state module: workers are ``types.SimpleNamespace`` stubs carrying
+exactly the attributes render.py documents. ``now`` is always passed
+explicitly so nothing here depends on the wall clock.
+"""
 
 from __future__ import annotations
 
+import re
 import unittest
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
-from hermes_tmux.render import LEGEND, render, render_empty
+from hermes_tmux import render as render_mod
+from hermes_tmux.render import ATTENTION_TTL_S, STALL_AFTER_S, classify, render, render_empty, summary
 
 NOW = datetime(2026, 11, 12, 12, 0, 0)
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
-class Worker(object):
-    """Tiny local stub; render() must not import hermes_tmux.state."""
-
-    def __init__(self, **overrides):
-        self.delegation_id = "deleg_6cfc92ad"
-        self.task_index = 0
-        self.key = "6cfc92ad#0"
-        self.role = "executor"
-        self.model = "deepseek/deepseek-v4.1-flash-1017"
-        self.goal = "Implement the renderer and unit tests."
-        self.state = "running"
-        self.exit_reason = None
-        self.phase = "tool"
-        self.tool_count = 3
-        self.last_tool = "read_file"
-        self.last_error = None
-        self.summary = None
-        self.started = "2026-11-12 11:59:18"
-        self.duration_s = None
-        self.review = {}
-        self.delegation_started = "2026-11-12 11:59:00"
-        for key, value in overrides.items():
-            setattr(self, key, value)
+def visible(text):
+    """The characters a pane shows: SGR sequences removed."""
+    return ANSI_RE.sub("", text)
 
 
-def rows_of(text):
-    """Rows live between the header line and the closing rule/summary block."""
-    return text.split("\n")[3:-4]
+def stamp(dt):
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def worker(**overrides):
+    """A consistent stub: attributes as render.py documents them."""
+    fields = dict(
+        key="deleg_6cfc92ad#0",
+        delegation_id="deleg_6cfc92ad",
+        task_index=0,
+        goal="Implement the renderer and unit tests.",
+        role="executor",
+        model="deepseek/deepseek-v4.1-flash-1017",
+        state="running",
+        exit_reason=None,
+        started=stamp(NOW - timedelta(seconds=42)),
+        last_event=stamp(NOW - timedelta(seconds=30)),
+        duration_s=None,
+        tool_count=3,
+        last_tool="read_file",
+        last_call=None,
+        last_message=None,
+        last_error=None,
+        error_pending=None,
+        summary=None,
+        review={},
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def running(**kw):
+    return worker(**kw)
+
+
+def failed(**kw):
+    base = dict(key="deleg_aaaabbbb#1", delegation_id="deleg_aaaabbbb", task_index=1,
+                state="failed", exit_reason="max_iterations", goal="Fix the flaky test.",
+                started=stamp(NOW - timedelta(minutes=10)),
+                last_event=stamp(NOW - timedelta(minutes=8)), duration_s=120,
+                last_message="I could not finish: permissions.")
+    base.update(kw)
+    return worker(**base)
+
+
+def done(**kw):
+    base = dict(key="deleg_ccccdddd#2", delegation_id="deleg_ccccdddd", task_index=2,
+                state="done", exit_reason="completed", goal="Write the state reader tests.",
+                started=stamp(NOW - timedelta(hours=1)),
+                last_event=stamp(NOW - timedelta(minutes=55)), duration_s=300,
+                summary="All eight tests pass.")
+    base.update(kw)
+    return worker(**base)
+
+
+def stalled(**kw):
+    base = dict(key="deleg_eeeeffff#3", delegation_id="deleg_eeeeffff", task_index=3,
+                goal="Wait for the build to finish.",
+                started=stamp(NOW - timedelta(minutes=20)),
+                last_event=stamp(NOW - timedelta(minutes=19)))
+    base.update(kw)
+    return worker(**base)
+
+
+def lines_of(text):
+    return text.split("\n")
+
+
+# --------------------------------------------------------------------------- #
+# classify()
+# --------------------------------------------------------------------------- #
+
+
+class TestClassify(unittest.TestCase):
+    def test_running_worker_is_running(self):
+        groups = classify([running()], now=NOW)
+        self.assertEqual([w.key for w in groups["running"]], [running().key])
+        self.assertEqual(groups["attention"], [])
+        self.assertEqual(groups["recent"], [])
+
+    def test_stalled_worker_stays_under_running(self):
+        groups = classify([stalled()], now=NOW)
+        self.assertEqual(len(groups["running"]), 1)
+        self.assertEqual(groups["attention"], [])
+
+    def test_fresh_failure_is_attention(self):
+        groups = classify([failed()], now=NOW)
+        self.assertEqual([w.key for w in groups["attention"]], [failed().key])
+        self.assertEqual(groups["recent"], [])
+
+    def test_failure_states_that_mean_failed_are_attention(self):
+        for state in ("error", "failed", "interrupted"):
+            groups = classify([failed(state=state, key="k-" + state)], now=NOW)
+            self.assertEqual(len(groups["attention"]), 1, state)
+
+    def test_seen_failure_is_recent(self):
+        w = failed()
+        groups = classify([w], now=NOW, seen={w.key})
+        self.assertEqual(groups["attention"], [])
+        self.assertEqual([x.key for x in groups["recent"]], [w.key])
+
+    def test_failure_older_than_attention_ttl_is_recent(self):
+        old = failed(started=stamp(NOW - timedelta(hours=9)),
+                     last_event=stamp(NOW - timedelta(hours=8)))
+        groups = classify([old], now=NOW)
+        self.assertEqual(groups["attention"], [])
+        self.assertEqual(len(groups["recent"]), 1)
+
+    def test_failure_exactly_at_attention_ttl_is_still_attention(self):
+        edge = failed(started=stamp(NOW - timedelta(hours=9)),
+                      last_event=stamp(NOW - timedelta(seconds=ATTENTION_TTL_S)))
+        groups = classify([edge], now=NOW)
+        self.assertEqual(len(groups["attention"]), 1)
+
+    def test_failure_one_second_past_ttl_is_recent(self):
+        edge = failed(started=stamp(NOW - timedelta(hours=9)),
+                      last_event=stamp(NOW - timedelta(seconds=ATTENTION_TTL_S + 1)))
+        groups = classify([edge], now=NOW)
+        self.assertEqual(groups["attention"], [])
+
+    def test_failure_that_ended_before_since_is_recent(self):
+        w = failed(started=stamp(NOW - timedelta(hours=2)),
+                   last_event=stamp(NOW - timedelta(hours=1)))
+        since = (NOW - timedelta(minutes=30)).timestamp()
+        groups = classify([w], now=NOW, since=since)
+        self.assertEqual(groups["attention"], [])
+        self.assertEqual(len(groups["recent"]), 1)
+
+    def test_failure_that_ended_after_since_is_attention(self):
+        w = failed(started=stamp(NOW - timedelta(minutes=20)),
+                   last_event=stamp(NOW - timedelta(minutes=10)))
+        since = (NOW - timedelta(minutes=30)).timestamp()
+        groups = classify([w], now=NOW, since=since)
+        self.assertEqual(len(groups["attention"]), 1)
+
+    def test_unparsable_since_is_ignored(self):
+        groups = classify([failed()], now=NOW, since="not-a-number")
+        self.assertEqual(len(groups["attention"]), 1)
+
+    def test_done_worker_is_recent(self):
+        groups = classify([done()], now=NOW)
+        self.assertEqual(groups["recent"], [done()])
+        self.assertEqual(groups["running"], [])
+
+    def test_none_entries_are_skipped(self):
+        groups = classify([None], now=NOW)
+        self.assertEqual(groups, {"running": [], "attention": [], "recent": []})
+
+    def test_running_sorted_oldest_first(self):
+        newer = running(key="new", started=stamp(NOW - timedelta(minutes=1)),
+                        last_event=stamp(NOW))
+        older = running(key="old", started=stamp(NOW - timedelta(minutes=30)),
+                        last_event=stamp(NOW))
+        groups = classify([newer, older], now=NOW)
+        self.assertEqual([w.key for w in groups["running"]], ["old", "new"])
+
+    def test_attention_and_recent_newest_first(self):
+        older = failed(key="old", started=stamp(NOW - timedelta(hours=2)),
+                       last_event=stamp(NOW - timedelta(minutes=40)))
+        newer = failed(key="new", started=stamp(NOW - timedelta(minutes=20)),
+                       last_event=stamp(NOW - timedelta(minutes=5)))
+        groups = classify([older, newer], now=NOW)
+        self.assertEqual([w.key for w in groups["attention"]], ["new", "old"])
+
+
+class TestSummary(unittest.TestCase):
+    def test_empty(self):
+        self.assertEqual(summary({"running": [], "attention": [], "recent": []}, NOW),
+                         {"running": 0, "stalled": 0, "attention": 0})
+
+    def test_running_count_excludes_stalled(self):
+        groups = {"running": [running(), stalled()], "attention": [], "recent": []}
+        counts = summary(groups, NOW)
+        self.assertEqual(counts["running"], 1)
+        self.assertEqual(counts["stalled"], 1)
+
+    def test_stalled_is_counted_as_attention(self):
+        groups = {"running": [stalled()], "attention": [failed()], "recent": [done()]}
+        counts = summary(groups, NOW)
+        self.assertEqual(counts["attention"], 2)
+        self.assertEqual(counts["recent"] if "recent" in counts else 0, 0)
+
+
+# --------------------------------------------------------------------------- #
+# geometry: width, whitespace, colour, ascii, height
+# --------------------------------------------------------------------------- #
+
+
+def crowded_workers():
+    return [
+        running(key="k0", goal="A very long goal " * 8),
+        failed(last_error='{"output": "", "error": "permission denied"}',
+               last_message="*could not* finish `the thing`"),
+        done(),
+        stalled(),
+        worker(key="k4", state="done", goal="x" * 300, model=None,
+               started=stamp(NOW - timedelta(hours=3)),
+               last_event=stamp(NOW - timedelta(hours=3)), exit_reason="timeout",
+               duration_s=60),
+        worker(key="k5", delegation_id="x" * 200, task_index=99,
+               goal="\t\n\x01wild\x7f goal   with\tcontrol\nchars", model="/" * 20,
+               last_tool="t" * 100, last_error="e" * 1000, state="some-unknown-state",
+               started="not-a-date"),
+    ]
+
+
+TABS = {"k0": 3, "k1": 4, "k2": 5, "k4": 12}
+
+
+class TestGeometry(unittest.TestCase):
+    def assert_fits(self, text, width, label=""):
+        for line in lines_of(visible(text)):
+            self.assertLessEqual(len(line), width,
+                                 "%s line %d columns in %d: %r" % (label, len(line), width, line))
+            self.assertEqual(line, line.rstrip(), "%s trailing whitespace: %r" % (label, line))
+
+    def test_every_line_fits_at_each_width(self):
+        for width in (187, 118, 93, 61, 40):
+            out = render(crowded_workers(), now=NOW, width=width,
+                         session_label="hx:workers", tabs=TABS, colour=True)
+            self.assert_fits(out, width, "width=%d" % width)
+
+    def test_width_fits_without_colour(self):
+        for width in (187, 118, 93, 61, 40):
+            out = render(crowded_workers(), now=NOW, width=width, tabs=TABS)
+            self.assert_fits(out, width, "plain width=%d" % width)
+
+    def test_empty_block_fits(self):
+        for width in (187, 118, 93, 61, 40):
+            self.assert_fits(render_empty(width=width, live_root="/a/very/long/live/root/path"),
+                             width, "empty width=%d" % width)
+            self.assert_fits(render_empty(width=width, live_root="x", note="reader failed"),
+                             width, "note width=%d" % width)
+
+    def test_colour_output_is_the_plain_text_with_sgr(self):
+        for width in (187, 118, 61):
+            coloured = render(crowded_workers(), now=NOW, width=width, tabs=TABS, colour=True)
+            plain = render(crowded_workers(), now=NOW, width=width, tabs=TABS, colour=False)
+            self.assertIn("\x1b", coloured)
+            self.assertEqual(visible(coloured), plain)
+
+    def test_colour_off_has_no_escape_byte(self):
+        out = render(crowded_workers(), now=NOW, width=110, colour=False)
+        self.assertNotIn("\x1b", out)
+
+    def test_ascii_mode_is_pure_ascii(self):
+        for width in (187, 118, 93, 61, 40):
+            out = render(crowded_workers(), now=NOW, width=width, ascii_mode=True)
+            for line in lines_of(out):
+                for ch in line:
+                    self.assertLess(ord(ch), 128, "non-ascii %r in %r" % (ch, line))
+            self.assertNotIn("\u2026", out)
+
+    def test_height_bounds_the_block(self):
+        workers = [running(key="r%d" % i, delegation_id="deleg_r%07d" % i,
+                           goal="running %d" % i, started=stamp(NOW - timedelta(minutes=20 - i)))
+                   for i in range(2)]
+        workers += [done(key="d%d" % i, delegation_id="deleg_d%07d" % i, task_index=i,
+                         goal="done %d" % i) for i in range(6)]
+        for height in (4, 6, 8, 10, 12, 16, 20, 30):
+            out = render(workers, now=NOW, width=100, height=height)
+            self.assertLessEqual(len(lines_of(out)), height, "height=%d" % height)
+
+    def test_height_never_drops_live_rows_for_history(self):
+        workers = [running(key="r%d" % i, delegation_id="deleg_r%07d" % i,
+                           goal="running %d" % i, started=stamp(NOW - timedelta(minutes=20 - i)))
+                   for i in range(2)]
+        workers += [done(key="d%d" % i, delegation_id="deleg_d%07d" % i, task_index=i,
+                         goal="done %d" % i) for i in range(6)]
+        for height in (8, 10, 12, 16):
+            out = render(workers, now=NOW, width=100, height=height)
+            self.assertIn("running 0", out, "height=%d" % height)
+            self.assertIn("running 1", out, "height=%d" % height)
+            self.assertIn("RUNNING", out, "height=%d" % height)
+
+    def test_height_with_only_history_keeps_the_bound(self):
+        workers = [done(key="d%d" % i, delegation_id="deleg_d%07d" % i, goal="done %d" % i)
+                   for i in range(6)]
+        for height in (1, 2, 3, 5, 9):
+            self.assertLessEqual(len(lines_of(render(workers, now=NOW, width=90, height=height))),
+                                 height)
+
+    def test_output_is_deterministic(self):
+        first = render(crowded_workers(), now=NOW, width=100, tabs=TABS, session_label="hx")
+        second = render(crowded_workers(), now=NOW, width=100, tabs=TABS, session_label="hx")
+        self.assertEqual(first, second)
+
+    def test_workers_without_timestamps_still_render(self):
+        w = worker(started=None, last_event=None, state="done", duration_s=None)
+        out = render([w], now=NOW, width=90)
+        self.assertIn("RECENT", out)
+        self.assertIn("?", out)
+
+
+# --------------------------------------------------------------------------- #
+# sections and rows
+# --------------------------------------------------------------------------- #
+
+
+class TestSections(unittest.TestCase):
+    def test_running_section_shows_task_and_meta(self):
+        out = render([running()], now=NOW, width=110)
+        self.assertIn("RUNNING", out)
+        self.assertIn("Implement the renderer and unit tests", out)
+        self.assertIn("42s", out)
+        self.assertIn("deepseek-v4.1-flash", out)
+        self.assertIn("3 tools", out)
+        self.assertNotIn("NEEDS ATTENTION", out)
+        self.assertNotIn("RECENT", out)
+
+    def test_nothing_running_line(self):
+        out = render([done()], now=NOW, width=110)
+        self.assertIn("Nothing running.", out)
+        self.assertNotIn("RUNNING", out)
+        self.assertIn("RECENT", out)
+
+    def test_attention_section_only_when_present(self):
+        self.assertNotIn("NEEDS ATTENTION", render([running(), done()], now=NOW, width=110))
+        self.assertIn("NEEDS ATTENTION", render([running(), failed()], now=NOW, width=110))
+
+    def test_recent_section_absent_when_no_history(self):
+        self.assertNotIn("RECENT", render([running(), failed()], now=NOW, width=110))
+
+    def test_attention_row_states_how_the_run_ended(self):
+        out = render([failed()], now=NOW, width=110)
+        self.assertIn("run ended: max_iterations", out)
+
+    def test_attention_row_quotes_last_report(self):
+        out = render([failed(last_message="I could not finish: permissions.")], now=NOW, width=110)
+        self.assertIn("last report: I could not finish: permissions.", out)
+
+    def test_attention_row_shows_error_message_not_json(self):
+        out = render([failed(last_error='{"output": "", "error": "permission denied"}')],
+                     now=NOW, width=110)
+        self.assertIn("permission denied", out)
+        self.assertNotIn('"error"', out)
+
+    def test_running_row_shows_tab_when_mapped(self):
+        out = render([running(), done()], now=NOW, width=110, tabs={"deleg_6cfc92ad#0": 3,
+                                                                  "deleg_ccccdddd#2": 4})
+        self.assertIn("tab 3", out)
+        self.assertIn("tab 4", out)
+
+    def test_no_tab_label_without_mapping(self):
+        out = render([running(), done()], now=NOW, width=110)
+        self.assertNotIn("tab ", out)
+
+    def test_recent_row_shows_summary_and_age(self):
+        out = render([done()], now=NOW, width=110)
+        self.assertIn("Write the state reader tests", out)
+        self.assertIn("All eight tests pass.", out)
+        self.assertIn("55m ago", out)
+
+    def test_stalled_row_says_nothing_came_out(self):
+        out = render([stalled()], now=NOW, width=110)
+        self.assertIn("no output for", out)
+
+    def test_unknown_state_is_not_invented_as_a_known_badge(self):
+        w = worker(key="odd", state="some-unknown-state", last_event=None, started=None)
+        out = render([w], now=NOW, width=110)
+        # It is not a failure and not running: it lands in history, with no
+        # FAILED/RUNNING claim this module cannot support.
+        self.assertIn("RECENT", out)
+        self.assertNotIn("FAILED", out)
+        self.assertNotIn("RUNNING", out)
+        self.assertEqual(render_mod._state_label(w, NOW)[:5], "some-")
+
+    def test_review_note_only_for_recorded_review(self):
+        recorded = done(key="rev-manual", review={"status": "recorded"})
+        self.assertIn("review: recorded (manual)", render([recorded], now=NOW, width=110))
+
+        modelled = done(key="rev-model",
+                        review={"status": "recorded", "reviewer_model": "z-ai/glm-5.3-flash"})
+        self.assertIn("review: recorded (glm-5.3-flash)", render([modelled], now=NOW, width=110))
+
+        for review in ({}, {"status": "failed"}, {"status": "unreviewed"}, None):
+            out = render([done(key="rev-none", review=review)], now=NOW, width=110)
+            self.assertNotIn("review:", out, repr(review))
+
+    def test_review_note_not_claimed_when_unreviewed(self):
+        out = render([running(review={})], now=NOW, width=110)
+        self.assertNotIn("recorded", out)
+
+    def test_goal_whitespace_is_collapsed(self):
+        w = running(goal="Fix\tstate\nreader   and\ttests")
+        out = render([w], now=NOW, width=110)
+        self.assertIn("Fix state reader and tests", out)
+        self.assertNotIn("\t", out)
+
+    def test_object_with_no_attributes_does_not_raise(self):
+        out = render([SimpleNamespace()], now=NOW, width=90)
+        self.assertIn("HERMES AGENTS", out)
+
+
+# --------------------------------------------------------------------------- #
+# empty state, note, and the reader-failure path
+# --------------------------------------------------------------------------- #
 
 
 class TestEmpty(unittest.TestCase):
-    def test_empty_explains_and_shows_root(self):
+    def test_default_empty_explains_and_shows_root(self):
         out = render_empty(width=110, live_root="/tmp/hermes/live")
-        self.assertIn("no delegations found", out)
+        self.assertIn("No delegations yet.", out)
         self.assertIn("/tmp/hermes/live", out)
-        self.assertIn(LEGEND, out)
 
-    def test_render_with_no_workers_delegates_to_empty(self):
-        out = render([], width=110, live_root="/tmp/hermes/live")
-        self.assertIn("no delegations found", out)
-        self.assertIn(LEGEND, out)
+    def test_empty_root_unknown(self):
+        self.assertIn("(unknown)", render_empty(width=90))
 
-    def test_empty_unknown_root_does_not_raise(self):
-        out = render_empty(width=80)
-        self.assertIn("(unknown)", out)
+    def test_render_without_workers_shows_empty(self):
+        self.assertIn("No delegations yet.", render([], width=110, live_root="/tmp/live"))
 
+    def test_note_is_a_reader_failure_not_an_empty_workspace(self):
+        out = render_empty(width=110, live_root="/tmp/live", note="reader exploded")
+        self.assertIn("reader exploded", out)
+        self.assertIn("reader failure, not an empty workspace", out)
+        self.assertNotIn("No delegations yet.", out)
 
-class TestSingleRunningWorker(unittest.TestCase):
-    def test_title_counts_and_row(self):
-        out = render([Worker()], now=NOW)
-        lines = out.split("\n")
-        self.assertTrue(lines[0].startswith("hermes subagents"))
-        self.assertIn("1 running / 1 total", lines[0])
-        self.assertEqual(lines[1], "-" * 110)
-        self.assertIn("KEY", lines[2])
-        self.assertIn("GOAL", lines[2])
-        self.assertEqual(len(rows_of(out)), 1)
-        row = rows_of(out)[0]
-        self.assertIn("6cfc92ad#0", row)
-        self.assertIn("exec", row)
-        self.assertIn("run", row)
-        self.assertIn("42s", row)
+    def test_note_overrides_a_worker_list(self):
+        out = render([running()], now=NOW, width=110, note="reader exploded")
+        self.assertIn("reader failure, not an empty workspace", out)
+        self.assertNotIn("No delegations yet.", out)
+        self.assertNotIn("RUNNING", out)
 
-    def test_title_carries_session_label(self):
-        out = render([Worker()], now=NOW, session_label="hx:workers")
-        self.assertIn("hermes subagents - hx:workers", out.split("\n")[0])
-
-    def test_footer_counts_and_legend(self):
-        out = render([Worker()], now=NOW)
-        lines = out.split("\n")
-        self.assertIn("total 1", lines[-3])
-        self.assertIn("review: 0 recorded, 1 unreviewed", lines[-2])
-        self.assertTrue(lines[-1].endswith(LEGEND))
-        self.assertIn("legend: STATE from Hermes state", out)
+    def test_note_never_says_no_delegations_even_when_clipped(self):
+        for width in (40, 61, 110):
+            out = render([], width=width, note="boom")
+            self.assertNotIn("No delegations yet.", out, "width=%d" % width)
 
 
-class TestRoleDistinctness(unittest.TestCase):
-    def test_reviewer_row_differs_from_executor(self):
-        executor = Worker(task_index=0, role="executor")
-        reviewer = Worker(
-            task_index=1,
-            role="reviewer",
-            model="z-ai/glm-5.3-flash",
-            goal="Review task 0.",
-            review={"status": "recorded", "reviewer_model": "z-ai/glm-5.3-flash", "at": "2026-11-12 11:59:50"},
-        )
-        out = render([executor, reviewer], now=NOW)
-        rows = rows_of(out)
-        self.assertEqual(len(rows), 2)
-        exec_row = [r for r in rows if "#0" in r][0]
-        rev_row = [r for r in rows if "#1" in r][0]
-        self.assertNotEqual(exec_row, rev_row)
-        self.assertIn("exec", exec_row)
-        self.assertIn("*revw", rev_row)
-        self.assertIn("review: recorded", rev_row)
-        self.assertNotIn("review: recorded", exec_row)
-
-    def test_reviewer_marker_survives_narrow_width(self):
-        reviewer = Worker(role="reviewer", goal="Review.")
-        out = render([reviewer], width=48, now=NOW)
-        row = rows_of(out)[0]
-        self.assertIn("*rev", row)
+# --------------------------------------------------------------------------- #
+# _state_label
+# --------------------------------------------------------------------------- #
 
 
-class TestStallDerivation(unittest.TestCase):
-    def test_eleven_minutes_is_stall(self):
-        started = (NOW - timedelta(minutes=11)).strftime("%Y-%m-%d %H:%M:%S")
-        out = render([Worker(started=started, state="running")], now=NOW)
-        self.assertIn("stall", rows_of(out)[0])
-        self.assertIn("stall 1", out)
+class TestStateLabel(unittest.TestCase):
+    def label(self, **kw):
+        return render_mod._state_label(worker(**kw), NOW)
 
-    def test_nine_minutes_is_running(self):
-        started = (NOW - timedelta(minutes=9)).strftime("%Y-%m-%d %H:%M:%S")
-        out = render([Worker(started=started, state="running")], now=NOW)
-        row = rows_of(out)[0]
-        self.assertIn("run", row)
-        self.assertNotIn("stall", row)
+    def test_running_maps_to_run(self):
+        self.assertEqual(self.label(state="running"), "run")
+        self.assertEqual(self.label(state="active"), "run")
 
-    def test_finished_worker_never_goes_stall(self):
-        started = (NOW - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
-        out = render([Worker(started=started, state="done")], now=NOW)
-        self.assertIn("done", rows_of(out)[0])
-        self.assertNotIn("stall", out)
+    def test_stall_after_threshold(self):
+        edge = NOW - timedelta(seconds=STALL_AFTER_S + 1)
+        self.assertEqual(self.label(state="running", started=None, last_event=stamp(edge)), "stall")
 
-    def test_iso_timestamps_parse(self):
-        started = (NOW - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        out = render([Worker(started=started, state="running")], now=NOW)
-        self.assertIn("30m", rows_of(out)[0])
+    def test_not_stall_at_threshold(self):
+        edge = NOW - timedelta(seconds=STALL_AFTER_S)
+        self.assertEqual(self.label(state="running", started=None, last_event=stamp(edge)), "run")
 
+    def test_future_timestamp_is_clamped_not_stalled(self):
+        future = NOW + timedelta(hours=2)
+        self.assertEqual(self.label(state="running", started=None, last_event=stamp(future)), "run")
 
-class TestWidthGuarantee(unittest.TestCase):
-    def _assert_fits(self, text, width):
-        for line in text.split("\n"):
-            self.assertLessEqual(len(line), width, "line too long: %r" % line)
-            self.assertEqual(line, line.rstrip(), "trailing whitespace: %r" % line)
-            self.assertTrue(all(ord(ch) < 128 for ch in line), "non-ascii: %r" % line)
-            self.assertNotIn("\x1b", line)
+    def test_done_and_fail_mappings(self):
+        self.assertEqual(self.label(state="done", last_event=None, started=None), "done")
+        self.assertEqual(self.label(state="completed", last_event=None, started=None), "done")
+        for state in ("failed", "error", "interrupted", "crashed"):
+            self.assertEqual(self.label(state=state, last_event=None, started=None), "fail", state)
 
-    def _workers(self):
-        return [
-            Worker(delegation_id="deleg_aaaa1111", task_index=0, role="executor",
-                   goal="A very long goal " * 8, state="running"),
-            Worker(delegation_id="deleg_bbbb2222", task_index=1, role="reviewer",
-                   model="z-ai/glm-5.3-flash", state="done", duration_s=120,
-                   review={"status": "recorded"}, last_error="boom"),
-            Worker(delegation_id="deleg_cccc3333", task_index=2, state="failed",
-                   last_tool="execute_code", model=None),
-        ]
+    def test_explicit_stalled_state(self):
+        self.assertEqual(self.label(state="stalled", started=None, last_event=None), "stall")
 
-    def test_every_line_fits(self):
-        for width in (60, 80, 110, 30):
-            out = render(self._workers(), width=width, now=NOW, session_label="hx")
-            self._assert_fits(out, width)
-            self._assert_fits(render_empty(width=width, live_root="/a/very/long/live/root/path"), width)
+    def test_missing_state_is_unknown(self):
+        self.assertEqual(self.label(state=""), "other")
 
-    def test_pathological_workers_still_fit(self):
-        wide = Worker(
-            delegation_id="x" * 200,
-            task_index=99,
-            goal="\t\n\x01wild\x7f goal   with\tcontrol\nchars",
-            model="/" * 20,
-            last_tool="t" * 100,
-            last_error="e" * 100,
-            state="some-unknown-state",
-            started="not-a-date",
-        )
-        out = render([wide], width=30, now=NOW)
-        self._assert_fits(out, 30)
-        # Unknown states are shown as the literal state, truncated to 5 — never
-        # invented as one of the known labels.
-        self.assertIn("some-", out)
-        self.assertNotIn("fail", out)
-
-
-class TestMaxRows(unittest.TestCase):
-    def test_truncates_rows(self):
-        workers = [Worker(task_index=i, delegation_id="deleg_%08d" % i) for i in range(5)]
-        out = render(workers, now=NOW, max_rows=2)
-        self.assertEqual(len(rows_of(out)), 2)
-        self.assertIn("total 5", out)
-
-    def test_all_rows_when_within_limit(self):
-        workers = [Worker(task_index=i) for i in range(3)]
-        out = render(workers, now=NOW, max_rows=12)
-        self.assertEqual(len(rows_of(out)), 3)
-
-    def test_zero_rows(self):
-        out = render([Worker()], now=NOW, max_rows=0)
-        self.assertEqual(len(rows_of(out)), 0)
-
-    def test_running_rows_come_first(self):
-        workers = [
-            Worker(task_index=0, delegation_id="deleg_00000000", state="done"),
-            Worker(task_index=1, delegation_id="deleg_11111111", state="running"),
-        ]
-        rows = rows_of(render(workers, now=NOW))
-        self.assertIn("11111111", rows[0])
-        self.assertIn("00000000", rows[1])
-
-
-class TestColumns(unittest.TestCase):
-    def test_model_prefix_stripped(self):
-        row = rows_of(render([Worker(model="deepseek/deepseek-v4.1-flash-1017")], now=NOW))[0]
-        self.assertNotIn("/", row)
-        self.assertIn("deepseek-v4.1-fl", row)
-
-    def test_model_without_slash_renders_as_is(self):
-        row = rows_of(render([Worker(model="glm-5")], now=NOW))[0]
-        self.assertIn("glm-5", row)
-
-    def test_none_model_shows_dash(self):
-        row = rows_of(render([Worker(model=None)], now=NOW))[0]
-        self.assertIn("-", row)
-        self.assertNotIn("None", row)
-
-    def test_error_marker(self):
-        row = rows_of(render([Worker(last_tool="execute_code", last_error="boom")], now=NOW))[0]
-        # One column is reserved for the marker so it survives the width cap.
-        self.assertIn("execute_co!", row)
-        self.assertLessEqual(len(row), 132)
-
-    def test_no_error_has_no_bang(self):
-        row = rows_of(render([Worker(last_tool="execute_code")], now=NOW))[0]
-        self.assertIn("execute_cod", row)
-        self.assertNotIn("!", row)
-
-    def test_missing_tool_is_dash(self):
-        row = rows_of(render([Worker(last_tool=None, last_error=None)], now=NOW))[0]
-        self.assertIn("-", row)
-
-    def test_goal_whitespace_collapsed(self):
-        goal = "Fix\tstate\nreader   and\tunit\n\ntests"
-        row = rows_of(render([Worker(goal=goal, state="done")], now=NOW))[0]
-        self.assertIn("Fix state reader and unit tests", row)
-        self.assertNotIn("\t", row)
-        self.assertNotIn("\n", row)
-
-    def test_unparseable_started_gives_question_mark(self):
-        row = rows_of(render([Worker(started="whenever", state="done")], now=NOW))[0]
-        self.assertIn("?", row)
-
-    def test_missing_attributes_do_not_raise(self):
-        class Bare(object):
-            pass
-
-        out = render([Bare()], now=NOW)
-        self.assertIn("other", out)
-        self.assertIn("unreviewed", out)
-
-
-class TestDeterminism(unittest.TestCase):
-    def test_two_calls_are_byte_identical(self):
-        workers = [Worker(task_index=0), Worker(task_index=1, state="done", duration_s=90)]
-        first = render(workers, now=NOW, session_label="hx", live_root="/tmp/live")
-        second = render(workers, now=NOW, session_label="hx", live_root="/tmp/live")
-        self.assertEqual(first.encode("utf-8"), second.encode("utf-8"))
-
-    def test_render_defaults_now_without_crashing(self):
-        self.assertIsInstance(render([Worker()]), str)
+    def test_finished_worker_never_stalls(self):
+        self.assertEqual(self.label(state="done", started=None,
+                                    last_event=stamp(NOW - timedelta(hours=5))), "done")
 
 
 if __name__ == "__main__":

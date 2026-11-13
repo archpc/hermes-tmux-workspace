@@ -44,6 +44,18 @@ class _Worker:
         self.error_pending = kw.get("error_pending", False)
 
 
+def _row(text, needle="audit"):
+    """The worker's title line (glyph + task); the key sits on the line below."""
+    return [line for line in text.splitlines() if needle in line][0]
+
+
+def _detail(text, needle="audit"):
+    """The dim second line of a worker's row (facts, silence, failure)."""
+    lines = text.splitlines()
+    at = next(i for i, line in enumerate(lines) if needle in line)
+    return lines[at + 1] if at + 1 < len(lines) else ""
+
+
 class StallRuleTest(unittest.TestCase):
     now = datetime(2026, 11, 12, 12, 0, 0)
 
@@ -51,37 +63,44 @@ class StallRuleTest(unittest.TestCase):
         w = _Worker(started="2026-11-12 08:00:00",
                     last_event="2026-11-12 11:59:00", state="running")
         text = render.render([w], now=self.now, width=120)
-        row = [line for line in text.splitlines() if "deleg_aaa" in line or "aaa11111" in line][0]
-        self.assertIn("run", row)
-        self.assertNotIn("stall", row)
+        row = _row(text)
+        # RUNNING glyph, and no silence claim: the v3 row has no "run" word.
+        self.assertIn("\u25cf", row)
+        self.assertNotIn("no output for", text)
+        self.assertIn("RUNNING", text)
 
     def test_silence_past_the_threshold_is_stall(self):
         w = _Worker(started="2026-11-12 08:00:00",
                     last_event="2026-11-12 11:00:00", state="running")
         text = render.render([w], now=self.now, width=120)
-        row = [line for line in text.splitlines() if "aaa11111" in line][0]
-        self.assertIn("stall", row)
+        row = _row(text)
+        # Silent, not failed: the v3 wording is "no output for <duration>".
+        self.assertIn("no output for 1h00m", row + " " + _detail(text))
+        self.assertIn("\u25d0", row)
+        self.assertNotIn("run ended", text)
 
     def test_future_timestamp_does_not_stall(self):
         """A midnight-crossing transcript date must not look hours stale."""
         w = _Worker(started="2026-11-12 23:50:00",
                     last_event="2026-11-13 00:05:00", state="running")
         text = render.render([w], now=self.now, width=120)
-        row = [line for line in text.splitlines() if "aaa11111" in line][0]
-        self.assertIn("run", row)
-        self.assertNotIn("stall", row)
+        row = _row(text)
+        self.assertIn("\u25cf", row)
+        self.assertNotIn("no output for", text)
 
 
 class ErrorMarkTest(unittest.TestCase):
     def test_only_the_latest_call_can_mark_an_error(self):
         pending = _Worker(error_pending=True, last_error="terminal ERROR exit 1")
         text = render.render([pending], width=120)
-        self.assertIn("terminal!", text)
+        # v3 states the failure in words on the row's detail line.
+        self.assertIn("last call failed: terminal", text)
 
         recovered = _Worker(error_pending=False, last_error="terminal ERROR exit 1")
         text = render.render([recovered], width=120)
-        self.assertIn("terminal ", text + " ")   # no bang
-        self.assertNotIn("terminal!", text)
+        self.assertIn("terminal", text)   # the call is still named
+        self.assertNotIn("last call failed", text,
+                         "an error from an earlier call was still claimed as current")
 
 
 class ReaderFailureTest(unittest.TestCase):
@@ -93,8 +112,10 @@ class ReaderFailureTest(unittest.TestCase):
 
     def test_empty_workspace_still_says_empty(self):
         text = render.render_empty(width=100)
-        self.assertIn("no delegations found", text)
+        # v3 headline for a genuinely empty workspace.
+        self.assertIn("No delegations yet.", text)
         self.assertNotIn("reader failure", text)
+        self.assertNotIn("failed", text)
 
 
 class VerdictTest(unittest.TestCase):
@@ -195,9 +216,9 @@ class MidnightRolloverTest(unittest.TestCase):
         w = _Worker(started="2026-11-12 23:50:00", last_event="2026-11-13 00:05:00",
                     state="running")
         text = render.render([w], now=datetime(2026, 11, 13, 0, 6, 0), width=120)
-        row = [line for line in text.splitlines() if "aaa11111" in line][0]
-        self.assertIn("run", row)
-        self.assertNotIn("stall", row)
+        row = _row(text)
+        self.assertIn("\u25cf", row)
+        self.assertNotIn("no output for", text)
 
 
 class ErrorMarkWidthTest(unittest.TestCase):
@@ -207,8 +228,9 @@ class ErrorMarkWidthTest(unittest.TestCase):
             text = render.render([w], width=width)
             for line in text.splitlines():
                 self.assertLessEqual(len(line), width, "%r exceeds %d" % (line, width))
-            if "TOOL" in text:      # narrow layouts drop the column entirely
-                self.assertIn("!", text, "marker clipped away at width %d" % width)
+            # The current failure stays legible at every width the row is shown.
+            self.assertIn("last call failed: execute_code", text,
+                          "failure marker clipped away at width %d" % width)
 
 
 class ReviewRefusalTest(unittest.TestCase):

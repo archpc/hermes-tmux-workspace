@@ -40,7 +40,8 @@ class ExistenceTest(unittest.TestCase):
     def test_window_exists_rejects_a_missing_window(self):
         with Sandbox() as box:
             self.assertEqual(box.cli("up"), 0)
-            win = box.window("hx:workers")
+            win = box.window("agents")
+            self.assertIsNotNone(win, "up did not create the overview window")
             code = ("from hermes_tmux import tmuxio; "
                     "print('REAL', tmuxio.window_exists(%r)); "
                     "print('MISSING', tmuxio.window_exists('@9999'))" % win["id"])
@@ -52,19 +53,50 @@ class ExistenceTest(unittest.TestCase):
 
 
 class StalePaneRecoveryTest(unittest.TestCase):
-    def test_a_closed_worker_pane_is_rebuilt(self):
-        """A killed tail pane must come back while its worker is still visible."""
+    def test_a_closed_tab_stays_closed_until_it_is_opened(self):
+        """v3: closing a tab is the reader's decision, and `open` undoes it.
+
+        A pane that disappears is indistinguishable from a tab the reader
+        closed, so the coordinator records the dismissal instead of silently
+        rebuilding a pane behind them. The old "rebuild the killed tail pane"
+        rule is exactly the behaviour v3 removed; the property that survives is
+        that the layout never keeps addressing a dead pane, and that the
+        reader has one documented way to get the tab back.
+        """
         with Sandbox() as box:
             box.add_delegation("deleg_stale001", [{"goal": "recover"}])
             self.assertEqual(box.cli("up"), 0)
-            self.assertTrue(wait_for(lambda: len(box.layout().get("tail_panes") or {}) == 1))
-            old = list(box.layout()["tail_panes"])[0]
-            _tmux("kill-pane", "-t", old)
+            self.assertTrue(wait_for(lambda: len(box.layout().get("tabs") or {}) == 1))
+            wkey, tab = list(box.layout()["tabs"].items())[0]
+            old_pane, old_window = tab["pane"], tab["window"]
+            _tmux("kill-pane", "-t", old_pane)
 
             self.assertTrue(
-                wait_for(lambda: any(p != old for p in (box.layout().get("tail_panes") or {})),
-                         timeout=25),
-                "the coordinator kept a dead pane id and never rebuilt the tail pane")
+                wait_for(lambda: wkey not in (box.layout().get("tabs") or {}), timeout=25),
+                "the coordinator kept a dead pane id in the layout")
+            self.assertIn(wkey, box.layout().get("dismissed") or {},
+                          "the closure was not recorded, so the tab can reopen by itself")
+
+            # A later worker event drives another reconcile pass; it must not
+            # resurrect the tab the reader closed.
+            box.append_event("deleg_stale001", 0, "note", "still working")
+            self.assertTrue(wait_for(
+                lambda: wkey not in (box.layout().get("tabs") or {}), timeout=5),
+                "the coordinator reopened a tab the reader had closed")
+            open_windows = _tmux("list-windows", "-t", box.name, "-F", "#{window_id}")[1].split()
+            self.assertNotIn(old_window, open_windows)
+
+            # `open` is the documented way to get it back.
+            self.assertEqual(box.cli("open", "stale001"), 0)
+            tabs = box.layout().get("tabs") or {}
+            self.assertIn(wkey, tabs, "`hermes-tmux open` did not reopen the tab")
+            new_pane = tabs[wkey]["pane"]
+            self.assertNotEqual(new_pane, old_pane)
+            self.assertNotIn(wkey, box.layout().get("dismissed") or {})
+            self.assertTrue(
+                wait_for(lambda: _tmux("display-message", "-p", "-t", new_pane,
+                                       "#{pane_id}")[1].strip() == new_pane, timeout=10),
+                "the reopened tab addresses a pane that does not exist")
 
     def test_down_reports_the_windows_it_closed(self):
         with Sandbox() as box:
