@@ -396,5 +396,125 @@ class TestNarrowAndMidFile(unittest.TestCase):
             ["12:00:01  exit: interrupted"])
 
 
+class TestUntrustedText(unittest.TestCase):
+    """A transcript is untrusted input: nothing in it may drive the reader's
+    terminal. OSC 52 sets a clipboard, OSC 8 forges a link, CSI clears a pane,
+    and a bare NUL/CR edits the line that was just drawn."""
+
+    HOSTILE = [
+        "\x1b]52;c;cHduZWQ=\x07",
+        "\x1b]8;;https://evil.example\x1b\\x\x1b]8;;\x1b\\",
+        "\x1b[2J\x1b[H",
+        "\x1b]0;title\x07",
+        "\x00",
+        "\r",
+        "\x9b31m",
+        "\u202eRTL\u202c",
+    ]
+
+    def displayed(self, line):
+        out = Formatter(width=90, colour=False).feed(line)
+        return "\n".join(out)
+
+    def test_assistant_text_carries_no_escape(self):
+        for hostile in self.HOSTILE:
+            with self.subTest(hostile=repr(hostile)):
+                out = self.displayed("09:00:00  assistant  | a" + hostile + "b")
+                self.assertNotIn("\x1b", out)
+                self.assertNotIn("\x00", out)
+                self.assertNotIn("\r", out)
+                self.assertNotIn("\x9b", out)
+                self.assertNotIn("\u202e", out)
+                # The visible words around it survive; the line is not dropped.
+                self.assertIn("a", out)
+                self.assertIn("b", out)
+
+    def test_tool_and_foreign_lines_are_defused_too(self):
+        for line in ("09:00:00  tool  | -> read(\x1b]52;c;x\x07)",
+                     "noise \x1b]52;c;x\x07",
+                     '09:00:00  result  | t ok 0.1s: {"output": "\x1b[2J"}'):
+            out = self.displayed(line)
+            self.assertNotIn("\x1b", out, line)
+
+    def test_tab_is_kept(self):
+        out = self.displayed("09:00:00  assistant  | a\tb")
+        self.assertIn("a\tb", out)
+
+
+class TestRotation(unittest.TestCase):
+    """Replacing the file is not truncating it: a larger replacement used to be
+    read from the old offset, showing half a line and skipping the start."""
+
+    def setUp(self):
+        os.makedirs(SCRATCH, exist_ok=True)
+        self.dir = tempfile.mkdtemp(dir=SCRATCH)
+        self.path = os.path.join(self.dir, "task-0.log")
+
+    def tearDown(self):
+        for name in os.listdir(self.dir):
+            os.remove(os.path.join(self.dir, name))
+        os.rmdir(self.dir)
+
+    def test_replacement_from_the_beginning(self):
+        import subprocess
+        import sys
+        import time
+
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write("09:00:00  assistant  | first\n")
+        env = {**os.environ, "NO_COLOR": "1", "TERM": "dumb"}
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "hermes_tmux", "tail", self.path],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        try:
+            time.sleep(1.3)
+            replacement = self.path + ".new"
+            with open(replacement, "w", encoding="utf-8") as handle:
+                handle.write("09:00:01  assistant  | REPLACEMENT-HEAD\n"
+                             "09:00:02  assistant  | second\n")
+            os.replace(replacement, self.path)
+            time.sleep(1.5)
+        finally:
+            proc.terminate()
+            try:
+                out = proc.communicate(timeout=5)[0]
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out = proc.communicate()[0]
+        self.assertIn("REPLACEMENT-HEAD", out)
+        self.assertNotIn("MENT-HEAD", out.replace("REPLACEMENT-HEAD", ""))
+        self.assertIn("first", out)
+
+
+    def test_unreadable_file_does_not_busy_loop(self):
+        # stat() succeeds and open() fails: the old loop treated the empty read
+        # as "no new data" and retried with no wait, burning a core.
+        import resource
+        import subprocess
+        import sys
+        import time
+
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write("09:00:00  assistant  | secret\n")
+        os.chmod(self.path, 0o000)
+        env = {**os.environ, "NO_COLOR": "1", "TERM": "dumb"}
+        before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "hermes_tmux", "tail", self.path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        try:
+            time.sleep(2.0)
+        finally:
+            os.chmod(self.path, 0o600)
+            proc.terminate()
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+        used = resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime - before
+        self.assertLess(used, 1.0, "follower burned %.2fs CPU in 2s" % used)
+
+
 if __name__ == "__main__":
     unittest.main()

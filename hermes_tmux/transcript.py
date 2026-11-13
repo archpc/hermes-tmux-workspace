@@ -28,6 +28,7 @@ import os
 import re
 import sys
 import time
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from . import labels
@@ -131,6 +132,10 @@ class Formatter:
 
     def feed(self, line: str) -> List[str]:
         line = line.rstrip("\r\n")
+        # Transcript text is untrusted (tool output, quoted files, a model's
+        # answer). Nothing below is safe on a raw ESC/OSC byte: one OSC 52 in a
+        # line would set the reader's clipboard, and CSI can clear the pane.
+        line = labels.defuse(line)
         match = _EVENT_RE.match(line)
         if match is None:
             out = self.flush()
@@ -334,7 +339,7 @@ def run_tail(path: str, follow: bool = True) -> int:
     if colour and follow:
         sys.stdout.write("\033[?25l")
         restore = quiet_tty()
-    if not _emit([style("transcript: %s" % path, DIM), ""]):
+    if not _emit([style("transcript: %s" % labels.defuse(path), DIM), ""]):
         return 0
 
     pane_id = os.environ.get("TMUX_PANE", "")
@@ -344,22 +349,43 @@ def run_tail(path: str, follow: bool = True) -> int:
     watcher = WatchSet()
     offset = 0
     pending = b""
+    ident = None          # (st_dev, st_ino) of the file being followed
     last_pane_check = time.time()
     try:
         while True:
             try:
-                size = os.path.getsize(path)
+                stat = os.stat(path)
+                size, current = stat.st_size, (stat.st_dev, stat.st_ino)
             except OSError:
-                size = -1
+                size, current = -1, None
+            # Rotation is not only truncation: a replacement file that is
+            # larger than the old offset used to be read from the middle, so
+            # the pane showed half a line and silently skipped the beginning.
+            if ident is not None and current is not None and current != ident:
+                # A held ``think`` belongs to the old file: show it rather than
+                # dropping it, then start the new file with fresh state.
+                _emit(fmt.flush())
+                offset, pending = 0, b""
+                fmt = Formatter(fmt.width, colour, ascii_mode)
+            if current is not None:
+                ident = current
             if 0 <= size < offset:
-                offset, pending = 0, b""        # truncated or replaced: start over
+                offset, pending = 0, b""        # truncated: start over
             if size > offset:
                 try:
                     with open(path, "rb") as handle:
                         handle.seek(offset)
                         chunk = handle.read()
                 except OSError:
-                    chunk = b""
+                    # The file can be stat'd but not read (permissions, a
+                    # directory path, a transient replacement). Do not spin:
+                    # wait for the next change and try again.
+                    if not follow:
+                        _emit(fmt.flush())
+                        return 0
+                    watcher.sync([], [Path(path)])
+                    watcher.wait(_POLL_S)
+                    continue
                 offset += len(chunk)
                 pending += chunk
                 *complete, pending = pending.split(b"\n")
