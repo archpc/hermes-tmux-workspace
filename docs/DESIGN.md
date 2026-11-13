@@ -39,16 +39,18 @@ Hermes (unchanged)
         │
         ▼
 hermes-tmux  (python3, stdlib only, single process per tmux session)
-  ├─ state.py   S1+S2+S3+review registry → normalized Worker records
-  ├─ render.py  Worker records → fixed-width text block (pure)
-  ├─ watch.py   kqueue over live root → redraw on change (no polling)
-  └─ tmuxio.py  thin tmux CLI wrapper; refuses to touch panes it did not create
+  ├─ state.py       S1+S2+S3+review registry → normalized Worker records
+  ├─ labels.py      task titles, tab names, state glyphs (one vocabulary)
+  ├─ render.py      Worker records → the agents overview (pure)
+  ├─ transcript.py  one transcript → readable live view (presentation only)
+  ├─ watch.py       kqueue over live root → tabs and redraw on change
+  └─ tmuxio.py      thin tmux CLI wrapper; refuses to touch panes it did not create
         │
         ▼
 tmux session (user's existing config untouched)
   agent window   (user's own; never renamed, never touched)
-  hx:workers     overview only (hermes-tmux follow)
-  hx:worker-N    up to 2 x tail -F task-N.log per window, grouped by delegation
+  agents         overview only (hermes-tmux follow)
+  <task name>    one window per live worker: hermes-tmux tail task-N.log
   hx:logs        lazy, on demand
   hx:tests       lazy, on demand
   hx:debug       lazy, on demand
@@ -64,8 +66,10 @@ Why this and not the alternatives:
   faking a client and coupling to an internal protocol version.
 - **Not `tmux capture-pane` scraping.** Fragile against reflow, colors, and user input.
   S1 is structured.
-- **`tail -F` as the per-worker renderer.** The kernel delivers the data; tmux paints it.
-  Zero polling, zero duplication, no code of ours on the hot path.
+- **The transcript file as the only per-worker source.** A worker pane follows the
+  real file (kqueue on the vnode, no polling) and prints each event once. The styled
+  follower changes presentation only (section 5); `HERMES_TMUX_TRANSCRIPT=raw` puts
+  plain `tail -F` back.
 - **kqueue for the overview.** stdlib, event-driven, no daemon dependency, no `fswatch`.
 
 ### Event coverage actually achieved
@@ -74,7 +78,7 @@ Why this and not the alternatives:
 |---|---|---|---|
 | delegation starts | dir create under `live/` | immediate | dir `NOTE_WRITE` |
 | task starts (header written) | file create | immediate | dir `NOTE_WRITE` |
-| tool call / tool result / thinking / assistant text | appended line | immediate | file `NOTE_EXTEND` → redraw; `tail -F` for raw |
+| tool call / tool result / thinking / assistant text | appended line | immediate | file `NOTE_EXTEND` → redraw; the pane's follower for the transcript |
 | task finishes | `final` marker in log; manifest status flip | immediate | file `NOTE_EXTEND` |
 | delegation completes | `manifest.completed` | immediate | dir `NOTE_WRITE` |
 | DB terminal state | `async_delegations.state` | immediate (1 s floor) | `state.db`/`-wal` `NOTE_WRITE` → redraw |
@@ -100,7 +104,7 @@ not a claim that the task failed.
 - `watch` holds an exclusive `flock` on the session lock, so a double `up` cannot
   start two coordinators. `follow` does not take the lock: there is one per overview
   pane and it owns no shared state.
-- Detach/reattach: panes, `tail -F`, and the watcher are children of the tmux server and
+- Detach/reattach: panes, their followers, and the watcher are children of the tmux server and
   survive detach. `up` after reattach is a no-op.
 
 ### Gate
@@ -178,8 +182,81 @@ real and are fixed here:
 - No writes to Hermes state, logs, or config.
 - No launching of subagents from the tmux layer.
 - This tool never edits `tmux.conf` and sets no global tmux options: the only options
-  it writes are `@hx` and the `pane-border-*` settings on the window it created. (The
+  it writes are on windows and panes it created (`@hx`, `@hx_glyph`, `@hx_head`,
+  `pane-border-*`, and a `window-status-format` derived from the user's own). (The
   user's `tmux.conf` was hardened separately during the shell-integration audit; that
   work is described in `docs/NOTES-tmux.md`, not done by the CLI.)
 - No killing of pre-existing sessions, windows, or panes.
 - No daemon outside the tmux server; nothing survives the server's death.
+
+## 5. Version 3: one worker per tab (UX redesign)
+
+Version 2 put the overview in `hx:workers` and two transcripts in each
+`hx:worker-N`. Rendered against a real day of work it showed four tabs of
+transcripts up to nine hours old, numeric tab names, a seven-column table keyed
+by delegation id, and a failure badge that could never clear. The redesign
+started from those captures, not from the layout.
+
+### Decisions
+
+| Question | Decision | Why |
+|---|---|---|
+| Grouping | One worker per window, one pane | A tab's state is exactly one worker's state; the transcript gets the whole window; slot packing, tiled reflow and "which pane" disappear. Stays under the two-per-window ceiling. |
+| Role tabs (Protocol / Implementation / Review) | Rejected | Hermes records no role for a task. Role tabs would need a classifier reading prose, and a wrong label is worse than none. |
+| One window per delegation | Rejected | Three siblings either break the ceiling or get split anyway; the tab becomes an aggregate. |
+| Tab name | First clause of the goal the parent wrote; articles dropped, paths to basename, words shared by all siblings dropped | The parent already named the task. Stable: decided once, the sibling set is fixed at dispatch. |
+| Narrow clients | The name never changes; `window-status-format` truncates it per client from `client_width` and `session_windows` | Two clients of different width each get a bar that fits; resizing renames nothing and costs the coordinator nothing. |
+| State in the tab | Glyph in window option `@hx_glyph`, placed before the name in a format derived from the user's own | No rename churn; follows the user's theme. |
+| History | Tabs only for live work; finished tabs linger, then leave; never while in view | The tab bar shows what is happening now. The overview keeps the record. |
+| User closes a tab | It stays closed; `open <id>` brings it back pinned | Version 2 recreated it, which is the tool overriding the reader. |
+| Attention | A failed run nobody has looked at, ended since the workspace came up, less than two hours old | An alert that cannot clear is not an alert. Looking at the tab is the acknowledgement; no command. |
+| Run outcome vs task outcome | "run ended: <reason>" plus the worker's own last report, quoted | Hermes records how the run stopped. It does not record whether the work is good, so the display does not say. |
+| Overview | Sections RUNNING / NEEDS ATTENTION / RECENT, task title first, details dimmer | Answers "what is happening" before "what happened". |
+| Transcript | Styled follower; each event ONE terminal line, soft-wrapped by the terminal | tmux re-wraps soft-wrapped lines on resize, so the reader's scroll position is never touched and nothing is replayed. A hanging indent was given up for that. |
+| Pane header | Three variants inside one tmux conditional on `pane_width` | tmux picks; nothing reacts to a resize. |
+| Colour | Terminal foreground for primary text, mid greys for secondary, 256-colour accents | Legible on light and dark themes; no truecolor dependency. |
+
+### Presentation-only guarantee for transcripts
+
+The follower reads the file Hermes wrote and nothing else. It prints the path
+first. It never drops an event: the two collapses are exact duplicates the
+writer itself produces (the `think` preview of the `assistant` line that
+follows it; the `start` copy of the kickoff goal), and the fixed six-line file
+header that the pane header repeats. Anything that is not an event is printed
+as written. Clipping is marked `(+N chars)`.
+
+### Defects found while building it
+
+| # | Symptom | Cause | Fix |
+|---|---|---|---|
+| V1 | `down` left a tmux message in the reader's own pane (view mode) | `run-shell -b` reports a job that ends on a signal in the active pane; the coordinator was killed with SIGTERM | output goes to `watch.log`, the wrapper shell always ends 0, SIGTERM exits cleanly |
+| V2 | a new delegation was not noticed for up to 20 s | a "nothing changed" signature covered only files already known, and a new directory is not one | any vnode event reloads; the signature is gone |
+| V3 | one-character orphan lines in transcripts | a pane is created a column wider than the client that later shows it | fitted lines keep a two-column margin |
+| V4 | previews duplicated the message that followed | the held `think` line was flushed before waiting for the next line | flushed only after a quiet wait |
+| V5 | failures from before the workspace started asked for attention with no tab to acknowledge them | attention ignored when the workspace came up | runs that ended before `created` are history |
+| V6 | pane header title unreadable | inside a border, the bare `default` style is the border colour | explicit styles |
+| V7 | the coordinator reverted a tab record that `open` published during its pass, then opened a second window for that worker | it wrote the whole `tabs` map back after seconds of tmux work | the pass snapshots what it read and merges only its own changes (`watch._merge`); a first tab created by both sides is kept once |
+| V8 | `tail --no-follow` run by hand left the reader's shell without echo | the view pane's no-echo setting was never restored | set only while following, restored on exit |
+| V9 | a fitted transcript line could overflow a narrow pane and cut its own `(+N chars)` marker | a minimum room larger than the pane | clip never exceeds the room; the marker is whole or a bare ellipsis |
+| V10 | the first delegation on a fresh profile was noticed only on the slow wake | the live root did not exist yet, so nothing watched it | its nearest existing ancestors are watched |
+
+### Independent review (GLM, two rounds)
+
+Round 1 returned FAIL on one blocker, V7. Round 2 returned PASS with no
+blockers after tracing the merge through four interleavings, and withdrew a
+round-1 claim by experiment on a private socket: a pane a user splits inside
+one of our windows does not carry `@hx` of its own (`show-options -p` says
+`invalid option`), so `_killable` refuses it before any command check. Its
+remaining notes were taken: ownership "no" answers are asked twice and an
+unanswered read leaves the tab alone for that pass, so one failed tmux call
+cannot hide live work; a pane the reader moved into another window with
+`join-pane` is forgotten and nothing is written to that window; `down` also
+nominates recorded window ids and keeps the state directory while a
+coordinator still holds the lock.
+
+Known limits, accepted: widths are counted in characters, so double-width text
+in a goal can overrun an overview line by a few columns; if the kernel watch on
+a transcript cannot be set up, a `think` preview is shown as well as the message
+it previews; with several clients of different sizes attached, tmux sizes each
+window for the client that used it last.
+

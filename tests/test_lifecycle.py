@@ -41,8 +41,7 @@ class LifecyclePropagationTest(unittest.TestCase):
             deleg = "deleg_life0001"
             box.add_delegation(deleg, [{"goal": "lifecycle"}])
             self.assertEqual(box.cli("up"), 0)
-            self.assertTrue(wait_for(lambda: "total 1: stall 1" in self._overview_text(box)
-                                     or "total 1: run 1" in self._overview_text(box), timeout=15),
+            self.assertTrue(wait_for(lambda: "RUNNING" in self._overview_text(box), timeout=15),
                             "the worker never rendered in a live state: %r"
                             % self._overview_text(box)[-200:])
             # Let the events raised while the workspace was built drain first:
@@ -51,7 +50,8 @@ class LifecyclePropagationTest(unittest.TestCase):
             time.sleep(2.5)
             self._manifest(box, deleg, "done")
             self.assertTrue(
-                wait_for(lambda: "total 1: done 1" in self._overview_text(box),
+                wait_for(lambda: "Nothing running." in self._overview_text(box)
+                         and "RUNNING" not in self._overview_text(box),
                          timeout=DEADLINE_S),
                 "the overview did not show the completed state within %.0fs; "
                 "manifest.json is probably no longer watched: %r"

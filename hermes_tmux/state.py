@@ -122,6 +122,8 @@ def _empty_log() -> Dict[str, Any]:
         "phase": "none",
         "tool_count": 0,
         "last_tool": None,
+        "last_call": None,
+        "last_message": None,
         "last_error": None,
         "summary": None,
         "first_ts": None,
@@ -201,6 +203,8 @@ def parse_log(path: Path) -> Dict[str, Any]:
 
     tool_count = 0
     last_tool: Optional[str] = None
+    last_call: Optional[str] = None
+    last_message: Optional[str] = None
     last_error: Optional[str] = None
     summary: Optional[str] = None
     duration: Optional[float] = None
@@ -213,10 +217,14 @@ def parse_log(path: Path) -> Dict[str, Any]:
         if role == "tool":
             tool_count += 1
             last_tool = _tool_name(text)
+            call = text.strip()
+            last_call = (call[len(_TOOL_ARROW):] if call.startswith(_TOOL_ARROW) else call).strip() or None
             # A new call supersedes the previous verdict: the marker describes
             # the *latest* call only, so a worker that recovers stops showing
             # an error it no longer has.
             error_pending = False
+        elif role == "assistant":
+            last_message = text or last_message
         elif role == "result":
             if "ERROR" in text:
                 last_error = text
@@ -237,6 +245,8 @@ def parse_log(path: Path) -> Dict[str, Any]:
     result["tool_count"] = tool_count
     result["error_pending"] = error_pending
     result["last_tool"] = last_tool
+    result["last_call"] = last_call
+    result["last_message"] = last_message
     result["last_error"] = last_error
     result["summary"] = summary
     result["has_final"] = has_final
@@ -466,6 +476,14 @@ class Worker:
     last_event: Optional[str] = None
     #: True when the most recent completed tool call reported an error.
     error_pending: bool = False
+    #: The most recent tool call as the transcript wrote it, name and argument
+    #: preview ("terminal(pytest -q)"): what the worker is doing right now.
+    last_call: Optional[str] = None
+    #: The last thing the worker itself said. Shown beside a failed run: how
+    #: the run ended (a provider error, an interruption) and what the worker
+    #: had reported by then are separate facts, and only the first is ours to
+    #: state.
+    last_message: Optional[str] = None
 
 
 def _resolve_state(
@@ -701,6 +719,8 @@ def _workers_for_manifest(
                 log_path=str(log_path) if (log_path is not None and log_exists) else None,
                 last_event=_combine_started(manifest_started, log.get("last_ts")),
                 error_pending=bool(log.get("error_pending")),
+                last_call=log.get("last_call"),
+                last_message=log.get("last_message"),
             )
         )
     return workers
