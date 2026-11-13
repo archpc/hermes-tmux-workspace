@@ -116,7 +116,7 @@ window for the client that used it last; the overview and tab bar follow.
 
 | Pane | Shows | Never |
 |---|---|---|
-| `hx:logs` | `tail -F` of the real `~/.hermes/logs/agent.log` | no placeholder text when the log is missing |
+| `hx:logs` | `tail -n 200 -F` of the real `~/.hermes/logs/agent.log` | if the log is missing, one line naming the missing path, never invented log content |
 | `hx:tests` | the last recorded run, or the opt-in command; `tests --run` records it | does not execute the suite by default (that would recurse into a running suite) |
 | `hx:debug` | live env (`HERMES_HOME`, `HERMES_TMUX`, `TMUX_PANE`), session key, window/pane inventory with ownership flags | no invented health status |
 | `hx:rea` | `rea --version` when the CLI exists, plus a note that REA MCP state is served by Hermes | no simulated REA output |
