@@ -1,0 +1,427 @@
+{
+  "claims": [
+    {
+      "id": "S1",
+      "kind": "observed",
+      "refs": [
+        {
+          "path": "deploy/live-running.txt",
+          "quote": "4 @10 [Check workspace docs\u2026] panes=1 active=0",
+          "type": "record"
+        },
+        {
+          "path": "deploy/live-retired.txt",
+          "quote": "19:33:39 layout tabs: deleg_bcaf50c1#0 absent",
+          "type": "record"
+        },
+        {
+          "path": "glm/review-1.txt",
+          "quote": "lost update between `reconcile_tabs` and `cmd_open`",
+          "type": "record"
+        },
+        {
+          "path": "glm/review-2.txt",
+          "quote": "The split pane has no own `@hx`",
+          "type": "record"
+        }
+      ],
+      "statement": "v3 deployed; real worker appeared, finished, lingered, retired; review FAIL then PASS"
+    },
+    {
+      "id": "P1",
+      "kind": "observed",
+      "refs": [
+        {
+          "path": "DESIGN.md",
+          "quote": "$HERMES_HOME/cache/delegation/live/<deleg_id>/task-<n>.log",
+          "type": "record"
+        },
+        {
+          "path": "DESIGN.md",
+          "quote": "hermes-tmux  (python3, stdlib only, single process per tmux session)",
+          "type": "record"
+        }
+      ],
+      "statement": "Hermes writes one append-only transcript per delegated task"
+    },
+    {
+      "id": "P2",
+      "kind": "observed",
+      "refs": [
+        {
+          "path": "DESIGN.md",
+          "quote": "Hermes has no concept of \"reviewing a delegation\".",
+          "type": "record"
+        },
+        {
+          "path": "DESIGN.md",
+          "quote": "Hermes records how the run stopped. It does not record whether the work is good, so the display does not say.",
+          "type": "record"
+        }
+      ],
+      "statement": "Hermes records neither review status nor quality of work"
+    },
+    {
+      "id": "V1",
+      "kind": "observed",
+      "refs": [
+        {
+          "path": "git-log-main.txt",
+          "repo": "/Users/sein/Code/hermes-tmux-workspace",
+          "rev": "859d3f0",
+          "type": "commit"
+        },
+        {
+          "path": "history.md",
+          "quote": "pane1 overview (hermes-tmux follow) + up to 4 x tail -F task-N.log",
+          "type": "record"
+        },
+        {
+          "path": "DESIGN.md",
+          "quote": "one idle coordinator process accumulated per closed session",
+          "type": "record"
+        },
+        {
+          "path": "DESIGN.md",
+          "quote": "ownership marker read as `{@hx}` (literal) instead of `#{@hx}`",
+          "type": "record"
+        }
+      ],
+      "statement": "v1: one window with overview plus up to four tail panes; defects found on real tmux"
+    },
+    {
+      "id": "V2",
+      "kind": "observed",
+      "refs": [
+        {
+          "path": "git-log-main.txt",
+          "repo": "/Users/sein/Code/hermes-tmux-workspace",
+          "rev": "4d93f6e",
+          "type": "commit"
+        },
+        {
+          "path": "DESIGN.md",
+          "quote": "Version 2 put the overview in `hx:workers` and two transcripts in each",
+          "type": "record"
+        },
+        {
+          "path": "history.md",
+          "quote": "142 tests on a private socket (gate default included)",
+          "type": "record"
+        },
+        {
+          "path": "history.md",
+          "quote": "counting `def test_` in `git show a17522d:tests` gives 166",
+          "type": "record"
+        }
+      ],
+      "statement": "v2: overview-only window, two transcripts per worker window; 142 then 166 tests"
+    },
+    {
+      "id": "B1",
+      "kind": "observed",
+      "refs": [
+        {
+          "path": "journal/entry-01.html",
+          "quote": "Overview is a 7-column table keyed by opaque ids, monochrome, 40 history rows",
+          "type": "record"
+        },
+        {
+          "path": "DESIGN.md",
+          "quote": "An alert that cannot clear is not an alert.",
+          "type": "record"
+        }
+      ],
+      "statement": "v2 overview under real history: 7-column table, 40 rows, permanent attention badge"
+    },
+    {
+      "id": "B2",
+      "kind": "observed",
+      "refs": [
+        {
+          "path": "journal/entry-01.html",
+          "quote": "hold 8 finished transcripts up to 9 h old; nothing running",
+          "type": "record"
+        },
+        {
+          "path": "DESIGN.md",
+          "quote": "transcripts up to nine hours old, numeric tab names, a seven-column table keyed",
+          "type": "record"
+        }
+      ],
+      "statement": "v2 worker tabs held eight finished transcripts up to nine hours old"
+    },
+    {
+      "id": "R1",
+      "kind": "observed",
+      "refs": [
+        {
+          "path": "DESIGN.md",
+          "quote": "Role tabs would need a classifier reading prose, and a wrong label is worse than none.",
+          "type": "record"
+        },
+        {
+          "path": "DESIGN.md",
+          "quote": "Three siblings either break the ceiling or get split anyway;",
+          "type": "record"
+        },
+        {
+          "path": "DESIGN.md",
+          "quote": "The name never changes; `window-status-format` truncates it per client from",
+          "type": "record"
+        }
+      ],
+      "statement": "role tabs and per-delegation windows rejected; names never change"
+    },
+    {
+      "id": "D1",
+      "kind": "observed",
+      "refs": [
+        {
+          "path": "DESIGN.md",
+          "quote": "Sections RUNNING / NEEDS ATTENTION / RECENT, task title first, details dimmer",
+          "type": "record"
+        },
+        {
+          "path": "shots/prod-01-overview-running.txt",
+          "quote": "Reconstruct the v1 and v2 history of the Hermes tmux workspace from its repository",
+          "type": "record"
+        }
+      ],
+      "statement": "overview is three sections, task title first"
+    },
+    {
+      "id": "L1",
+      "kind": "observed",
+      "refs": [
+        {
+          "path": "DESIGN.md",
+          "quote": "Tabs only for live work; finished tabs linger, then leave; never while in view",
+          "type": "record"
+        },
+        {
+          "path": "code/watch.py",
+          "quote": "#: How long a finished worker keeps its tab after it settles or was last",
+          "type": "record"
+        },
+        {
+          "path": "code/watch.py",
+          "quote": "#: full window size and makes a tab's state exactly one worker's state. Eight",
+          "type": "record"
+        },
+        {
+          "path": "code/render.py",
+          "quote": "STALL_AFTER_S = 600  # 10 minutes; display-only, never a failure claim",
+          "type": "record"
+        }
+      ],
+      "statement": "lifecycle: live work only, 5-minute linger, never while in view, cap of eight"
+    },
+    {
+      "id": "D2",
+      "kind": "observed",
+      "refs": [
+        {
+          "path": "DESIGN.md",
+          "quote": "Hermes records how the run stopped. It does not record whether the work is good, so the display does not say.",
+          "type": "record"
+        },
+        {
+          "path": "journal/entry-03.html",
+          "quote": "the failed worker in the lab screenshots is synthetic",
+          "type": "record"
+        }
+      ],
+      "statement": "a run that ended in an error is reported as such, with the worker's last report"
+    },
+    {
+      "id": "T1",
+      "kind": "observed",
+      "refs": [
+        {
+          "path": "DESIGN.md",
+          "quote": "each event ONE terminal line, soft-wrapped by the terminal",
+          "type": "record"
+        },
+        {
+          "path": "journal/entry-03.html",
+          "quote": "You rejected the replay (loses scrol",
+          "type": "record"
+        }
+      ],
+      "statement": "styled follower is presentation only; one terminal line per event"
+    },
+    {
+      "id": "X1",
+      "kind": "observed",
+      "refs": [
+        {
+          "path": "journal/entry-04.html",
+          "quote": "a real mouse click on a status-line tab switched wi",
+          "type": "record"
+        },
+        {
+          "path": "DESIGN.md",
+          "quote": "Legible on light and dark themes; no truecolor dependency",
+          "type": "record"
+        }
+      ],
+      "statement": "tmux-native; rendered in iTerm2 and Ghostty, smoke-tested in Terminal.app"
+    },
+    {
+      "id": "H1",
+      "kind": "observed",
+      "refs": [
+        {
+          "path": "journal/entry-04.html",
+          "quote": "three DeepSeek workers in parallel on disjoint files",
+          "type": "record"
+        },
+        {
+          "path": "journal/entry-05.html",
+          "quote": "a clipped transcript line could overflow a narrow pane and cut its own",
+          "type": "record"
+        }
+      ],
+      "statement": "parallel DeepSeek workers on disjoint files reported real defects"
+    },
+    {
+      "id": "I1",
+      "kind": "observed",
+      "refs": [
+        {
+          "path": "dev/pure-suites.txt",
+          "quote": "Ran 231 tests in 0.142s",
+          "type": "record"
+        },
+        {
+          "path": "journal/entry-04.html",
+          "quote": "tmux reports run-shell jobs that",
+          "type": "record"
+        },
+        {
+          "path": "journal/entry-03.html",
+          "quote": "coordinator ignored new delegations for up to 20 s",
+          "type": "record"
+        }
+      ],
+      "statement": "synthetic replay lab; pure suites run in well under a second; renders found defects"
+    },
+    {
+      "id": "G1",
+      "kind": "observed",
+      "refs": [
+        {
+          "path": "glm/review-1.txt",
+          "quote": "lost update between `reconcile_tabs` and `cmd_open`",
+          "type": "record"
+        },
+        {
+          "path": "DESIGN.md",
+          "quote": "the pass snapshots what it read and merges only its own changes",
+          "type": "record"
+        }
+      ],
+      "statement": "round 1 failed on a lost update between reconcile and open"
+    },
+    {
+      "id": "G2",
+      "kind": "observed",
+      "refs": [
+        {
+          "path": "glm/review-2.txt",
+          "quote": "NB 1 (round 1): refuted by experiment.",
+          "type": "record"
+        },
+        {
+          "path": "glm/review-2.txt",
+          "quote": "The split pane has no own `@hx`",
+          "type": "record"
+        }
+      ],
+      "statement": "round 2 passed; reviewer withdrew the inherited-marker claim by experiment"
+    },
+    {
+      "id": "G3",
+      "kind": "observed",
+      "refs": [
+        {
+          "path": "test-run-main.txt",
+          "quote": "Ran 308 tests in 109.503s",
+          "type": "record"
+        },
+        {
+          "path": "test-run-main.txt",
+          "quote": "leftover private tmux servers: 0",
+          "type": "record"
+        },
+        {
+          "path": "deploy/rollback-rehearsal.txt",
+          "quote": "-- checkout tag v2-two-per-window, up",
+          "type": "record"
+        },
+        {
+          "path": "deploy/rollback-rehearsal.txt",
+          "quote": "user pane alive: %104 zsh",
+          "type": "record"
+        }
+      ],
+      "statement": "308 tests pass; rollback rehearsed with a user shell surviving"
+    },
+    {
+      "id": "M1",
+      "kind": "observed",
+      "refs": [
+        {
+          "path": "journal/entry-05.html",
+          "quote": "I deleted the Desktop product screenshots before the replacements existed.",
+          "type": "record"
+        },
+        {
+          "path": "journal/entry-05.html",
+          "quote": "A lab setting leaked into the first production start.",
+          "type": "record"
+        },
+        {
+          "path": "dev/tests-baseline-v3.txt",
+          "quote": "test_tmux_integration 279s :: Ran 33 tests in 278.593s  FAILED (failures=24, errors=1)",
+          "type": "record"
+        }
+      ],
+      "statement": "three mistakes: deleted screenshots, leaked linger setting, misread timing"
+    },
+    {
+      "id": "G4",
+      "kind": "open",
+      "open_reason": "No real delegation failed in the production session during the validation window, and none was induced.",
+      "refs": [],
+      "statement": "No production worker ended in an error during validation; the failure path is shown from synthetic lab workers."
+    }
+  ],
+  "generation": "a2a9858eab44c730a87a8ab7f3eaea26dda09b0bbe734021afe313214a76b06a",
+  "report_id": "RR-2026-1112-HX",
+  "root": "../evidence",
+  "schema": "research-evidence/1",
+  "validation": {
+    "by_kind": {
+      "derived": 0,
+      "inferred": 0,
+      "observed": 19,
+      "open": 1
+    },
+    "claims": 20,
+    "content_sha256": "2a623f985e62fe6740380c680f67a683b001165df4ee952ebefea6d81dc08922",
+    "ref_classes": {
+      "artifact": 0,
+      "commit": 2,
+      "external": 0,
+      "file": 0,
+      "record": 49,
+      "run": 0
+    },
+    "refs": 51,
+    "report_id": "RR-2026-1112-HX",
+    "schema": "research-evidence/1",
+    "verification": "record-level; binaries, symbols and addresses are not re-examined"
+  }
+}

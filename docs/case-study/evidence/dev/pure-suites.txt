@@ -1,0 +1,4 @@
+repo: ~/Code/hermes-tmux-workspace @ ce69f1c
+command: python3 -m unittest tests.test_render tests.test_labels tests.test_transcript tests.test_tab_merge tests.test_state tests.test_honesty
+Ran 231 tests in 0.142s
+OK

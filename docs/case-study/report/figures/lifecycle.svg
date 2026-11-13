@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 836 268" width="836" height="268" font-family="SF NS, Helvetica Neue, Helvetica, sans-serif">
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#6E6E73"/></marker></defs>
+<rect x="0" y="28" width="176" height="60" rx="4" fill="#FFFFFF" stroke="#0071E3" stroke-width="1.6"/>
+<text x="12" y="53" font-size="17" font-weight="600" fill="#1D1D1F">Dispatched</text>
+<text x="12" y="74" font-size="14.5" fill="#6E6E73">tab opens, detached</text>
+<rect x="220" y="28" width="176" height="60" rx="4" fill="#FFFFFF" stroke="#1B7F4B" stroke-width="1.6"/>
+<text x="232" y="53" font-size="17" font-weight="600" fill="#1D1D1F">Running</text>
+<text x="232" y="74" font-size="14.5" fill="#6E6E73">live transcript</text>
+<rect x="440" y="28" width="176" height="60" rx="4" fill="#FFFFFF" stroke="#6E6E73" stroke-width="1.6"/>
+<text x="452" y="53" font-size="17" font-weight="600" fill="#1D1D1F">Done</text>
+<text x="452" y="74" font-size="14.5" fill="#6E6E73">lingers 5 minutes</text>
+<rect x="660" y="28" width="176" height="60" rx="4" fill="#FFFFFF" stroke="#C7C7CC" stroke-width="1.6"/>
+<text x="672" y="53" font-size="17" font-weight="600" fill="#1D1D1F">Retired</text>
+<text x="672" y="74" font-size="14.5" fill="#6E6E73">listed in overview</text>
+<line x1="176" y1="58" x2="218" y2="58" stroke="#6E6E73" stroke-width="1.4" marker-end="url(#a)"/>
+<line x1="396" y1="58" x2="438" y2="58" stroke="#6E6E73" stroke-width="1.4" marker-end="url(#a)"/>
+<line x1="616" y1="58" x2="658" y2="58" stroke="#6E6E73" stroke-width="1.4" marker-end="url(#a)"/>
+<text x="566" y="18" font-size="14" fill="#6E6E73">once out of view</text>
+<rect x="220" y="150" width="176" height="60" rx="4" fill="#FFFFFF" stroke="#C7C7CC" stroke-width="1.6"/>
+<text x="232" y="175" font-size="17" font-weight="600" fill="#1D1D1F">Closed by reader</text>
+<text x="232" y="196" font-size="14.5" fill="#6E6E73">stays closed</text>
+<rect x="440" y="150" width="176" height="60" rx="4" fill="#FFFFFF" stroke="#B3261E" stroke-width="1.6"/>
+<text x="452" y="175" font-size="17" font-weight="600" fill="#1D1D1F">Run ended in error</text>
+<text x="452" y="196" font-size="14.5" fill="#6E6E73">waits to be seen</text>
+<line x1="280" y1="88" x2="280" y2="148" stroke="#6E6E73" stroke-width="1.4" marker-end="url(#a)"/>
+<line x1="360" y1="88" x2="470" y2="148" stroke="#6E6E73" stroke-width="1.4" marker-end="url(#a)"/>
+<text x="420" y="124" font-size="14" fill="#6E6E73">error</text>
+<line x1="616" y1="180" x2="730" y2="90" stroke="#6E6E73" stroke-width="1.4" marker-end="url(#a)"/>
+<text x="690" y="150" font-size="14" fill="#6E6E73">seen, then 5 min</text>
+<text x="0" y="250" font-size="14" fill="#0071E3">Any retired or closed worker: hermes-tmux open brings the transcript back as a pinned tab.</text>
+</svg>

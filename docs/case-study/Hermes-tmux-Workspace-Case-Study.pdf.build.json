@@ -1,0 +1,15 @@
+{
+  "claims": 20,
+  "evidence": "Hermes-tmux-Workspace-Case-Study.pdf.evidence.json",
+  "evidence_sha256": "e17a1efd6da854a7fd539ca367053b2d6cbeb9bdd549e5f8103e685385bec300",
+  "generation": "a2a9858eab44c730a87a8ab7f3eaea26dda09b0bbe734021afe313214a76b06a",
+  "meta_sha256": "344e57b4c9f418f3e466fb79a750a89d862c99aa6b9bfda370eaaea3fd16ebc6",
+  "output": "/Users/sein/Code/hermes-tmux-workspace-ux/docs/case-study/Hermes-tmux-Workspace-Case-Study.pdf",
+  "output_sha256": "a2a9858eab44c730a87a8ab7f3eaea26dda09b0bbe734021afe313214a76b06a",
+  "pages": 15,
+  "source": "/Users/sein/Code/hermes-tmux-workspace-ux/docs/case-study/report/report.typ",
+  "source_date_epoch": "1794441600",
+  "source_sha256": "2a623f985e62fe6740380c680f67a683b001165df4ee952ebefea6d81dc08922",
+  "template_version": "1.2.0",
+  "typst": "typst 0.15.1 (unknown commit)"
+}

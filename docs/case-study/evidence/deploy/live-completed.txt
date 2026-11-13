@@ -1,0 +1,14 @@
+Thu Nov 12 19:28:38 EST 2026
+1 [python3.14] active=1 glyph=
+2 [zsh] active=0 glyph=
+3 [agents] active=0 glyph=#[push-default]#[fg=colour244]○#[default]#[pop-default]
+4 [Check workspace docs…] active=0 glyph=#[push-default]#[fg=colour244]✓#[default]#[pop-default]
+       HERMES AGENTS · main                                                                                            idle
+
+       Nothing running.
+
+       RECENT
+       ✓ Check the workspace docs for stale statements                                                        7s ago  tab 4
+         4m07s · deepseek-v4.1-flash · Stale statements found (read-only) 1. README.md:119 — "…agent.log         bcaf50c1#0
+hermes pane mode=0
+deleg_bcaf50c1#0 {'glyph': '#[push-default]#[fg=colour244]✓#[default]#[pop-default]', 'head': '#{?#{e|>=:#{pane_width},112}, #[fg=colour244#,bold]✓ DONE  #[fg=terminal#,bold]Check the workspace docs for stale statements  #[fg=colour246#,nobold]deepseek-v4.1-flash · 4m07s · 46 tools · bcaf50c1##0#[default] ,#{?#{e|>=:#{pane_width},88}, #[fg=colour244#,bold]✓ DONE  #[fg=terminal#,bold]Check the workspace docs for stale statements  #[fg=colour246#,nobold]deepseek-v4.1-flash · 4m07s#[default] ,#{?#{e|>=:#{pane_width},66}, #[fg=colour244#,bold]✓ DONE  #[fg=terminal#,bold]Check the workspace docs for stale statements  #[fg=colour246#,nobold]4m07s#[default] , #[fg=colour244#,bold]✓  #[fg=terminal#,bold]Check the workspace docs…#[default] }}}', 'opened': 256, 'pane': '%24', 'settled': 9, 'window': '@10'}

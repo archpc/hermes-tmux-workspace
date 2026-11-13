@@ -1,0 +1,29 @@
+<h2>05 · 19:26 · Review, fixes, merged, deployed</h2>
+<div><b>Progress.</b> v3 is merged to main (PR #1, commit ade244b) and running in the real <i>main</i> session. 308 tests pass in about 115 s (v2: 166). A real delegation (bcaf50c1) started after the deploy and appeared as tab 4, “Check workspace docs…”, with the overview showing it under RUNNING.</div>
+<div><br></div>
+<div><b>Independent review (GLM), round 1: FAIL.</b> One blocker, and it was real. The coordinator read the layout, spent seconds creating windows, then wrote the whole tab map back. If you ran <i>hermes-tmux open</i> in that gap, the write erased your tab’s record and the next pass opened a second window for the same worker. <b>Fix:</b> the pass remembers what it read and merges only its own changes. A test places the race exactly and fails if the merge is replaced by the old wholesale write.</div>
+<div><br></div>
+<div><b>Round 2: PASS, no blockers.</b> GLM traced the merge through four interleavings. It also withdrew one of its own round-1 claims after I asked it to settle it by experiment: it had said a pane you split inside one of our windows inherits our marker and would be closed by <i>down</i>. On a private tmux server the new pane has no marker of its own. My code comment said the same wrong thing; corrected to what was measured.</div>
+<div><br></div>
+<div><b>Round 2 notes I took.</b></div>
+<ul>
+<li>Running <i>hermes-tmux tail --no-follow</i> by hand left your shell without echo. Now echo is only turned off while following and is put back on exit.</li>
+<li>One failed tmux call could make a healthy tab be forgotten. A “no” is now asked twice; no answer at all leaves the tab alone.</li>
+<li><i>open</i> and the coordinator creating the same worker’s first tab at once left two windows. The recorded one stands; the other is closed.</li>
+<li>A pane you move into your own window with join-pane is forgotten, left running, and nothing is written to your window.</li>
+</ul>
+<div><b>Defects the DeepSeek workers found while writing tests</b> (reported, not hidden): a clipped transcript line could overflow a narrow pane and cut its own “(+N chars)” marker; a lone closing line printed “exit: completed”; a one-shot read hid an unterminated last line (a worker test had asserted that behaviour, I changed the behaviour and the test); the first delegation on a fresh profile was only noticed on the slow 20 s wake.</div>
+<div><br></div>
+<div><b>Mistakes, mine.</b></div>
+<ul>
+<li><b>I deleted the Desktop product screenshots before the replacements existed.</b> I wanted them re-shot with the final build, removed the old set first, and the screen had locked: window capture fails while locked and a display capture is black. The original HDR files are gone. The folder now holds PNG copies of the earlier build; a job is waiting for the screen to unlock and will re-shoot the full HDR set by itself (window captures only, nothing raised).</li>
+<li><b>A lab setting leaked into the first production start.</b> I had exported a 10-minute linger in my shell for the lab; the coordinator inherits its environment from the shell that runs <i>up</i>. Caught in the process list, restarted clean (default 5 minutes).</li>
+</ul>
+<div><b>Deployment.</b> The old coordinator was stopped with an interrupt signal, which makes it exit 0, so tmux printed nothing into the Hermes pane (a plain terminate makes tmux put a “terminated by signal” notice there). Old <i>down</i> closed its 8 panes and 4 windows; the checkout was fast-forwarded; <i>up</i> built the agents window. The Hermes pane stayed out of any mode and the active window did not change.</div>
+<div><br></div>
+<div><b>Rollback.</b> <i>hermes-tmux down</i>; <i>git -C ~/Code/hermes-tmux-workspace checkout v2-two-per-window</i>; <i>hermes-tmux up</i>. Or HERMES_TMUX=0 in one shell.</div>
+<div><br></div>
+<div><b>Evidence.</b> glm/review-1.txt, glm/review-2.txt, deploy/pre-deploy.txt, deploy/post-deploy.txt, deploy/live-running.txt under ~/.hermes/artifacts/hermes-tmux-workspace/ux-redesign/.</div>
+<div><b>Blockers.</b> Screenshots need an unlocked screen.</div>
+<div><b>Next.</b> Watch the real delegation finish and its tab retire; re-shoot; final report.</div>
+<div><br></div>

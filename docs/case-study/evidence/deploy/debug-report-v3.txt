@@ -1,0 +1,9 @@
+session $0 (main)  key 3cbd5142-_0
+layout: {"ascii": false, "created": 1794529380.783433, "overview_pane": "%23", "session_id": "$0", "session_name": "main", "updated": "2026-11-12 19:23:57", "workers_window": "@9"}
+  @0 python3.14         index 1
+    %0 ours=False python3.14 Honk.local
+  @2 zsh                index 2
+    %6 ours=False zsh        Honk.local
+* @9 agents             index 3
+    %23 ours=True Python     Honk.local
+watcher pid: 30862 (alive=True)

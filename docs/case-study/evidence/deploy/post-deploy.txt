@@ -1,0 +1,12 @@
+Thu Nov 12 19:23:03 EST 2026
+1 @0 python3.14 panes=1 active=1 @hx=
+2 @2 zsh panes=1 active=0 @hx=
+3 @9 agents panes=1 active=0 @hx=1
+hermes pane mode=0 cmd=python3.14
+active window before=@0 after=@0
+28801 sh -c rkspace HX_PYTHON=/Applications/Xcode.app/Contents/Developer/usr/bin/python3 HERMES_TMUX_ASCII=0 HERMES_TMUX_LINGER_S=600 /Applications/Xcode.app/Contents/Developer/usr/bin/python3 -m hermes_tmux watch --key 3cbd5142-_0 >>/Users/sein/.hermes/cache/hermes-tmux/sessions/3cbd5142-_0/watch.log 2>&1; true
+28803 /Applies_tmux watch --key 3cbd5142-_0
+95093 sh -c ers/sein/Code/hermes-tmux-workspace-ux HX_PYTHON=/Applications/Xcode.app/Contents/Developer/usr/bin/python3 HERMES_TMUX_ASCII=0 HERMES_TMUX_LINGER_S=600 /Applications/Xcode.app/Contents/Developer/usr/bin/python3 -m hermes_tmux watch --key 6e277ebb-_0 >>/Users/sein/.hermes/cache/scratch/hxlab/home/cache/hermes-tmux/sessions/6e277ebb-_0/watch.log 2>&1; true
+95094 /Applies_tmux watch --key 6e277ebb-_0
+3cbd5142-_0
+nosock-unknown

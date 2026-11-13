@@ -1,0 +1,14 @@
+production session main, checked 2026-11-12 19:33:54
+worker deleg_bcaf50c1#0 settled at 19:28:29 (see live-completed.txt: settled 9 s before 19:28:38); linger 300 s
+19:33:04 layout tabs: deleg_bcaf50c1#0 settled 275s ago, still tabbed (window 4)
+19:33:39 layout tabs: deleg_bcaf50c1#0 absent; windows now:
+  1 [python3.14]
+  2 [zsh]
+  3 [agents]
+  4 [Reconstruct v1 and v2…]
+  5 [Compile sourced evidence…]
+layout.json now:
+  tabs: ['deleg_98adce95#0', 'deleg_98adce95#1']
+  dismissed: ['deleg_bcaf50c1#0']
+hermes pane in mode: 0; user session active window index: 1
+open still lists it: 1 row(s) in status

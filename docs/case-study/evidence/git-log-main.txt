@@ -1,0 +1,10 @@
+859d3f0 2026-11-12 13:32:54 -0500 tmux workspace: live subagent panes with verified ownership
+bdd9fc7 2026-11-12 13:37:33 -0500 Enable the tmux workspace by default
+e9a66d3 2026-11-12 13:51:19 -0500 Close the remaining review notes: server identity, two test pins
+4d93f6e 2026-11-12 17:33:18 -0500 Worker windows: overview-only hx:workers, two panes per worker window
+3ffb719 2026-11-12 17:38:27 -0500 Fix overview staleness (db watch, draw scroll), migration test, docs
+acc7a54 2026-11-12 17:41:23 -0500 Focus worker command across windows; add delegated layout regressions and 0-8 worker matrix
+c21ae8f 2026-11-12 17:44:01 -0500 Cap visible worker panes at eight (four two-pane windows)
+a17522d 2026-11-12 17:47:03 -0500 down: stop the coordinator before closing panes (no reopen race)
+ade244b 2026-11-12 19:19:59 -0500 One worker per tab: tabs for live work, an agents overview, readable transcripts
+ce69f1c 2026-11-12 19:28:52 -0500 Docs: five statements that no longer matched the code

@@ -1,0 +1,15 @@
+test_concurrency 33s :: Ran 3 tests in 32.400s  FAILED (failures=3) 
+test_existence 14s :: Ran 5 tests in 14.331s  FAILED (failures=1, errors=1) 
+test_follow_liveness 4s :: Ran 2 tests in 3.979s  OK 
+test_gate 0s :: Ran 6 tests in 0.000s  OK 
+test_honesty 0s :: Ran 24 tests in 0.099s  FAILED (failures=6) 
+test_isolation_guards 15s :: Ran 3 tests in 14.375s  FAILED (failures=1) 
+test_layout_races 2s :: Ran 3 tests in 1.874s  FAILED (failures=1) 
+test_lifecycle 15s :: Ran 1 test in 15.370s  FAILED (failures=1) 
+test_process_guards 0s :: Ran 4 tests in 0.021s  OK 
+test_render 0s :: Ran 1 test in 0.000s  FAILED (errors=1) 
+test_state 0s :: Ran 31 tests in 0.029s  OK 
+test_state_json 0s :: Ran 5 tests in 0.010s  OK 
+test_tmux_integration 279s :: Ran 33 tests in 278.593s  FAILED (failures=24, errors=1) 
+test_worker_layouts 5s :: Ran 8 tests in 4.611s  FAILED (failures=12) 
+test_worker_order 0s :: Ran 1 test in 0.000s  FAILED (errors=1) 
