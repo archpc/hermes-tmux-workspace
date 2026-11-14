@@ -8,5 +8,6 @@ linked, never rewritten. Detail behind each decision lives in `docs/DESIGN.md` a
 <!-- adr-index:start -->
 | ID | Status | Date | Decision |
 |---|---|---|---|
+| 0002 | accepted | 2026-11-14 | [Permanent hx:testbench auxiliary window and opt-out gate](0002-permanent-hx-testbench-auxiliary-window-and-opt-out-gate.md) |
 | 0001 | accepted | 2026-11-12 | [Read-only side-car over Hermes artifacts, not agent hooks](0001-read-only-side-car-over-hermes-artifacts-not-agent-hooks.md) |
 <!-- adr-index:end -->

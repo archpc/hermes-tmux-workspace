@@ -787,10 +787,10 @@ class IntegrationTest(unittest.TestCase):
                     for tab in (layout.get("tabs") or {}).values():
                         self.assertEqual(len(box.panes_of(tab["window"])), 1,
                                          "a worker tab holds more than one pane")
-                    # One window per running worker, plus `agents` and permanent `hx:mail`.
-                    self.assertEqual(len(box.own_windows()), count + 2,
+                    # One window per running worker, plus `agents`, `hx:mail`, and `hx:testbench`.
+                    self.assertEqual(len(box.own_windows()), count + 3,
                                      "%d workers must own %d windows, got %r"
-                                     % (count, count + 2,
+                                     % (count, count + 3,
                                         [w["name"] for w in box.own_windows()]))
                     overview = box.window(AGENTS)
                     self.assertIsNotNone(overview)

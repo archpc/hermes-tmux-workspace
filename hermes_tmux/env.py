@@ -28,7 +28,8 @@ def python() -> str:
 #: read from the shell that ran the command; the tmux server's environment is
 #: older and does not have them.
 _PASSTHROUGH = ("HERMES_TMUX_TRANSCRIPT", "HERMES_TMUX_LINGER_S", "HERMES_TMUX_CLOSE_MARK",
-                "NO_COLOR", "HXMAIL_DB", "HXMAIL_LOCAL_DIR")
+                "HERMES_TMUX_TESTBENCH", "NO_COLOR", "HXMAIL_DB", "HXMAIL_LOCAL_DIR",
+                "TESTBENCH_HOME")
 
 
 def pane_env() -> Dict[str, str]:
@@ -55,4 +56,5 @@ def pane_env() -> Dict[str, str]:
     if not is_default_home:
         env.setdefault("HXMAIL_DB", str(hh / "cache" / "hxmail" / "mail.db"))
         env.setdefault("HXMAIL_LOCAL_DIR", str(hh / "cache" / "hxmail" / "local"))
+        env.setdefault("TESTBENCH_HOME", str(hh / "cache" / "testbench"))
     return env
