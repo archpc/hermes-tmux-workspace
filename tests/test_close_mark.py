@@ -218,7 +218,7 @@ class CloseMarkTest(unittest.TestCase):
                         break
                 self.assertFalse(T._window_exists(tab["window"]),
                                  "no click on or after the name closed the tab (status: %r)" % text)
-                self.assertEqual(len(box.windows()), 3,
+                self.assertEqual(len(box.windows()), 4,
                                  "a click closed more than the one tab: %r" % box.windows())
             finally:
                 client.close()

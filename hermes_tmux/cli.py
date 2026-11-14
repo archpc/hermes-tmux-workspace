@@ -25,7 +25,13 @@ from . import closemark, gate, tmuxio, watch
 from .env import pane_env, python as _env_python, repo_root as _env_repo_root
 
 WORKERS_WINDOW = watch.OVERVIEW_WINDOW
-AUX_ROLES = ("logs", "tests", "debug", "rea", "mail")
+AUX_ROLES = ("logs", "tests", "debug", "rea", "mail", "testbench")
+
+
+def testbench_tab_enabled() -> bool:
+    return os.environ.get("HERMES_TMUX_TESTBENCH", "1").strip().lower() not in (
+        "0", "false", "off", "no"
+    )
 
 
 # --------------------------------------------------------------------------- helpers
@@ -326,6 +332,12 @@ def _up() -> int:
     )
     if not mail_wid:
         print("hermes-tmux: warning: could not create hx:mail")
+    if testbench_tab_enabled():
+        tb_wid, _tb_state = ensure_aux_window(
+            key, session_id, "testbench", focus=False, after_window=mail_wid or window_id
+        )
+        if not tb_wid:
+            print("hermes-tmux: warning: could not create hx:testbench")
     _start_watcher(key)
     watch.render_and_publish(key, session_label=session_name)
     print("hermes-tmux: workspace ready  (%s)" % window_id)
@@ -535,6 +547,12 @@ def _aux_command(role: str, shell: str, run: bool = False) -> Tuple[str, str]:
             "elif command -v hxmail >/dev/null 2>&1; then exec hxmail; "
             "else printf '%s\\n' 'hxmail binary not installed yet (expected ~/.local/bin/hxmail)'; exec " + shell + "; fi")
 
+    if role == "testbench":
+        return str(home), (
+            "if [ -x \"$HOME/.local/bin/testbench\" ]; then exec \"$HOME/.local/bin/testbench\" tui; "
+            "elif command -v testbench >/dev/null 2>&1; then exec testbench tui; "
+            "else printf '%s\\n' 'testbench binary not installed yet (expected ~/.local/bin/testbench)'; exec " + shell + "; fi")
+
     # role == "rea": show what is actually installed, then a shell.
     return str(home), (
         "printf '%s\\n' '--- REA ---'; "
@@ -583,6 +601,8 @@ def ensure_aux_window(
         if not is_def and "HXMAIL_DB" not in os.environ:
             p_env["HXMAIL_DB"] = str(home / "cache" / "hxmail" / "mail.db")
             p_env["HXMAIL_LOCAL_DIR"] = str(home / "cache" / "hxmail" / "local")
+        if not is_def and "TESTBENCH_HOME" not in os.environ:
+            p_env["TESTBENCH_HOME"] = str(home / "cache" / "testbench")
 
     status = "existing"
     if wid is not None:

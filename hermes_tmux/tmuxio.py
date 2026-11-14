@@ -448,7 +448,7 @@ def owns_pane(pane_id: str) -> bool:
 #: case a pane ever does carry a marker it should not.
 _KILLABLE_COMMANDS = ("tail", "python", "python3", "python3.9", "python3.10",
                       "python3.11", "python3.12", "python3.13", "python3.14",
-                      "python3.15", "hxmail")
+                      "python3.15", "hxmail", "testbench")
 
 
 def _killable(pane_id: str) -> Tuple[bool, str]:
