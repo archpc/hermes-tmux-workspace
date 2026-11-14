@@ -16,6 +16,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -196,14 +197,20 @@ def cmd_up(args) -> int:
 
 @contextlib.contextmanager
 def _server_lock():
+    digest = tmuxio.session_key(session_id="x").split("-", 1)[0]
+    srv_lock = Path(tempfile.gettempdir()) / ("hx-srv-%d-%s.lock" % (os.getuid(), digest))
     root = watch.state_root()     # beside sessions/, whose entries are all session directories
     root.mkdir(parents=True, exist_ok=True)
-    with open(str(root / "up.lock"), "a+") as handle:
+    with open(str(srv_lock), "a+") as srv_handle, open(str(root / "up.lock"), "a+") as handle:
+        fcntl.flock(srv_handle.fileno(), fcntl.LOCK_EX)
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                fcntl.flock(srv_handle.fileno(), fcntl.LOCK_UN)
 
 
 def _anchor(layout: Dict) -> Tuple[str, str]:
@@ -380,10 +387,13 @@ def cmd_down(args) -> int:
         sdir.rmdir()
     except OSError:
         pass
-    if not any(_watcher_alive(other) for other in _server_keys() if other != key):
-        # The click binding is per server. It goes when the last workspace on
-        # this server goes; until then it falls through for every other click.
-        closemark.restore()
+    if not _any_workspace_on_server(exclude_key=key):
+        # The click binding is per server. It goes only when no workspace or
+        # owned worker window remains anywhere on this server (including other
+        # HERMES_HOME profiles and tabs opened without `up`).
+        with _server_lock():
+            if not _any_workspace_on_server(exclude_key=key):
+                closemark.restore()
     closed_windows = sum(1 for window_id in before_windows
                          if not tmuxio.window_exists(window_id))
     print("hermes-tmux: closed %d pane(s) and %d window(s)"
@@ -690,6 +700,9 @@ def cmd_open(args) -> int:
         print("hermes-tmux: could not open a tab for %s" % worker.key)
         return 1
     watch.decorate_window(window_id, ascii_mode=ascii_mode)
+    if closemark.enabled():
+        with _server_lock():
+            closemark.install(_close_handler())
     kind = watch._kind(worker)
     record = {"window": window_id, "pane": panes[0]["pane_id"], "opened": time.time(),
               "pinned": True, "seen": time.time(),
@@ -722,28 +735,54 @@ def _close_handler() -> str:
     return "%s >/dev/null 2>&1; true" % command
 
 
-def _server_keys() -> List[str]:
+def _server_keys(home: Optional[Path] = None) -> List[str]:
     """Session keys with state on disk for the tmux server we are talking to."""
     digest = tmuxio.session_key(session_id="x").split("-", 1)[0]
     try:
-        return sorted(p.name for p in (watch.state_root() / "sessions").iterdir()
+        return sorted(p.name for p in (watch.state_root(home) / "sessions").iterdir()
                       if p.is_dir() and p.name.startswith(digest + "-"))
     except OSError:
         return []
 
 
-def _tab_of_window(window_id: str) -> Tuple[str, str, Dict]:
-    """(session key, worker key, tab record) of the worker tab in ``window_id``.
+def _any_workspace_on_server(exclude_key: str = "") -> bool:
+    """True when any owned window or live watcher remains on this tmux server."""
+    rc, all_wids = tmuxio.run("list-windows", "-a", "-F", "#{window_id}")
+    if rc == 0:
+        for line in all_wids.splitlines():
+            wid = line.strip()
+            if wid and tmuxio.owns_window(wid):
+                return True
+    return any(_watcher_alive(other) for other in _server_keys() if other != exclude_key)
 
-    Looked up in the layouts, not derived from the window's session: with
-    grouped sessions one window belongs to several, and only one of them is
-    the session the workspace was built in.
+
+def _window_home(window_id: str) -> Optional[Path]:
+    """Return the HERMES_HOME stamped on ``window_id``, if any."""
+    rc, out = tmuxio.run("show-options", "-wv", "-t", window_id, "@hx_home")
+    val = out.strip() if rc == 0 else ""
+    return Path(val) if val else None
+
+
+def _tab_of_window(window_id: str) -> Tuple[Optional[Path], str, str, Dict]:
+    """(home, session key, worker key, tab record) of the worker tab in ``window_id``.
+
+    Resolves across HERMES_HOME profiles via ``@hx_home`` stamped on the window
+    when it was decorated, falling back to the current ``hermes_home()``.
     """
-    for key in _server_keys():
-        for wkey, tab in (watch.read_layout(key).get("tabs") or {}).items():
-            if isinstance(tab, dict) and tab.get("window") == window_id:
-                return key, wkey, tab
-    return "", "", {}
+    from .state import hermes_home
+    homes: List[Path] = []
+    stamped = _window_home(window_id)
+    if stamped is not None:
+        homes.append(stamped)
+    cur_home = hermes_home()
+    if cur_home not in homes:
+        homes.append(cur_home)
+    for cand_home in homes:
+        for key in _server_keys(cand_home):
+            for wkey, tab in (watch.read_layout(key, cand_home).get("tabs") or {}).items():
+                if isinstance(tab, dict) and tab.get("window") == window_id:
+                    return cand_home, key, wkey, tab
+    return None, "", "", {}
 
 
 def cmd_close(args) -> int:
@@ -771,7 +810,7 @@ def cmd_close(args) -> int:
         window_id = tmuxio.format_of(os.environ.get("TMUX_PANE") or "", "#{window_id}").strip()
     if not window_id or not tmuxio.window_exists(window_id):
         return say("no such window: %s" % (window_id or "?"), 3)
-    key, wkey, tab = _tab_of_window(window_id)
+    tab_home, key, wkey, tab = _tab_of_window(window_id)
     if not wkey:
         # Not a worker tab: the reader's own windows, the overview, the aux
         # panes. Nothing is closed and nothing is asked of tmux.
@@ -789,7 +828,7 @@ def cmd_close(args) -> int:
             tabs.pop(wkey, None)
         current.setdefault("dismissed", {})[wkey] = time.time()
         return current
-    watch.update_layout(key, _apply)
+    watch.update_layout(key, _apply, tab_home)
 
     ref = wkey.replace("deleg_", "")
     ref = "%s#%s" % (ref.split("#", 1)[0][-8:], ref.split("#", 1)[1]) if "#" in ref else ref[-8:]
@@ -808,10 +847,10 @@ def cmd_close_mark(args) -> int:
         print("hermes-tmux: not inside tmux.")
         return 0
     from . import labels
-    windows = [tab.get("window") for key in _server_keys()
-               for tab in (watch.read_layout(key).get("tabs") or {}).values()
-               if isinstance(tab, dict) and tab.get("window")]
-    windows = [wid for wid in windows if tmuxio.window_exists(wid) and tmuxio.owns_window(wid)]
+    rc, all_wids = tmuxio.run("list-windows", "-a", "-F", "#{window_id}")
+    cand_wids = [w.strip() for w in all_wids.splitlines() if w.strip()] if rc == 0 else []
+    windows = [wid for wid in cand_wids
+               if tmuxio.owns_window(wid) and _tab_of_window(wid)[2]]
     if args.action == "status":
         marked = sum(1 for wid in windows if closemark.has_mark(closemark._own_format(wid)))
         print("hermes-tmux: close mark binding %s; %d of %d worker tab(s) marked"

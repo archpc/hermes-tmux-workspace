@@ -616,9 +616,12 @@ def _tab_format(option: str, ascii_mode: bool = False, worker: bool = True) -> s
 
 
 def decorate_window(window_id: str, header: bool = True,
-                    ascii_mode: bool = False) -> None:
+                    ascii_mode: bool = False,
+                    home: Optional[Path] = None) -> None:
     """Window-scoped presentation for a window we created (never global)."""
     from . import closemark
+    from .state import hermes_home
+    tmuxio.window_option(window_id, "@hx_home", str(hermes_home(home)))
     for option in ("window-status-format", "window-status-current-format"):
         fmt = _tab_format(option, ascii_mode, worker=header)
         # Worker tabs only, and only the tab in view: one quiet mark, and a
@@ -813,7 +816,7 @@ def reconcile_tabs(key: str, workers: Sequence, home: Optional[Path] = None,
         panes = tmuxio.wait_for_panes(window_id)
         if not panes:
             continue
-        decorate_window(window_id, ascii_mode=ascii_mode)
+        decorate_window(window_id, ascii_mode=ascii_mode, home=home)
         tabs[wkey] = {"window": window_id, "pane": panes[0]["pane_id"], "opened": now}
         if settled is not None:
             tabs[wkey]["settled"] = now

@@ -64,19 +64,23 @@ def with_mark(fmt: str, window_id: str, ascii_mode: bool = False) -> str:
 
     Only the foreground and weight change for the mark, so the tab's own
     background carries through it and through the padding cell after it.
+    Preserves whether ``fmt`` originally ended with a trailing space.
     """
     if not fmt or has_mark(fmt) or not _TARGET_RE.match(window_id or ""):
         return fmt
-    body = fmt[:-1] if fmt.endswith(" ") else fmt
-    return "%s #[range=user|%s%s fg=%s nobold]%s#[range=window|#{window_index}] " % (
-        body, RANGE, window_id, _COLOUR, MARK_ASCII if ascii_mode else MARK)
+    had_space = fmt.endswith(" ")
+    body = fmt[:-1] if had_space else fmt
+    tail = " " if had_space else ""
+    return "%s #[range=user|%s%s fg=%s nobold]%s#[range=window|#{window_index}]%s" % (
+        body, RANGE, window_id, _COLOUR, MARK_ASCII if ascii_mode else MARK, tail)
 
 
 def without_mark(fmt: str) -> str:
-    """Inverse of ``with_mark`` (the single trailing space is put back)."""
+    """Inverse of ``with_mark`` (restores trailing space iff one was present)."""
     if not has_mark(fmt):
         return fmt
-    return _MARK_RE.sub("", fmt) + " "
+    had_space = fmt.endswith(" ")
+    return _MARK_RE.sub("", fmt) + (" " if had_space else "")
 
 
 def parse_target(arg: str) -> Optional[str]:
