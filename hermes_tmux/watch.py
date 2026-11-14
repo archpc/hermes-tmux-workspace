@@ -399,6 +399,7 @@ def collect_paths(
 
     manifests: List[Path] = []
     active_logs: List[Path] = []
+    recent_logs: List[Path] = []
     if root.is_dir():
         dirs.append(root)
         try:
@@ -409,13 +410,12 @@ def collect_paths(
         # plus the 40 newest dirs by name.
         all_children.sort(key=lambda p: p.name, reverse=True)
         selected: List[Path] = []
-        seen_dirs = set()
         for child in all_children:
             mp = child / "manifest.json"
             is_live = (not mp.is_file()) or _manifest_has_live_task(read_manifest(mp))
             if is_live or len(selected) < 40:
                 selected.append(child)
-                seen_dirs.add(str(child))
+        completed_with_logs = 0
         for child in selected:
             dirs.append(child)
             mp = child / "manifest.json"
@@ -423,15 +423,23 @@ def collect_paths(
             if mp.is_file():
                 manifests.append(mp)
                 is_live = _manifest_has_live_task(read_manifest(mp))
-            if is_live:
+            # Watch logs of all live delegations plus the 8 newest completed
+            # delegations (matching RECENT_ROWS) so a late buffered flush after
+            # completion still triggers an immediate coordinator pass, without
+            # holding FDs open on dozens of older historical delegations.
+            watch_logs = is_live or (include_db and completed_with_logs < 8)
+            if not is_live and watch_logs:
+                completed_with_logs += 1
+            if watch_logs:
                 try:
                     for entry in child.iterdir():
                         if entry.suffix == ".log":
-                            active_logs.append(entry)
+                            (active_logs if is_live else recent_logs).append(entry)
                 except OSError:
                     continue
     files.extend(manifests)
     files.extend(active_logs)
+    files.extend(recent_logs)
     return dirs, files
 
 
