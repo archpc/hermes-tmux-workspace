@@ -14,7 +14,8 @@ Rules enforced by this harness:
 The contract these tests pin is the v3 tab model (one worker, one window, one
 pane) as implemented by ``hermes_tmux/watch.py:reconcile_tabs``:
 
-* ``up`` owns exactly one non-worker window, ``agents`` (``cli.WORKERS_WINDOW``),
+* ``up`` owns two static workspace windows, ``agents`` (``cli.WORKERS_WINDOW``)
+  and ``hx:mail`` (permanent local mail reader),
   holding one pane: the overview;
 * a RUNNING worker gets one window of its own, named from its goal, one pane
   running the styled follower (``python -m hermes_tmux tail <log>``), and a
@@ -786,10 +787,10 @@ class IntegrationTest(unittest.TestCase):
                     for tab in (layout.get("tabs") or {}).values():
                         self.assertEqual(len(box.panes_of(tab["window"])), 1,
                                          "a worker tab holds more than one pane")
-                    # One window per running worker, plus the overview.
-                    self.assertEqual(len(box.own_windows()), count + 1,
+                    # One window per running worker, plus `agents` and permanent `hx:mail`.
+                    self.assertEqual(len(box.own_windows()), count + 2,
                                      "%d workers must own %d windows, got %r"
-                                     % (count, count + 1,
+                                     % (count, count + 2,
                                         [w["name"] for w in box.own_windows()]))
                     overview = box.window(AGENTS)
                     self.assertIsNotNone(overview)

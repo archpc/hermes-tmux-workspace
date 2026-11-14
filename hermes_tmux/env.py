@@ -34,8 +34,9 @@ _PASSTHROUGH = ("HERMES_TMUX_TRANSCRIPT", "HERMES_TMUX_LINGER_S", "HERMES_TMUX_C
 def pane_env() -> Dict[str, str]:
     from . import labels
     from .state import hermes_home
+    hh = hermes_home()
     env = {
-        "HERMES_HOME": str(hermes_home()),
+        "HERMES_HOME": str(hh),
         "HERMES_TMUX": "1" if gate.enabled() else "0",
         "PYTHONPATH": str(repo_root()),
         "HX_PYTHON": python(),
@@ -47,4 +48,11 @@ def pane_env() -> Dict[str, str]:
         value = os.environ.get(name)
         if value:
             env[name] = value
+    try:
+        is_default_home = hh.resolve() == (Path.home() / ".hermes").resolve()
+    except OSError:
+        is_default_home = False
+    if not is_default_home:
+        env.setdefault("HXMAIL_DB", str(hh / "cache" / "hxmail" / "mail.db"))
+        env.setdefault("HXMAIL_LOCAL_DIR", str(hh / "cache" / "hxmail" / "local"))
     return env

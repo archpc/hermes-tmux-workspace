@@ -3,7 +3,8 @@
 Hermes subagents as live tmux tabs. Each worker Hermes delegates to gets a tab
 of its own, named after its task, showing its transcript as it is written. An
 `agents` tab says what is running, what needs a look, and what finished
-recently. `logs` / `tests` / `debug` / `REA` panes open on demand.
+recently, and `hx:mail` runs the local `hxmail` reader as a permanent tab beside
+it. `logs` / `tests` / `debug` / `REA` panes open on demand.
 
 It is a **read-only side-car**. Hermes core is not patched, configured, or
 restarted. The workspace reads the delegation artifacts Hermes already writes
@@ -83,7 +84,7 @@ symlink afterwards.
 
 ```sh
 # inside an existing tmux session, from the pane you run `hermes` in
-hermes-tmux up            # build or repair the workspace (idempotent)
+hermes-tmux up            # build or repair the workspace: agents + hx:mail (idempotent)
 
 hermes-tmux status        # the overview once; works outside tmux too
 hermes-tmux status --all  # every recorded worker, not only the recent ones
@@ -91,7 +92,8 @@ hermes-tmux worker 2      # focus the 2nd worker tab
 hermes-tmux open 427f4b2c#1   # open the transcript of any worker, old ones too
 hermes-tmux close         # close the worker tab you are in (the view, never the worker)
 hermes-tmux close-mark off    # remove the clickable × and restore the click binding (on | off | status)
-hermes-tmux logs          # open/focus hx:logs   (also: tests debug rea mail)
+hermes-tmux mail          # focus (or restore) the permanent hx:mail tab
+hermes-tmux logs          # open/focus hx:logs   (also: tests debug rea)
 hermes-tmux debug-report  # windows, panes, ownership flags, watcher pid
 hermes-tmux down          # close only panes this tool created; a window that
                           # also holds one of your panes is left standing

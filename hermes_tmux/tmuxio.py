@@ -335,15 +335,34 @@ def free_window_name(session: str, base: str) -> str:
 
 def new_window(session: str, name: str, command: Optional[str] = None,
                cwd: Optional[str] = None,
-               env: Optional[Dict[str, str]] = None) -> Optional[str]:
+               env: Optional[Dict[str, str]] = None,
+               after_window: Optional[str] = None) -> Optional[str]:
     """Create a detached window we own. Returns its window_id.
 
     ``env`` is passed with ``-e``: a new window is forked from the *server*, so
     it does not see variables exported in the pane that asked for it. Without
     this, HERMES_HOME/PYTHONPATH silently fall back to the server's values and
     the pane reads a different Hermes profile than the caller.
+
+    When ``after_window`` is given and the index immediately after it is free,
+    insert there (``-a -t <after_window>``) so permanent tabs stay beside
+    ``agents`` without ever renumbering or shifting occupied tabs.
     """
-    args = ["new-window", "-d", "-P", "-F", "#{window_id}", "-t", session, "-n", name]
+    target = session
+    extra: List[str] = []
+    if after_window:
+        wins = list_windows(session)
+        by_id = {w["window_id"]: w for w in wins}
+        if after_window in by_id:
+            try:
+                want_idx = int(by_id[after_window]["index"]) + 1
+                taken = {int(w["index"]) for w in wins}
+                if want_idx not in taken:
+                    extra = ["-a"]
+                    target = after_window
+            except (ValueError, KeyError):
+                pass
+    args = ["new-window", "-d"] + extra + ["-P", "-F", "#{window_id}", "-t", target, "-n", name]
     for key, value in (env or {}).items():
         args.extend(["-e", "%s=%s" % (key, value)])
     if cwd:

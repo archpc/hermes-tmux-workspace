@@ -321,6 +321,11 @@ def _up() -> int:
         current["ascii"] = labels.ascii_only()
         return current
     layout = watch.update_layout(key, _apply)
+    mail_wid, _mail_state = ensure_aux_window(
+        key, session_id, "mail", focus=False, after_window=window_id
+    )
+    if not mail_wid:
+        print("hermes-tmux: warning: could not create hx:mail")
     _start_watcher(key)
     watch.render_and_publish(key, session_label=session_name)
     print("hermes-tmux: workspace ready  (%s)" % window_id)
@@ -539,6 +544,89 @@ def _aux_command(role: str, shell: str, run: bool = False) -> Tuple[str, str]:
         "exec " + shell)
 
 
+def ensure_aux_window(
+    key: str,
+    session_id: str,
+    role: str,
+    *,
+    focus: bool = False,
+    run: bool = False,
+    after_window: Optional[str] = None,
+    home: Optional[Path] = None,
+) -> Tuple[Optional[str], str]:
+    """Ensure ``hx:<role>`` exists with one owned pane; focus only when asked.
+
+    Shared by ``cmd_aux`` (interactive ``hermes-tmux mail|logs|...``), ``_up``
+    (permanent ``hx:mail`` startup), and ``watch`` (detached crash recovery).
+    Returns ``(window_id, status)`` where status is ``opened``, ``rebuilt``,
+    ``running``, or ``existing``.
+    """
+    name = "hx:" + role
+    shell = os.environ.get("SHELL") or "/bin/zsh"
+    layout = watch.read_layout(key, home)
+    recorded = ((layout.get("aux") or {}).get(role)) or ""
+    wid: Optional[str] = None
+    if recorded and tmuxio.window_exists(recorded) and tmuxio.owns_window(recorded):
+        wid = recorded
+    if wid is None and session_id:
+        found = tmuxio.find_window_by_name(session_id, name)
+        if found:
+            wid = found["window_id"]
+
+    p_env = _pane_env()
+    if home is not None:
+        p_env["HERMES_HOME"] = str(home)
+        try:
+            is_def = home.resolve() == (Path.home() / ".hermes").resolve()
+        except OSError:
+            is_def = False
+        if not is_def and "HXMAIL_DB" not in os.environ:
+            p_env["HXMAIL_DB"] = str(home / "cache" / "hxmail" / "mail.db")
+            p_env["HXMAIL_LOCAL_DIR"] = str(home / "cache" / "hxmail" / "local")
+
+    status = "existing"
+    if wid is not None:
+        panes = tmuxio.list_panes(wid)
+        ours = [pane for pane in panes if pane["ours"]]
+        if run and ours:
+            _cwd, run_cmd = _aux_command(role, shell, run=True)
+            tmuxio.respawn(ours[0]["pane_id"], run_cmd)
+            status = "running"
+        elif not ours:
+            _cwd, cmd = _aux_command(role, shell, run=run)
+            rebuilt = tmuxio.split_window(wid, cmd, horizontal=False, env=p_env)
+            if not rebuilt:
+                return None, "failed"
+            tmuxio.mark_pane(rebuilt)
+            status = "rebuilt"
+    else:
+        if not session_id:
+            return None, "failed"
+        cwd, cmd = _aux_command(role, shell, run=run)
+        wid = tmuxio.new_window(
+            session_id,
+            tmuxio.free_window_name(session_id, name),
+            cwd=cwd,
+            command=cmd,
+            env=p_env,
+            after_window=after_window,
+        )
+        if not wid:
+            return None, "failed"
+        tmuxio.window_option(wid, "pane-border-status", "off")
+        status = "opened"
+
+    if ((layout.get("aux") or {}).get(role)) != wid:
+        def _record(current):
+            current.setdefault("aux", {})[role] = wid
+            return current
+        watch.update_layout(key, _record, home=home)
+
+    if focus and wid:
+        tmuxio.select_window(wid)
+    return wid, status
+
+
 def cmd_aux(args) -> int:
     role = args.role
     if not gate.enabled():
@@ -550,41 +638,24 @@ def cmd_aux(args) -> int:
     key = tmuxio.session_key()
     _ensure_state_dir(key)
     layout = watch.read_layout(key)
-    session_id = tmuxio.current_session_id() or ""
+    recorded_sid = layout.get("session_id") or ""
+    session_id = recorded_sid if (recorded_sid and tmuxio.session_alive(recorded_sid)) else (
+        tmuxio.current_session_id() or ""
+    )
     name = "hx:" + role
-
     run_now = bool(getattr(args, "run", False))
-    win = tmuxio.find_window_by_name(session_id, name)
-    if win:
-        panes = tmuxio.list_panes(win["window_id"])
-        ours = [pane for pane in panes if pane["ours"]]
-        if run_now and ours:
-            # `--run` has to run. Focusing the pane that only prints the hint
-            # would claim a run that never happened.
-            _cwd, run_cmd = _aux_command(role, os.environ.get("SHELL") or "/bin/zsh",
-                                         run=True)
-            tmuxio.respawn(ours[0]["pane_id"], run_cmd)
-            tmuxio.select_window(win["window_id"])
-            print("hermes-tmux: running the suite in %s" % name)
-            return 0
-        tmuxio.select_window(win["window_id"])
-        print("hermes-tmux: focused %s" % name)
-        return 0
-
-    shell = os.environ.get("SHELL") or "/bin/zsh"
-    cwd, command = _aux_command(role, shell, run=getattr(args, "run", False))
-
-    window_id = tmuxio.new_window(session_id, tmuxio.free_window_name(session_id, name),
-                                  cwd=cwd, command=command, env=_pane_env())
-    if not window_id:
+    wid, status = ensure_aux_window(
+        key, session_id, role, focus=True, run=run_now, after_window=layout.get("workers_window")
+    )
+    if not wid:
         print("hermes-tmux: could not create %s" % name)
         return 1
-    def _apply(current):
-        current.setdefault("aux", {})[role] = window_id
-        return current
-    watch.update_layout(key, _apply)
-    tmuxio.select_window(window_id)
-    print("hermes-tmux: opened %s" % name)
+    if status == "running":
+        print("hermes-tmux: running the suite in %s" % name)
+    elif status == "opened":
+        print("hermes-tmux: opened %s" % name)
+    else:
+        print("hermes-tmux: focused %s" % name)
     return 0
 
 
