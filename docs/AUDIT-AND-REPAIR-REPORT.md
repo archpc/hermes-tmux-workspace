@@ -108,19 +108,56 @@ Harness: `bench_performance.py` running in an isolated tmux 3.8 server (`-f /dev
 
 ---
 
-## 8. Rollback Procedures
+## 8. Independent Adversarial Review & Deployment Record
 
-Snapshot recorded prior to any change: `/Users/sein/.hermes/artifacts/carbon-audit-2026-11-13/rollback/pre-audit-snapshot.json`.
+### Independent Review (`deleg_38d0f6a2`, `deepseek/deepseek-v4.1-flash`)
+- **Verdict**: **PASS** (full report archived in `~/.hermes/artifacts/carbon-audit-2026-11-13/evidence/independent_review.md`).
+- **Reconciled Review Findings** (`b6f2a74` in `hermes-tmux-workspace`; `21750d0b0f` in `hermes-agent-tui-ux`):
+  1. **`B1` (`coordinator_alive` startup probe race)**: Added bounded 5-attempt / 20ms `LOCK_EX | LOCK_NB` retry in `run_watch` startup so a transient `coordinator_alive` / `_lock_held` probe can never cause a newly spawned coordinator to exit.
+  2. **`C2` (`db_only_fds` skip bound under continuous >1 Hz chat)**: Bounded consecutive `db_only_fds` skips by `max_skip = _TICK_S` (5s when work is running/settling, 20s when idle) so tab `seen` acknowledgements and linger retirements never stall during continuous parent chat.
+  3. **`B2` (`_server_lock` path)**: Placed `hx-srv-<uid>-<digest>.lock` in the tmux socket directory (`$TMUX` parent) when available rather than `TMPDIR`.
+  4. **`E1` (`cmd_close_mark` layout scan)**: Deduplicated `@hx_home` layout reads across owned windows (`O(sessions)` instead of `O(windows)`).
+  5. **`G1` (`NO_COLOR` consistency in `cli_modern_layout.py`)**: Extended `_plain_output()` (`NO_COLOR` / `TERM=dumb`) to `_fg()`, `separator()`, and `thought_rows()` truncation lines so entire reasoning blocks emit zero SGR escapes when `NO_COLOR=1`.
+- Both complete test suites were re-executed after reconciliation: **352 / 352 PASS** on macOS Python 3.9.6 (`hermes-tmux-workspace`) and **15 files / all pass (`rc=0`)** on `hermes-agent-tui-ux`.
+
+### GitHub Commits & Remote State
+- **`archpc/hermes-tmux-workspace`** (`main` & `fix/carbon-audit-2026-11-13`, fast-forwarded from `0a5cc97`):
+  - `ff30264` — `fix(state,cli): reconcile per-task DB verdicts, preserve old live workers, stat-cache reads`
+  - `440ef08` — `fix(watch,perf): track replaced inodes, enforce 1Hz floor, skip unrelated WAL churn`
+  - `a4ba899` — `fix(closemark,cli): resolve @hx_home per window, install on open, guard server-wide down`
+  - `c00ef0b` — `fix(labels,render,transcript): account for wide CJK and combining cell widths`
+  - `2b44f93` — `fix(watch): keep kqueue logs on 8 most recent settled delegations for late flushes`
+  - `b2a1531` — `docs: align README, DESIGN, and shot notes with runtime contracts and 352-test suite`
+  - `b6f2a74` — `fix(watch,cli): reconcile independent review findings (flock startup retry, max_skip bound, socket lock dir)`
+- **`archpc/hermes-agent`** (`tui/compact-footer` & `fix/carbon-tui-audit-2026-11-13`, fast-forwarded from `7159ad64cd`):
+  - `c15b1bbffb` — `fix(tui): defuse escapes in reasoning lines, preserve distinct /title, guard scalar display`
+  - `21750d0b0f` — `fix(tui): honor NO_COLOR across separator and reasoning truncation rows`
+
+### Live Deployment Status on Honk
+- **`hermes-tmux-workspace`**: **DEPLOYED & VERIFIED** on live session `main` (`$0`, server PID `4695`, active focus preserved on `@0` / `%0` `PID 4696`, user shell `@2` / `%6` `PID 5425` untouched):
+  - New `watch --key 3cbd5142-_0` (`PID 14066`) and `follow --key 3cbd5142-_0` (`@34` / `%48`, `PID 14044`) running on Python 3.9.6 with `@hx_home=/Users/sein/.hermes` stamped and `close-mark` binding installed.
+  - **Live CPU**: `0.00s` CPU over a 5s active parent-turn window (`0.1%` / `0.0%`, down from `15.1%` + `8.8%` = `23.9%`).
+  - **Live Open FDs**: `251` combined (`134` `watch` + `117` `follow`, down from `372` = `186` + `186`).
+  - **Live Data Verification**: `hermes-tmux status --all --json` now returns all **88** recorded workers (previously capped at 40), and mixed-outcome delegation `deleg_f0b03414` now accurately reports `[(0, 'interrupted'), (1, 'completed'), (2, 'interrupted')]` instead of falsely marking all three `completed`.
+  - Removed empty orphan directory `~/.hermes/cache/hermes-tmux/sessions/nosock-unknown`.
+- **`~/.hermes/hermes-agent` (`tui/compact-footer`)**: **DEFERRED FROM LIVE HOT-PATCH (BY SAFEGUARD)** — live `~/.hermes/hermes-agent` is on upstream detached HEAD `3b421578` (which predates the unmerged `tui/compact-footer` feature branch) and backs the active overnight Hermes process (`PID 4696`). Verified repairs are pushed and merged onto `archpc/hermes-agent` `tui/compact-footer` (`21750d0b0f`).
+
+---
+
+## 9. Rollback Procedures
+
+Snapshot recorded prior to any change: `/Users/sein/.hermes/artifacts/carbon-audit-2026-11-13/rollback/pre-audit-snapshot.json`. Local rollback tags: `pre-carbon-2026-11-13` (`0a5cc97`) and `pre-carbon-tui-2026-11-13` (`7159ad64cd`).
 
 ### Roll back `hermes-tmux-workspace` (live symlink `~/.local/bin/hermes-tmux`)
 ```sh
 git -C ~/Code/hermes-tmux-workspace checkout main
-git -C ~/Code/hermes-tmux-workspace reset --hard 0a5cc97a0ba90c2f673f98d534b04140a607b41e
-# Inside tmux session `main`, restart coordinator & overview pane non-destructively:
-hermes-tmux up
+git -C ~/Code/hermes-tmux-workspace reset --hard pre-carbon-2026-11-13
+# Restart live coordinator & overview pane non-destructively:
+kill -TERM "$(cat ~/.hermes/cache/hermes-tmux/sessions/3cbd5142-_0/watch.pid)"
+tmux kill-window -t @34 && hermes-tmux up
 ```
 
 ### Roll back `hermes-agent-tui-ux`
 ```sh
-git -C ~/Code/hermes-agent-tui-ux reset --hard 7159ad64cddd82c400655550a55970e62fc4d738
+git -C ~/Code/hermes-agent-tui-ux reset --hard pre-carbon-tui-2026-11-13
 ```

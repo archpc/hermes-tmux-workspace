@@ -83,3 +83,21 @@ Next: dispatch independent code review subagent to challenge all commits before 
 | Memory RSS (`watch` / `follow`) | 22.1 MB / 22.1 MB | 22.4 MB / 21.9 MB | flat (~0 delta) |
 | `W3` New worker -> overview (ms) | 230, 274, 280 ms | 283, 178, 179 ms | ~25% faster median |
 | `W3` New worker -> tab (ms) | 675, 501, 529 ms | 846, 468, 433 ms | ~13% faster median |
+
+## 2026-11-14 00:33 EST | 04 Independent Review Reconciled, Pushed to GitHub, Deployed Live [Cfb7e2a6b]
+
+Commit at time of entry: `5673131 docs(audit): add consolidated adversarial audit and repair report`
+
+Independent review subagent (deleg_38d0f6a2) returned VERDICT: PASS; reconciled all valid follow-ups (watch.lock startup retry B1, db_only_fds max_skip bound C2, socket-dir server lock B2, O(sessions) close-mark scan E1, full NO_COLOR reasoning block G1).
+Re-ran complete suites post-reconciliation: hermes-tmux-workspace 352/352 OK on Python 3.9.6 (0 leaks); hermes-agent-tui-ux 15-file status/subagent/dock/layout suite OK (rc=0).
+Pushed and fast-forwarded archpc/hermes-tmux-workspace main (b6f2a74+) and archpc/hermes-agent tui/compact-footer (21750d0b0f), preserving rollback tags pre-carbon-2026-11-13 (0a5cc97) and pre-carbon-tui-2026-11-13 (7159ad64cd).
+Deployed hermes-tmux live on Honk session main ($0) with active focus preserved on @0: live CPU dropped from 23.9% to ~0.0% (0.00s over 5s), open FDs dropped from 372 to 251, status --all now lists all 88 workers, and mixed batch deleg_f0b03414 reports exact per-task interrupted/completed states.
+---
+### Final verification & rollout summary
+
+- Independent review report: `~/.hermes/artifacts/carbon-audit-2026-11-13/evidence/independent_review.md` (`Verdict: PASS`).
+- Live Honk processes after rollout:
+  - `watch --key 3cbd5142-_0`: PID `14066`, Python 3.9.6, `134` FDs (down from `186`), `0.00s` CPU across 5s active WAL turn.
+  - `follow --key 3cbd5142-_0`: window `@34` (`agents`, `@hx=1`, `@hx_key=3cbd5142-_0`, `@hx_home=/Users/sein/.hermes`), pane `%48`, PID `14044`, Python 3.9.6, `117` FDs (down from `186`), `0.00s` CPU across 5s.
+  - User windows `@0` (`%0`, active Hermes `PID 4696`) and `@2` (`%6`, user `zsh` `PID 5425`) preserved untouched.
+- `~/.hermes/hermes-agent` (`3b421578`) left untouched per safeguard (`tui/compact-footer` is an unmerged feature branch on `archpc/hermes-agent` and `PID 4696` is active).
