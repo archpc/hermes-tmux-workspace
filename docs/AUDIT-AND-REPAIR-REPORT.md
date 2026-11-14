@@ -140,7 +140,9 @@ Harness: `bench_performance.py` running in an isolated tmux 3.8 server (`-f /dev
   - **Live Open FDs**: `251` combined (`134` `watch` + `117` `follow`, down from `372` = `186` + `186`).
   - **Live Data Verification**: `hermes-tmux status --all --json` now returns all **88** recorded workers (previously capped at 40), and mixed-outcome delegation `deleg_f0b03414` now accurately reports `[(0, 'interrupted'), (1, 'completed'), (2, 'interrupted')]` instead of falsely marking all three `completed`.
   - Removed empty orphan directory `~/.hermes/cache/hermes-tmux/sessions/nosock-unknown`.
-- **`~/.hermes/hermes-agent` (`tui/compact-footer`)**: **DEFERRED FROM LIVE HOT-PATCH (BY SAFEGUARD)** — live `~/.hermes/hermes-agent` is on upstream detached HEAD `3b421578` (which predates the unmerged `tui/compact-footer` feature branch) and backs the active overnight Hermes process (`PID 4696`). Verified repairs are pushed and merged onto `archpc/hermes-agent` `tui/compact-footer` (`21750d0b0f`).
+- **`~/.hermes/hermes-agent` (`tui/compact-footer` + Carbon TUI fixes)**: **DEPLOYED & VERIFIED** on live `~/.hermes/hermes-agent` (`21750d0b0f2c3a59f8402d40ad250e8980f45501`, pure fast-forward from `3b42157858`, rollback tag `pre-carbon-live-2026-11-14`):
+  - `hermes --version` reports `Hermes Agent v0.23.1+3.g21750d0 · local 21750d0b0f2c` with zero venv rebuild needed (`e2e910c584487a9f` stamp preserved).
+  - Live runtime import smoke test passed for OSC-52/escape defusal, `NO_COLOR`, `_repeats_goal` `/title` preservation, scalar `display` safety, and `compact` subagent dock. New `hermes` CLI sessions pick up `21750d0b0f` immediately; the currently running CLI process (`PID 4910`) picks it up on next restart.
 
 ---
 
@@ -157,7 +159,8 @@ kill -TERM "$(cat ~/.hermes/cache/hermes-tmux/sessions/3cbd5142-_0/watch.pid)"
 tmux kill-window -t @34 && hermes-tmux up
 ```
 
-### Roll back `hermes-agent-tui-ux`
+### Roll back live `~/.hermes/hermes-agent` and `~/Code/hermes-agent-tui-ux`
 ```sh
+git -C ~/.hermes/hermes-agent checkout --detach pre-carbon-live-2026-11-14
 git -C ~/Code/hermes-agent-tui-ux reset --hard pre-carbon-tui-2026-11-13
 ```

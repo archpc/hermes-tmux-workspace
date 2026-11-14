@@ -101,3 +101,17 @@ Deployed hermes-tmux live on Honk session main ($0) with active focus preserved 
   - `follow --key 3cbd5142-_0`: window `@34` (`agents`, `@hx=1`, `@hx_key=3cbd5142-_0`, `@hx_home=/Users/sein/.hermes`), pane `%48`, PID `14044`, Python 3.9.6, `117` FDs (down from `186`), `0.00s` CPU across 5s.
   - User windows `@0` (`%0`, active Hermes `PID 4696`) and `@2` (`%6`, user `zsh` `PID 5425`) preserved untouched.
 - `~/.hermes/hermes-agent` (`3b421578`) left untouched per safeguard (`tui/compact-footer` is an unmerged feature branch on `archpc/hermes-agent` and `PID 4696` is active).
+
+## 2026-11-14 04:40 EST | 05 Live ~/.hermes/hermes-agent Deployed at 21750d0b0f [C5fbc797c]
+
+Commit at time of entry: `54b16fc docs(audit,journal): record independent review reconciliation, GitHub push, and live Honk rollout`
+
+Deployed tui/compact-footer + Carbon TUI repairs (21750d0b0f) onto live ~/.hermes/hermes-agent (detached HEAD fast-forwarded from 3b42157858; rollback tag pre-carbon-live-2026-11-14).
+Verified zero dependency/lockfile drift: hermes --version reports v0.23.1+3.g21750d0 (local 21750d0b0f2c) using existing e2e910c584487a9f environment without rebuild.
+Verified live runtime imports against /Users/sein/.hermes/hermes-agent/hermes_cli/cli_modern_layout.py: OSC-52 defusal, NO_COLOR full-block compliance, _repeats_goal /title preservation, scalar display safety, and compact dock all pass.
+---
+### Live `~/.hermes/hermes-agent` rollout details
+
+- Pre-deploy tag: `pre-carbon-live-2026-11-14` (`3b421578588243f920886e6fe79a6faa87ea026e`).
+- Deployed detached HEAD: `21750d0b0f2c3a59f8402d40ad250e8980f45501` (`7159ad64cd` + `c15b1bbffb` + `21750d0b0f`).
+- Active CLI process (`PID 4910`) continues undisturbed; new `hermes` CLI invocations load `21750d0b0f` immediately.
