@@ -13,6 +13,70 @@ artifact or a review registry entry, the display says so.
 It targets plain tmux, not a terminal emulator: Ghostty, iTerm2 and Terminal.app
 are interchangeable clients, at any window size, several at once.
 
+![Agents overview: RUNNING, NEEDS ATTENTION and RECENT, with a tab per worker](docs/shots/01-agents-overview.png)
+
+## Product shots
+
+Every image here is a real capture of tmux while the tool was running; none is a
+mockup. Provenance and what each one is meant to show is in
+[docs/shots/README.md](docs/shots/README.md).
+
+**The tab bar.** Worker tabs carry one stable name and a state glyph. The
+`agents` badge counts running workers and unseen failures, and the tab in view
+shows a clickable `×` that closes the view, never the worker.
+
+![Tab bar with worker tabs and the agents badge](docs/shots/05-tab-bar.png)
+
+**A worker running.** One worker, one full-size pane: the border names the
+state, task, model and run id; the pane follows the transcript Hermes is
+writing, colouring tool calls and results one line each.
+
+![Worker tab following a running transcript](docs/shots/02-worker-running.png)
+
+**A run that ended with an error.** `✕ FAILED … provider_error` is what Hermes
+recorded about the agent run; the worker's own last report is quoted beside it,
+and the tab stays until you look at it.
+
+![Worker tab for a run that ended with provider_error](docs/shots/03-worker-run-ended-with-error.png)
+
+**A narrow client.** The same overview in a 996 px window: names are cut by tmux
+from the client's own width, nothing is renamed, nothing overlaps.
+
+![The agents overview in a narrow terminal](docs/shots/04-narrow-overview.png)
+
+## Install
+
+Requirements: tmux (developed and tested on 3.8; the layout depends on 3.x id
+and option formats), Python 3.9+, and a terminal that runs tmux. The package has
+no third-party dependencies and no install step; Hermes core is not patched.
+
+```sh
+git clone https://github.com/archpc/hermes-tmux-workspace.git ~/Code/hermes-tmux-workspace
+mkdir -p ~/.local/bin
+ln -sf ~/Code/hermes-tmux-workspace/hermes-tmux ~/.local/bin/hermes-tmux
+```
+
+`hermes-tmux` is a launcher that adds its own repository to `sys.path`, so the
+symlink is the whole installation. Optional: `scripts/tmux-attach` starts or
+reattaches tmux when a terminal opens. It never calls `hermes-tmux up`; it is
+independent of this tool and is here only because this tool is easier to reach
+from a tmux session that always exists.
+
+```sh
+cp ~/Code/hermes-tmux-workspace/scripts/tmux-attach ~/.local/bin/
+# in ~/.zshrc, interactive shells only:
+#   [[ -o interactive ]] && ~/.local/bin/tmux-attach
+```
+
+Then, from the pane you run `hermes` in, inside tmux:
+
+```sh
+hermes-tmux up
+```
+
+Uninstall: `hermes-tmux down` closes only the panes it created; delete the
+symlink afterwards.
+
 ## Quick start
 
 ```sh
@@ -151,16 +215,37 @@ and `docs/NOTES-tmux.md` for the tmux/macOS mechanics the layout depends on.
 TMUX_TMPDIR=$(mktemp -d) python3 -m unittest discover -s tests -t .
 ```
 
-The suite creates a private tmux server (`-L hx_it_<pid>`) and tears it down;
-the socket *file* it leaves behind is removed by `tearDownModule` only when the
-server is gone, so a normal run leaves no live process and `sessions/` empty.
-
-The suite needs no environment: it creates a **private tmux server** named
-`hx_it_<pid>` and tears it down afterwards, so it never touches the default
-socket or the user's sessions.
+The suite needs no environment. It creates a **private tmux server** named
+`hx_it_<pid>_<n>` per test and tears it down afterwards, so it never touches the
+default socket or the user's sessions; the socket *file* it leaves behind is
+removed by `tearDownModule` only when the server is gone, so a normal run leaves
+no live process and `sessions/` empty.
 
 Unit tests cover the gate, the state reader, the overview renderer, the labels
 and the transcript formatter. The integration
 suite drives **real, isolated tmux sessions** named `hx_it_<pid>_<n>`, each with
 a private `HERMES_HOME`, and asserts against what tmux actually painted. It
 never lists, renames, or kills any other session.
+
+Quick subset, no tmux needed:
+
+```sh
+python3 -m unittest tests.test_render tests.test_labels tests.test_transcript tests.test_tab_merge
+```
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `hermes-tmux` | launcher; a symlink to it on `PATH` is the whole install |
+| `hermes_tmux/` | the package: `cli`, `gate`, `env`, `state`, `render`, `labels`, `transcript`, `watch`, `tmuxio`, `closemark` |
+| `tests/` | 333 tests: pure unit tests plus an integration suite on private tmux servers |
+| `docs/DESIGN.md` | architecture decision record, rejected alternatives, defect log |
+| `docs/NOTES-tmux.md` | tmux and macOS mechanics the layout depends on |
+| `docs/shots/` | the product shots used above, with provenance |
+| `docs/case-study/` | the redesign from version 1 to version 3: PDF, report sources, evidence snapshot |
+| `scripts/tmux-attach` | optional terminal-open hook that starts or reattaches tmux |
+
+## License
+
+MIT. See [LICENSE](LICENSE).

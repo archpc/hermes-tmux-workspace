@@ -1,0 +1,183 @@
+#!/bin/zsh
+# tmux-attach — start or reattach tmux from a freshly opened terminal window.
+#
+#   no sessions              -> create and attach
+#   single session, job live -> attach straight away (reconnect wins)
+#   single session, idle     -> attach, or ask if another client already holds it
+#   several sessions         -> picker, default = last used, busy ones marked
+#
+# Job detection uses the pane tty's foreground process group (catches anything
+# that takes the terminal) plus any direct child of the pane shell (catches
+# background jobs). It is a heuristic, not a process inventory: deeper
+# descendants that reparent, and jobs that fully detach (setsid, launchd,
+# disowned daemons), are invisible here. pane_current_command is only a label.
+#
+#   --dry-run   print the decision, do nothing
+#   --new       force a fresh session instead of attaching
+# Opt out per shell:  export TMUX_AUTO_ATTACH=0
+
+emulate -L zsh
+setopt pipe_fail
+unsetopt nomatch 2>/dev/null
+
+DRY=0
+FORCE_NEW=0
+for arg in "$@"; do
+  case $arg in
+    --dry-run) DRY=1 ;;
+    --new)     FORCE_NEW=1 ;;
+  esac
+done
+
+# ---------------- guards: never hijack nested, dumb, or agent shells ----------
+# TMUX alone is not enough: a nested server or `env -u TMUX` can leave it empty
+# while TMUX_PANE still points at a real pane. Either marker means "inside".
+[[ -n ${TMUX:-}${TMUX_PANE:-} ]] && exit 0
+[[ ${TMUX_AUTO_ATTACH:-1} == 0 ]] && exit 0
+[[ ${TERM:-dumb} == dumb ]] && exit 0
+[[ -t 0 && -t 1 ]] || exit 0
+[[ -n ${HERMES_SESSION_ID:-}${HERMES_AGENT_SESSION:-}${CLAUDECODE:-} ]] && exit 0
+
+TMUX_BIN=${commands[tmux]:-}
+[[ -z $TMUX_BIN ]] && exit 0
+
+# ---------------- helpers ------------------------------------------------------
+pane_has_job() {   # $1 = pane_pid, $2 = pane_tty
+  local pid=$1 tpgid
+  [[ -z $pid ]] && return 1
+  # A foreground job moves the tty's foreground process group off the shell.
+  tpgid=$(ps -o tpgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  if [[ -n $tpgid && $tpgid != $pid ]]; then
+    return 0
+  fi
+  # Background jobs: any surviving direct child of the pane shell.
+  pgrep -P "$pid" >/dev/null 2>&1 && return 0
+  return 1
+}
+
+session_busy() {   # $1 = session_name
+  local name=$1 line pid
+  for line in "${(@f)$($TMUX_BIN list-panes -s -t "$name" -F '#{pane_pid} #{pane_tty}' 2>/dev/null)}"; do
+    [[ -z $line ]] && continue
+    pid=${line%% *}
+    if pane_has_job "$pid"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+session_label() {  # $1 = session_name -> short note for the picker
+  local name=$1 cmds attached note=""
+  cmds=$($TMUX_BIN list-panes -s -t "$name" -F '#{pane_current_command}' 2>/dev/null \
+    | grep -vxE 'zsh|bash|sh|fish|dash|login|tcsh|csh' | sort -u | paste -sd ',' -)
+  [[ -n $cmds ]] && note+="cmd: $cmds; "
+  attached=$($TMUX_BIN display-message -p -t "$name" '#{session_attached}' 2>/dev/null)
+  [[ -n $attached && $attached != 0 ]] && note+="${attached} client(s); "
+  session_busy "$name" && note+="job detected; "
+  print -r -- "${note%; }"
+}
+
+new_session() {    # create a session with a free name, then attach
+  local base=main name n=2
+  name=$base
+  # "=name" is an exact target: a bare name is a prefix match, so looking for
+  # "main" would report a free name as taken whenever "main-2" exists.
+  $TMUX_BIN has-session -t "=$name" 2>/dev/null && name="${base}-2"
+  while $TMUX_BIN has-session -t "=$name" 2>/dev/null; do
+    name="${base}-${n}"
+    (( n++ ))
+  done
+  # Create detached, then attach. `has-session` + `new-session` is two steps,
+  # so another window can take the name in between; creating first lets the
+  # failure be retried with the next free name instead of losing the terminal
+  # to a "duplicate session" error.
+  local tries=0
+  while [[ $DRY == 0 && $tries -lt 20 ]]; do
+    if $TMUX_BIN new-session -d -s "$name" -c "${HOME}" 2>/dev/null; then
+      exec $TMUX_BIN attach-session -t "$name"
+    fi
+    name="${base}-${n}"
+    (( n++, tries++ ))
+  done
+  if [[ $DRY == 0 ]]; then
+    print -u2 -- "tmux-attach: could not create a named session after 20 attempts"
+    exit 1
+  fi
+  print "new session: $name"
+  exit 0
+}
+
+attach_to() {      # $1 = session_name, $REASON = why (dry-run only)
+  if [[ $DRY == 1 ]]; then
+    print "attach: $1${REASON:+   ($REASON)}"
+    exit 0
+  fi
+  exec $TMUX_BIN attach-session -t "$1"
+}
+
+# ---------------- main ---------------------------------------------------------
+sessions=(${(f)"$($TMUX_BIN list-sessions -F '#{session_name}' 2>/dev/null)"})
+sessions=(${sessions:#})
+
+(( ${#sessions} == 0 )) && new_session
+(( FORCE_NEW == 1 )) && new_session
+
+# Default target: most recently used session.
+# '|' as the field separator: a session name may contain a space, and the old
+# space-separated form silently truncated such a name to its first word.
+last=$($TMUX_BIN list-sessions -F '#{session_last_attached}|#{session_name}' 2>/dev/null \
+  | sort -t'|' -k1,1 -n -r | head -1 | cut -d'|' -f2-)
+[[ -z $last ]] && last=${sessions[1]}
+
+# Single session: reconnect if a job is live, else ask only when someone else holds it.
+if (( ${#sessions} == 1 )); then
+  only=${sessions[1]}
+  REASON="job running"
+  session_busy "$only" && attach_to "$only"
+  REASON="idle, single session"
+  clients=$($TMUX_BIN display-message -p -t "$only" '#{session_attached}' 2>/dev/null)
+  if [[ -n $clients && $clients != 0 ]]; then
+    print -r -- "$only is already open in $clients terminal window(s)."
+    print -rn -- "[j]oin it, [n]ew session, [q]uit? "
+    reply=""
+    # A reply without a trailing newline still counts (read returns non-zero but
+    # sets reply); a real EOF leaves reply empty and must keep quitting, so both
+    # the status and the content are checked.
+    IFS= read -r reply
+    [[ $? -ne 0 && -z $reply ]] && reply=q
+    case ${reply:l} in
+      n|new)  new_session ;;
+      q|quit) exit 0 ;;
+      *)      attach_to "$only" ;;
+    esac
+  fi
+  attach_to "$only"
+fi
+
+# Several sessions: always show the menu. Busy sessions are flagged; the default
+# is the most recently used session, not merely a busy one.
+print -r -- "tmux sessions:"
+i=1
+for s in $sessions; do
+  note=$(session_label "$s")
+  print -r -- "  $i) $s${note:+   ($note)}"
+  (( i++ ))
+done
+print -rn -- "Attach to [$last], number to choose, [n]ew, [q]uit: "
+reply=""
+# Same rule as the single-session prompt: EOF quits, an empty line takes the
+# default, and a reply with no trailing newline still chooses.
+IFS= read -r reply
+[[ $? -ne 0 && -z $reply ]] && reply=q
+case ${reply:l} in
+  q|quit) exit 0 ;;
+  n|new)  new_session ;;
+  "")     attach_to "$last" ;;
+  *)
+    if [[ $reply == <-> ]] && (( reply >= 1 && reply <= ${#sessions} )); then
+      attach_to "${sessions[$reply]}"
+    fi
+    attach_to "$last"
+    ;;
+esac
