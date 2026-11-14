@@ -542,7 +542,8 @@ def pane_header(worker, kind: str, ascii_mode: bool = False) -> str:
         meta = sep.join(part for part in parts if part)
         shown = labels.clip(title, width, ellipsis)
         state_text = labels.glyph(kind, ascii_mode) + ((" " + labels.word(kind)) if word else "")
-        visible = 1 + len(state_text) + 2 + len(shown) + ((2 + len(meta)) if meta else 0) + 1
+        visible = (1 + labels.cell_width(state_text) + 2 + labels.cell_width(shown)
+                   + ((2 + labels.cell_width(meta)) if meta else 0) + 1)
         # Explicit styles throughout: inside a border, `default` is the border's
         # own style, which is deliberately dim. `terminal` is the terminal's
         # foreground, so the title reads on light and dark themes alike;

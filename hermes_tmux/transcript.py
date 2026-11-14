@@ -174,20 +174,30 @@ class Formatter:
     # -- rendering ----------------------------------------------------------
 
     def _fit(self, text: str, room: int) -> str:
-        """Clip to ``room`` columns. Never wider, and never a half-written marker.
+        """Clip to ``room`` display columns. Never wider, and never a half-written marker.
 
         The count of hidden characters is shown when it fits whole; in a pane
         too narrow for that, a bare ellipsis says the entry was clipped.
         """
         room = max(0, room)
-        if len(text) <= room:
+        if labels.cell_width(text) <= room:
             return text
-        tail = " %s(+%d chars)" % (self.ellipsis, len(text) - room)
-        if room >= len(tail) + 4:
-            return text[:room - len(tail)].rstrip() + tail
-        if room <= len(self.ellipsis):
+        ell_w = labels.cell_width(self.ellipsis)
+        # Estimate hidden char count from initial slice, then refine once so the
+        # marker's own width is accounted for cleanly.
+        rough_prefix = labels.take_cells(text, room)
+        tail = " %s(+%d chars)" % (self.ellipsis, max(1, len(text) - len(rough_prefix)))
+        tail_w = labels.cell_width(tail)
+        if room >= tail_w + 4:
+            kept = labels.take_cells(text, room - tail_w).rstrip()
+            tail = " %s(+%d chars)" % (self.ellipsis, max(1, len(text) - len(kept)))
+            while labels.cell_width(kept) + labels.cell_width(tail) > room and kept:
+                kept = kept[:-1].rstrip()
+                tail = " %s(+%d chars)" % (self.ellipsis, max(1, len(text) - len(kept)))
+            return kept + tail
+        if room <= ell_w:
             return self.ellipsis        # clipping is always marked, even with no room
-        return text[:room - len(self.ellipsis)].rstrip() + self.ellipsis
+        return labels.take_cells(text, room - ell_w).rstrip() + self.ellipsis
 
     def _line(self, ts: str, marker: str, text: str, kind: str, *codes: str,
               marker_codes: Optional[List[str]] = None, fit: bool = False) -> str:
@@ -195,7 +205,7 @@ class Formatter:
         s = self.style
         lead = (ts + "  ") if ts else ""
         if fit:
-            text = self._fit(text, self.width - _MARGIN - len(lead) - len(marker))
+            text = self._fit(text, self.width - _MARGIN - labels.cell_width(lead) - labels.cell_width(marker))
         else:
             text = _limit(text, _MAX_CHARS.get(kind, 480), self.ellipsis)
         return (s(lead, DIM) + s(marker, *(marker_codes or list(codes)))

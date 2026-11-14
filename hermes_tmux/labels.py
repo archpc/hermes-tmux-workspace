@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 #: Longest window name. The status line shows less of it when space is short.
@@ -126,21 +127,59 @@ _TRAILING = {"and", "or", "of", "the", "a", "an", "to", "for", "in", "on", "with
              "at", "by", "from", "that", "then"}
 
 
+def _char_cells(ch: str) -> int:
+    if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        return 0
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return 2
+    return 1
+
+
+def cell_width(text: str) -> int:
+    """Display columns ``text`` occupies in a monospace terminal."""
+    if not text:
+        return 0
+    if text.isascii():
+        return len(text)
+    return sum(_char_cells(ch) for ch in text)
+
+
+def take_cells(text: str, max_cells: int) -> str:
+    """Longest prefix of ``text`` occupying at most ``max_cells`` terminal columns."""
+    if max_cells <= 0 or not text:
+        return ""
+    if text.isascii():
+        return text[:max_cells]
+    used = 0
+    out = []
+    for ch in text:
+        w = _char_cells(ch)
+        if used + w > max_cells:
+            break
+        used += w
+        out.append(ch)
+    return "".join(out)
+
+
 def clip(text: str, width: int, ellipsis: str = "\u2026") -> str:
-    """Clip to ``width`` columns, at a word boundary when one is close."""
+    """Clip to ``width`` display columns, at a word boundary when one is close."""
     if width <= 0:
         return ""
-    if len(text) <= width:
+    if cell_width(text) <= width:
         return text
-    if width <= len(ellipsis):
-        return text[:width]
-    room = width - len(ellipsis)
-    cut = text.rfind(" ", 0, room + 1)
+    ell_w = cell_width(ellipsis)
+    if width <= ell_w:
+        return take_cells(text, width)
+    room = width - ell_w
+    prefix = take_cells(text, room)
+    # Include one lookahead space if the next char right after `prefix` is a space
+    next_is_space = len(text) > len(prefix) and text[len(prefix)] == " "
+    cut = len(prefix) if next_is_space else prefix.rfind(" ")
     # A boundary that throws away more than half of the room wastes the label
     # on a short stub; cut mid-word instead.
-    if cut < room // 2:
-        return text[:room].rstrip(" ,;:-") + ellipsis
-    words = text[:cut].split(" ")
+    if cut < 0 or cell_width(prefix[:cut]) < room // 2:
+        return prefix.rstrip(" ,;:-") + ellipsis
+    words = prefix[:cut].split(" ")
     # "Audit shell-startup and..." says less than "Audit shell-startup...".
     while len(words) > 1 and words[-1].lower() in _TRAILING:
         words.pop()

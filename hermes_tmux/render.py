@@ -67,19 +67,15 @@ def _clean(value: Any) -> str:
 def _clip_cell(text: str, width: int) -> str:
     if width <= 0:
         return ""
-    if len(text) > width:
-        return text[:width]
-    return text
+    return labels.take_cells(text, width)
 
 
 def _fit_line(text: str, width: int) -> str:
-    """Hard guarantee: no trailing whitespace, never longer than ``width``."""
+    """Hard guarantee: no trailing whitespace, never wider than ``width`` cells."""
     if width <= 0:
         return ""
     text = _CTRL_RE.sub(" ", text)
-    if len(text) > width:
-        text = text[:width]
-    return text.rstrip()
+    return labels.take_cells(text, width).rstrip()
 
 
 def _parse_dt(value: Any) -> Optional[datetime]:
@@ -312,16 +308,16 @@ class _Pen:
         return "\033[%sm%s\033[0m" % (";".join(codes), text)
 
     def line(self, *segments: Tuple[str, Tuple[str, ...]]) -> None:
-        """Append one line; segments are (text, codes). Clipped to the width."""
+        """Append one line; segments are (text, codes). Clipped to ``width`` cells."""
         room = self.width
-        out: List[str] = []
+        out: List[Tuple[str, Tuple[str, ...]]] = []
         plain = ""
         for text, codes in segments:
             text = _CTRL_RE.sub(" ", text)
             if room <= 0:
                 break
-            text = text[:room]
-            room -= len(text)
+            text = labels.take_cells(text, room)
+            room -= labels.cell_width(text)
             plain += text
             out.append((text, codes))
         # Trailing whitespace is dropped from the last segments so a pane never
@@ -342,13 +338,13 @@ class _Pen:
     def split(self, left: Sequence[Tuple[str, Tuple[str, ...]]],
               right: Sequence[Tuple[str, Tuple[str, ...]]]) -> None:
         """Left segments, then right segments flush against the content edge."""
-        right_len = sum(len(t) for t, _ in right)
+        right_len = sum(labels.cell_width(t) for t, _ in right)
         left_room = max(0, self.width - right_len - (2 if right_len else 0))
         fitted: List[Tuple[str, Tuple[str, ...]]] = []
         used = 0
         for text, codes in left:
-            text = text[:max(0, left_room - used)]
-            used += len(text)
+            text = labels.take_cells(text, max(0, left_room - used))
+            used += labels.cell_width(text)
             fitted.append((text, codes))
         pad = self.width - used - right_len
         self.line(*fitted, (" " * max(0, pad), ()), *right)
@@ -398,7 +394,7 @@ def _title_line(pen: _Pen, worker: Any, kind: str, tabs: Optional[Dict[str, Any]
                 glyph_colour: Optional[int] = None) -> None:
     """Glyph, task title, and whatever is pinned to the right edge."""
     right = list(right) + _tab_segment(worker, tabs, bool(right))
-    room = pen.width - 4 - sum(len(t) for t, _ in right) - (2 if right else 0)
+    room = pen.width - 4 - sum(labels.cell_width(t) for t, _ in right) - (2 if right else 0)
     colour = labels.colour(kind) if glyph_colour is None else glyph_colour
     pen.split([("  ", ()), (labels.glyph(kind, ascii_mode) + " ", (_fg(colour),)),
                (_fit(labels.title(getattr(worker, "goal", "")), room, ascii_mode), title_codes)],
@@ -420,7 +416,7 @@ def _running_rows(pen: _Pen, worker: Any, now: datetime,
         parts.append("%d tool%s" % (tools, "" if tools == 1 else "s") if tools else "starting")
     left: List[Tuple[str, Tuple[str, ...]]] = [("    " + _meta(parts, ascii_mode), (_fg(244),))]
     key = _key_label(worker) if wide else ""
-    room = pen.width - len(left[0][0]) - len(sep) - (len(key) + 2 if key else 0)
+    room = pen.width - labels.cell_width(left[0][0]) - labels.cell_width(sep) - (labels.cell_width(key) + 2 if key else 0)
     call = _clean(getattr(worker, "last_call", None)) or _clean(getattr(worker, "last_tool", None))
     if kind == "stall":
         activity = _activity_at(worker)
@@ -485,7 +481,7 @@ def _recent_rows(pen: _Pen, worker: Any, now: datetime, tabs: Optional[Dict[str,
     # task instead of a table entry.
     said = _excerpt(getattr(worker, "summary", None) or getattr(worker, "last_message", None))
     key = _key_label(worker) if pen.width >= 90 else ""
-    room = pen.width - sum(len(t) for t, _ in left) - len(sep) - (len(key) + 2 if key else 0)
+    room = pen.width - sum(labels.cell_width(t) for t, _ in left) - labels.cell_width(sep) - (labels.cell_width(key) + 2 if key else 0)
     if said and room >= 16:
         left.append((sep, (_fg(243),)))
         left.append((_fit(said, room, ascii_mode), (_fg(246),)))
