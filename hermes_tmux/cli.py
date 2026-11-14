@@ -198,7 +198,9 @@ def cmd_up(args) -> int:
 @contextlib.contextmanager
 def _server_lock():
     digest = tmuxio.session_key(session_id="x").split("-", 1)[0]
-    srv_lock = Path(tempfile.gettempdir()) / ("hx-srv-%d-%s.lock" % (os.getuid(), digest))
+    sock_raw = (os.environ.get("TMUX") or "").split(",", 1)[0]
+    lock_dir = Path(sock_raw).parent if sock_raw and Path(sock_raw).parent.is_dir() else Path(tempfile.gettempdir())
+    srv_lock = lock_dir / ("hx-srv-%d-%s.lock" % (os.getuid(), digest))
     root = watch.state_root()     # beside sessions/, whose entries are all session directories
     root.mkdir(parents=True, exist_ok=True)
     with open(str(srv_lock), "a+") as srv_handle, open(str(root / "up.lock"), "a+") as handle:
@@ -849,8 +851,21 @@ def cmd_close_mark(args) -> int:
     from . import labels
     rc, all_wids = tmuxio.run("list-windows", "-a", "-F", "#{window_id}")
     cand_wids = [w.strip() for w in all_wids.splitlines() if w.strip()] if rc == 0 else []
-    windows = [wid for wid in cand_wids
-               if tmuxio.owns_window(wid) and _tab_of_window(wid)[2]]
+    owned_wids = [wid for wid in cand_wids if tmuxio.owns_window(wid)]
+    from .state import hermes_home
+    homes: List[Path] = [hermes_home()]
+    for wid in owned_wids:
+        wh = _window_home(wid)
+        if wh is not None and wh not in homes:
+            homes.append(wh)
+    tab_wids = {
+        tab.get("window")
+        for h in homes
+        for key in _server_keys(h)
+        for tab in (watch.read_layout(key, h).get("tabs") or {}).values()
+        if isinstance(tab, dict) and tab.get("window")
+    }
+    windows = [wid for wid in owned_wids if wid in tab_wids]
     if args.action == "status":
         marked = sum(1 for wid in windows if closemark.has_mark(closemark._own_format(wid)))
         print("hermes-tmux: close mark binding %s; %d of %d worker tab(s) marked"

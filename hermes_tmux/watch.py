@@ -1001,9 +1001,22 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
     lock_file = None
     try:
         lock_file = open(lock_path(key, home), "a+")
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        locked = False
+        # Retry briefly so a microsecond `coordinator_alive` / `_lock_held`
+        # probe cannot cause a newly launched coordinator to exit at startup.
+        for attempt in range(5):
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except (OSError, IOError):
+                if attempt < 4:
+                    time.sleep(0.02)
+        if not locked:
+            lock_file.close()
+            return 0  # another coordinator genuinely owns this session
     except (OSError, IOError):
-        return 0  # another watcher already owns this session
+        return 0
 
     pid_path(key, home).write_text(str(os.getpid()), encoding="utf-8")
     # `down` stops this process with SIGTERM. Leaving through the normal exit
@@ -1030,6 +1043,7 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
     base = hermes_home(home)
     watcher = WatchSet()
     last_pass_mono = 0.0
+    last_full_pass_mono = 0.0
     last_liveness_mono = time.monotonic()
     workers: List = []
     last_db_rows: Optional[Dict] = None
@@ -1042,6 +1056,7 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
     try:
         while True:
             last_pass_mono = time.monotonic()
+            last_full_pass_mono = last_pass_mono
             # Reconcile BEFORE blocking. The first pass must run immediately:
             # `up` starts this process after writing the layout, and a delegation
             # that already existed raised no vnode event, so waiting first would
@@ -1101,9 +1116,11 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
                             db_only_fds.add(watcher.dirs[p_str])
                         if p_str in watcher.files:
                             db_only_fds.add(watcher.files[p_str])
+                    max_skip = _TICK_S if (pending or running) else _SESSION_CHECK_S
                     if (
                         last_db_rows is not None
                         and live_root(home).is_dir()
+                        and (time.monotonic() - last_full_pass_mono) < max_skip
                         and watcher.fired_fds
                         and watcher.fired_fds.issubset(db_only_fds)
                         and db_delegations(home) == last_db_rows
