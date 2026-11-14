@@ -14,6 +14,7 @@ Ground rules for this module:
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -171,17 +172,49 @@ def _parse_event_line(line: str) -> Optional[Dict[str, str]]:
         return None
 
 
+_STAT_CACHE_MAX = 512
+_LOG_CACHE: Dict[str, Tuple[Tuple[int, int, int, int], Dict[str, Any]]] = {}
+_MANIFEST_CACHE: Dict[str, Tuple[Tuple[int, int, int, int], Dict[str, Any]]] = {}
+
+
+def _stat_sig(path: Path) -> Optional[Tuple[int, int, int, int]]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _copy_log(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(parsed)
+    out["events"] = list(parsed.get("events") or [])
+    return out
+
+
 def parse_log(path: Path) -> Dict[str, Any]:
-    """Parse a task transcript.
+    """Parse a task transcript, cached by ``(st_dev, st_ino, st_size, st_mtime_ns)``.
 
     The first six lines are a fixed header and the rest are event lines. Lines
     that are malformed (no pipe, bad timestamp) are skipped, never fatal. A
     partially written final line is skipped the same way, so reading while the
-    writer appends is safe.
+    writer appends is safe. Finished transcripts on disk never change, so
+    keying by stat metadata avoids re-reading megabytes of historical logs on
+    unrelated SQLite WAL wakeups while immediately invalidating on any append
+    or atomic file replacement.
     """
+    p = Path(path)
+    key = str(p)
+    sig = _stat_sig(p)
+    if sig is None:
+        _LOG_CACHE.pop(key, None)
+        return _empty_log()
+    cached = _LOG_CACHE.get(key)
+    if cached is not None and cached[0] == sig:
+        return _copy_log(cached[1])
+
     result = _empty_log()
     try:
-        raw = Path(path).read_text(encoding="utf-8", errors="replace")
+        raw = p.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return result
 
@@ -195,7 +228,10 @@ def parse_log(path: Path) -> Dict[str, Any]:
         events.append(event)
 
     if not events:
-        return result
+        if len(_LOG_CACHE) >= _STAT_CACHE_MAX and key not in _LOG_CACHE:
+            _LOG_CACHE.pop(next(iter(_LOG_CACHE)), None)
+        _LOG_CACHE[key] = (sig, result)
+        return _copy_log(result)
 
     result["phase"] = events[-1]["role"]
     result["first_ts"] = events[0]["ts"]
@@ -251,7 +287,10 @@ def parse_log(path: Path) -> Dict[str, Any]:
     result["summary"] = summary
     result["has_final"] = has_final
     result["duration_s"] = duration
-    return result
+    if len(_LOG_CACHE) >= _STAT_CACHE_MAX and key not in _LOG_CACHE:
+        _LOG_CACHE.pop(next(iter(_LOG_CACHE)), None)
+    _LOG_CACHE[key] = (sig, result)
+    return _copy_log(result)
 
 
 # --------------------------------------------------------------------------
@@ -259,21 +298,55 @@ def parse_log(path: Path) -> Dict[str, Any]:
 
 
 def read_manifest(path: Path) -> Dict[str, Any]:
-    """Read one manifest. Returns ``{}`` for missing, truncated, or invalid files."""
+    """Read one manifest (stat-cached). Returns ``{}`` for missing or invalid files."""
+    p = Path(path)
+    key = str(p)
+    sig = _stat_sig(p)
+    if sig is None:
+        _MANIFEST_CACHE.pop(key, None)
+        return {}
+    cached = _MANIFEST_CACHE.get(key)
+    if cached is not None and cached[0] == sig:
+        return copy.deepcopy(cached[1])
     try:
-        with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
+        with p.open("r", encoding="utf-8", errors="replace") as handle:
             data = json.load(handle)
     except Exception:
         return {}
     if not isinstance(data, dict):
         return {}
-    return data
+    if len(_MANIFEST_CACHE) >= _STAT_CACHE_MAX and key not in _MANIFEST_CACHE:
+        _MANIFEST_CACHE.pop(next(iter(_MANIFEST_CACHE)), None)
+    _MANIFEST_CACHE[key] = (sig, data)
+    return copy.deepcopy(data)
+
+
+def _manifest_has_live_task(manifest: Dict[str, Any]) -> bool:
+    """True when any task in ``manifest`` may still be active.
+
+    Keeps long-running delegations from being evicted out of ``load_manifests``
+    when more than ``limit`` short-lived delegations start after them.
+    """
+    tasks = manifest.get("tasks")
+    if isinstance(tasks, list) and tasks:
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            status = task.get("status")
+            if status is None or (isinstance(status, str) and not status.strip()):
+                if not manifest.get("completed"):
+                    return True
+                continue
+            if isinstance(status, str) and status.strip().lower() in NON_TERMINAL_DB_STATES:
+                return True
+        return False
+    return not bool(manifest.get("completed"))
 
 
 def load_manifests(
     home: Optional[Path] = None, limit: int = 40
 ) -> List[Tuple[Path, Dict[str, Any]]]:
-    """Load ``(manifest_path, manifest)`` pairs, newest first."""
+    """Load ``(manifest_path, manifest)`` pairs, active first then newest first."""
     root = live_root(home)
     found: List[Tuple[Path, Dict[str, Any]]] = []
     try:
@@ -308,6 +381,7 @@ def load_manifests(
         return (started, did)
 
     found.sort(key=sort_key, reverse=True)
+    found.sort(key=lambda item: 0 if _manifest_has_live_task(item[1]) else 1)
     try:
         cap = int(limit)
     except (TypeError, ValueError):
@@ -486,18 +560,132 @@ class Worker:
     last_message: Optional[str] = None
 
 
+def _db_row_for_task(
+    db_rows: Dict[str, Dict[str, Any]], delegation_id: str, task_index: int
+) -> Optional[Dict[str, Any]]:
+    """Find the ``async_delegations`` row governing ``(delegation_id, task_index)``.
+
+    Under ``delegation.independent_completions``, Hermes dispatches one DB unit
+    per task under ``<delegation_id>-<k>`` with ``task_json.task_indexes`` naming
+    the covered task index(es), while ``manifest.json`` stays keyed by the base
+    ``delegation_id``. Check suffixed unit rows first, then the batch row.
+    """
+    prefix = delegation_id + "-"
+    for key, row in db_rows.items():
+        if not key.startswith(prefix):
+            continue
+        raw_task = row.get("task_json")
+        if isinstance(raw_task, str) and raw_task.strip():
+            try:
+                payload = json.loads(raw_task)
+            except (TypeError, ValueError):
+                payload = None
+            if isinstance(payload, dict):
+                indexes = payload.get("task_indexes")
+                if isinstance(indexes, list):
+                    for item in indexes:
+                        try:
+                            if int(item) == task_index:
+                                return row
+                        except (TypeError, ValueError):
+                            continue
+                    continue
+        if delegation_id not in db_rows:
+            suffix = key[len(prefix):]
+            try:
+                if int(suffix) - 1 == task_index:
+                    return row
+            except ValueError:
+                continue
+    return db_rows.get(delegation_id)
+
+
+def _db_task_verdict(
+    db_row: Optional[Dict[str, Any]], task_index: int, unit_task_count: int
+) -> Tuple[Optional[str], Optional[str]]:
+    """Extract per-task ``(status, exit_reason)`` from ``db_row['result_json']``."""
+    if not db_row:
+        return (None, None)
+    raw = db_row.get("result_json")
+    if not isinstance(raw, str) or not raw.strip():
+        return (None, None)
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return (None, None)
+    if not isinstance(payload, dict):
+        return (None, None)
+    results = payload.get("results")
+    if isinstance(results, list):
+        chosen: Optional[Dict[str, Any]] = None
+        for entry in results:
+            if not isinstance(entry, dict):
+                continue
+            raw_idx = entry.get("task_index")
+            if raw_idx is None:
+                continue
+            try:
+                if int(raw_idx) == task_index:
+                    chosen = entry
+                    break
+            except (TypeError, ValueError):
+                continue
+        if chosen is None and 0 <= task_index < len(results):
+            cand = results[task_index]
+            if isinstance(cand, dict) and "task_index" not in cand:
+                chosen = cand
+        if chosen is not None:
+            st = chosen.get("status")
+            er = chosen.get("exit_reason")
+            return (
+                st.strip() if isinstance(st, str) and st.strip() else None,
+                er.strip() if isinstance(er, str) and er.strip() else None,
+            )
+    if unit_task_count <= 1:
+        st = payload.get("status")
+        er = payload.get("exit_reason")
+        return (
+            st.strip() if isinstance(st, str) and st.strip() else None,
+            er.strip() if isinstance(er, str) and er.strip() else None,
+        )
+    return (None, None)
+
+
 def _resolve_state(
     db_row: Optional[Dict[str, Any]],
     manifest_status: Any,
     log_exists: bool,
     log: Dict[str, Any],
+    *,
+    task_db_status: Optional[str] = None,
+    unit_task_count: int = 1,
 ) -> str:
-    """Apply the documented precedence: db terminal > manifest > running > unknown."""
+    """Resolve worker state: per-task DB verdict > batch DB verdict > manifest > running > unknown.
+
+    In multi-task batches, Hermes sets ``async_delegations.state = 'completed'``
+    when the batch finishes delivering mixed per-task outcomes, recording each
+    subagent's real verdict in ``result_json.results`` and ``manifest.json``.
+    A batch-level ``completed`` must therefore never mask a per-task terminal
+    failure/interruption in ``manifest_status``, whereas non-success batch DB
+    verdicts (``failed``, ``unknown`` from crash recovery, ``interrupted``)
+    still override stale ``running`` manifests.
+    """
+    if isinstance(task_db_status, str) and task_db_status.strip():
+        if task_db_status.strip().lower() not in NON_TERMINAL_DB_STATES:
+            return task_db_status.strip()
     if db_row:
         db_state = db_row.get("state")
         if isinstance(db_state, str) and db_state.strip():
             lowered = db_state.strip().lower()
             if lowered not in NON_TERMINAL_DB_STATES:
+                if (
+                    unit_task_count > 1
+                    and lowered == "completed"
+                    and isinstance(manifest_status, str)
+                    and manifest_status.strip()
+                    and manifest_status.strip().lower() not in NON_TERMINAL_DB_STATES
+                ):
+                    return manifest_status.strip()
                 return db_state.strip()
     if isinstance(manifest_status, str) and manifest_status.strip():
         return manifest_status.strip()
@@ -646,13 +834,14 @@ def _workers_for_manifest(
     if not isinstance(manifest_model, str):
         manifest_model = None
 
-    db_row = db_rows.get(delegation_id)
-    transcripts = _task_transcripts(db_row)
+    base_db_row = db_rows.get(delegation_id)
+    base_transcripts = _task_transcripts(base_db_row)
     is_reviewer = is_reviewer_delegation(reviews, delegation_id)
 
     tasks = manifest.get("tasks")
     if not isinstance(tasks, list):
         tasks = []
+    manifest_task_count = max(len(tasks), 1)
 
     workers: List[Worker] = []
     for position, task in enumerate(tasks):
@@ -663,6 +852,13 @@ def _workers_for_manifest(
             index = int(index_value)
         except (TypeError, ValueError):
             index = position
+
+        task_db_row = _db_row_for_task(db_rows, delegation_id, index)
+        transcripts = dict(base_transcripts)
+        if task_db_row is not base_db_row:
+            transcripts.update(_task_transcripts(task_db_row))
+        unit_count = 1 if (task_db_row is not None and task_db_row is not base_db_row) else manifest_task_count
+        task_db_status, task_db_exit = _db_task_verdict(task_db_row, index, unit_count)
 
         goal = task.get("goal")
         goal = goal if isinstance(goal, str) else ""
@@ -679,11 +875,14 @@ def _workers_for_manifest(
                 log = parse_log(log_path)
 
         status = task.get("status")
-        state = _resolve_state(db_row, status, log_exists, log)
+        state = _resolve_state(
+            task_db_row, status, log_exists, log,
+            task_db_status=task_db_status, unit_task_count=unit_count,
+        )
 
         exit_reason = task.get("exit_reason")
-        if not isinstance(exit_reason, str):
-            exit_reason = None
+        if not isinstance(exit_reason, str) or not exit_reason:
+            exit_reason = task_db_exit if isinstance(task_db_exit, str) else None
 
         model = task.get("model")
         if not isinstance(model, str) or not model:

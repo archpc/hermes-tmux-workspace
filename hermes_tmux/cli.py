@@ -398,7 +398,8 @@ def cmd_status(args) -> int:
     from . import state as state_mod
     from .state import live_root
 
-    workers = state_mod.load_workers()
+    show_all = bool(getattr(args, "all", False))
+    workers = state_mod.load_workers(limit=-1 if show_all else 40)
     if args.json:
         rows = []
         for w in workers:
@@ -421,7 +422,7 @@ def cmd_status(args) -> int:
         workers, width=width, live_root=str(live_root()), colour=colour_enabled(),
         tabs=watch.tab_indexes(layout), seen=watch.seen_keys(layout),
         since=layout.get("created"), ascii_mode=labels.ascii_only(),
-        recent_rows=len(workers) if getattr(args, "all", False) else render_mod.RECENT_ROWS)
+        recent_rows=len(workers) if show_all else render_mod.RECENT_ROWS)
     print(text)
     if not gate.enabled():
         print()
@@ -430,6 +431,17 @@ def cmd_status(args) -> int:
 
 
 def cmd_rerender(args) -> int:
+    if not tmuxio.in_tmux():
+        from . import labels
+        from . import render as render_mod
+        from . import state as state_mod
+        from .transcript import colour_enabled
+        text = render_mod.render(
+            state_mod.load_workers(), width=110,
+            live_root=str(state_mod.live_root()),
+            colour=colour_enabled(), ascii_mode=labels.ascii_only())
+        print(text)
+        return 0
     key = tmuxio.session_key()
     layout = watch.read_layout(key)
     text = watch.render_and_publish(key, session_label=layout.get("session_name") or "")
@@ -643,7 +655,8 @@ def cmd_open(args) -> int:
     from . import labels
     from .state import load_workers
     ref = args.ref.replace("deleg_", "")
-    matches = [w for w in load_workers()
+    all_workers = load_workers(limit=-1)
+    matches = [w for w in all_workers
                if ref in ("%s#%s" % (w.delegation_id[-8:], w.task_index))
                or ref == w.delegation_id[-8:]]
     if not matches:
@@ -668,7 +681,7 @@ def cmd_open(args) -> int:
     window_id = tmuxio.new_window(
         session_id,
         tmuxio.free_window_name(session_id, labels.tab_label(
-            worker.goal, [w.goal for w in load_workers()
+            worker.goal, [w.goal for w in all_workers
                           if w.delegation_id == worker.delegation_id and w.key != worker.key],
             ascii_mode=ascii_mode)),
         cwd=str(Path.home()), command=watch.tail_command(worker.log_path), env=_pane_env())
@@ -947,7 +960,7 @@ def cmd_review(args) -> int:
     from .state import load_workers
 
     def _find_worker():
-        for candidate in load_workers():
+        for candidate in load_workers(limit=-1):
             if candidate.delegation_id != args.delegation:
                 continue
             if args.task < 0 or candidate.task_index == args.task:
