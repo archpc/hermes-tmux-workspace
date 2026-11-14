@@ -24,6 +24,9 @@ Capture conditions, so a reader can tell what a shot proves and what it does not
   reproducible.
 - Text that looks truncated (`…`) is truncated by the renderer or by tmux on
   purpose; it is not cropping in the screenshot.
+- Captures `01`–`05` were recorded during the v3 redesign prior to commit
+  `3f29699` (`closemark.py`), so worker tabs in `02` and `03` do not yet show
+  the trailing `×` close mark, and `05` has `agents*` active in view.
 
 The case study in `docs/case-study/` uses a larger set from the same sessions,
 including the version-2 layout for comparison:

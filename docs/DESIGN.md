@@ -67,7 +67,8 @@ Why this and not the alternatives:
 - **Not `tmux capture-pane` scraping.** Fragile against reflow, colors, and user input.
   S1 is structured.
 - **The transcript file as the only per-worker source.** A worker pane follows the
-  real file (kqueue on the vnode, no polling) and prints each event once. The styled
+  real file (kqueue on the vnode with a 2 s bounded safety wait for rotation/pane
+  liveness) and prints each event once. The styled
   follower changes presentation only (section 5); `HERMES_TMUX_TRANSCRIPT=raw` puts
   plain `tail -F` back.
 - **kqueue for the overview.** stdlib, event-driven, no daemon dependency, no `fswatch`.
@@ -257,11 +258,11 @@ cannot hide live work; a pane the reader moved into another window with
 nominates recorded window ids and keeps the state directory while a
 coordinator still holds the lock.
 
-Known limits, accepted: widths are counted in characters, so double-width text
-in a goal can overrun an overview line by a few columns; if the kernel watch on
-a transcript cannot be set up, a `think` preview is shown as well as the message
-it previews; with several clients of different sizes attached, tmux sizes each
-window for the client that used it last.
+Known limits, accepted: emoji variation-selector clusters are measured by East
+Asian / combining code-point width rather than full grapheme-cluster shaping; if
+the kernel watch on a transcript cannot be set up, a `think` preview is shown as
+well as the message it previews; with several clients of different sizes
+attached, tmux sizes each window for the client that used it last.
 
 ## 6. Close mark on the tab in view
 

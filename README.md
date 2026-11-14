@@ -22,8 +22,10 @@ mockup. Provenance and what each one is meant to show is in
 [docs/shots/README.md](docs/shots/README.md).
 
 **The tab bar.** Worker tabs carry one stable name and a state glyph. The
-`agents` badge counts running workers and unseen failures, and the tab in view
-shows a clickable `×` that closes the view, never the worker.
+`agents` badge counts running workers and unseen failures; when a worker tab is
+in view, it shows a clickable `×` that closes the view, never the worker (in
+`05-tab-bar.png` below, `agents` is the active window and the capture predates
+the `×` mark; see [docs/shots/README.md](docs/shots/README.md)).
 
 ![Tab bar with worker tabs and the agents badge](docs/shots/05-tab-bar.png)
 
@@ -200,7 +202,7 @@ All four are created lazily on first use and reused afterwards.
 |---|---|
 | worker id, task goal, model | `<HERMES_HOME>/cache/delegation/live/<deleg_id>/manifest.json` |
 | tool activity, thinking, assistant text, final summary | `.../task-<n>.log` (append-only, written live by Hermes) |
-| terminal state, exit reason, tokens/cost | `state.db` table `async_delegations` |
+| terminal state, exit reason, transcript path map | `state.db` table `async_delegations` (`state`, `result_json`, `task_json`) |
 | review status | `cache/hermes-tmux/reviews.json` — written by `review run` or `review record` |
 
 Review status is never inferred. A worker whose goal mentions "review" is still
@@ -239,7 +241,7 @@ python3 -m unittest tests.test_render tests.test_labels tests.test_transcript te
 |---|---|
 | `hermes-tmux` | launcher; a symlink to it on `PATH` is the whole install |
 | `hermes_tmux/` | the package: `cli`, `gate`, `env`, `state`, `render`, `labels`, `transcript`, `watch`, `tmuxio`, `closemark` |
-| `tests/` | 333 tests: pure unit tests plus an integration suite on private tmux servers |
+| `tests/` | 352 tests: pure unit tests plus an integration suite on private tmux servers |
 | `docs/DESIGN.md` | architecture decision record, rejected alternatives, defect log |
 | `docs/NOTES-tmux.md` | tmux and macOS mechanics the layout depends on |
 | `docs/shots/` | the product shots used above, with provenance |
