@@ -91,7 +91,7 @@ hermes-tmux worker 2      # focus the 2nd worker tab
 hermes-tmux open 427f4b2c#1   # open the transcript of any worker, old ones too
 hermes-tmux close         # close the worker tab you are in (the view, never the worker)
 hermes-tmux close-mark off    # remove the clickable × and restore the click binding (on | off | status)
-hermes-tmux logs          # open/focus hx:logs   (also: tests debug rea)
+hermes-tmux logs          # open/focus hx:logs   (also: tests debug rea mail)
 hermes-tmux debug-report  # windows, panes, ownership flags, watcher pid
 hermes-tmux down          # close only panes this tool created; a window that
                           # also holds one of your panes is left standing
