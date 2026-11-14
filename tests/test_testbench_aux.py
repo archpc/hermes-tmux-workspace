@@ -29,7 +29,8 @@ def _installed_testbench() -> Path | None:
 @unittest.skipUnless(shutil.which("tmux"), "tmux unavailable")
 class PermanentTestBenchTabTests(unittest.TestCase):
     def setUp(self):
-        scratch = Path.home() / ".hermes/cache/scratch"
+        import pwd
+        scratch = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".hermes/cache/scratch"
         scratch.mkdir(parents=True, exist_ok=True)
         self.tmp = tempfile.TemporaryDirectory(dir=str(scratch), prefix="hxtb-")
         self.root = Path(self.tmp.name)
