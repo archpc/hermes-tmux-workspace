@@ -526,9 +526,8 @@ def _aux_command(role: str, shell: str, run: bool = False) -> Tuple[str, str]:
 
     if role == "mail":
         return str(home), (
-            "if [ -n \"${HXMAIL_BIN:-}\" ] && [ -x \"${HXMAIL_BIN}\" ]; then exec \"${HXMAIL_BIN}\"; "
+            "if [ -x \"$HOME/.local/bin/hxmail\" ]; then exec \"$HOME/.local/bin/hxmail\"; "
             "elif command -v hxmail >/dev/null 2>&1; then exec hxmail; "
-            "elif [ -x \"$HOME/.local/bin/hxmail\" ]; then exec \"$HOME/.local/bin/hxmail\"; "
             "else printf '%s\\n' 'hxmail binary not installed yet (expected ~/.local/bin/hxmail)'; exec " + shell + "; fi")
 
     # role == "rea": show what is actually installed, then a shell.

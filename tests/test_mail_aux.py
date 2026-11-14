@@ -14,7 +14,14 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 TMUX = shutil.which("tmux") or "tmux"
 PY = sys.executable or "/usr/bin/python3"
-HXMAIL_RELEASE = Path("/Users/sein/.hermes/artifacts/hermes-terminal-env/worktrees/impl/target/release/hxmail")
+
+
+def _installed_hxmail() -> Path | None:
+    cand = Path.home() / ".local/bin/hxmail"
+    if cand.is_file() and os.access(str(cand), os.X_OK):
+        return cand
+    found = shutil.which("hxmail")
+    return Path(found) if found else None
 
 
 @unittest.skipUnless(shutil.which("tmux"), "tmux unavailable")
@@ -61,8 +68,6 @@ class MailAuxWindowTests(unittest.TestCase):
         env["PYTHONPATH"] = str(REPO)
         env["HXMAIL_DB"] = str(self.root / "mail.db")
         env["HXMAIL_LOCAL_DIR"] = str(self.root / "local")
-        if HXMAIL_RELEASE.is_file():
-            env["HXMAIL_BIN"] = str(HXMAIL_RELEASE)
         return env
 
     def _cli(self, *args: str, pane: str = "") -> subprocess.CompletedProcess:
@@ -109,8 +114,8 @@ class MailAuxWindowTests(unittest.TestCase):
         self.assertIn(self.user_win, [wid for wid, _ in self._windows()])
         mail_wid = wins1["hx:mail"]
 
-        # If real hxmail binary is present, wait briefly and confirm TUI rendered inside tmux pane!
-        if HXMAIL_RELEASE.is_file():
+        # If ~/.local/bin/hxmail is installed, wait briefly and confirm TUI rendered inside tmux pane!
+        if _installed_hxmail() is not None:
             deadline = time.time() + 5.0
             captured = ""
             while time.time() < deadline:
