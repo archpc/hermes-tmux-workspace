@@ -383,7 +383,7 @@ def run_tail(path: str, follow: bool = True) -> int:
                     if not follow:
                         _emit(fmt.flush())
                         return 0
-                    watcher.sync([], [Path(path)])
+                    watcher.sync([Path(path).parent], [Path(path)])
                     watcher.wait(_POLL_S)
                     continue
                 offset += len(chunk)
@@ -404,7 +404,8 @@ def run_tail(path: str, follow: bool = True) -> int:
                 tail = fmt.feed(pending.decode("utf-8", "replace")) if pending.strip() else []
                 _emit(tail + fmt.flush())
                 return 0
-            watcher.sync([], [path])
+            p_obj = Path(path)
+            watcher.sync([p_obj.parent] if p_obj.parent.is_dir() else [], [p_obj])
             # Nothing new within one wait: a held line was not a preview.
             if not watcher.wait(_POLL_S) and not _emit(fmt.flush()):
                 return 0

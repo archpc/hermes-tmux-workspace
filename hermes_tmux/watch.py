@@ -1,25 +1,24 @@
-"""Event-driven watcher and pane display for the tmux workspace.
+"""Event-driven coordinator and overview display for the tmux workspace.
 
 Two long-lived processes, both children of the tmux server (so they survive
 detach/reattach):
 
 ``watch``
-    One per tmux session. Holds a kqueue over the delegation live root,
-    re-renders the overview on filesystem events, keeps the per-worker
-    ``tail -F`` panes pointed at the right task logs, and badges the window
-    name. Never reads a file unless the kernel reported a change.
+    One per workspace (keyed by ``@hx_key`` on the overview window). Holds a
+    kqueue over ``state.db``/``state.db-wal``, ``reviews.json``, ``live/``
+    directories, manifests, and active transcripts; reconciles worker tabs,
+    badges the overview tab, and publishes ``render.txt``. Bursts are coalesced
+    and throttled to ``_MIN_RENDER_INTERVAL_S`` (1 Hz), while unchanged
+    manifests and historical transcripts are stat-cached in memory.
 
 ``follow``
-    One per overview pane. Composes the block itself (at the pane's own width,
-    from the same records) and redraws on live-root changes, with a bounded wait
-    so a dead coordinator degrades to periodic re-reads rather than a frozen
-    pane. ``render.txt`` is still written per session for ``status`` and the
-    watcher, but the pane no longer depends on it.
-
-Neither process polls for data. The only timed wake is one scheduled wake per
-minute while any worker is running, used solely to advance the display-only
-"stalled" label in ``render.render()`` from already-loaded records; it performs
-no filesystem or database reads.
+    One per ``agents`` overview pane. Redraws immediately on ``SIGWINCH`` or
+    when ``render.txt`` / ``layout.json`` / active delegation files change.
+    While the coordinator holds ``watch.lock``, ``follow`` relies on the
+    coordinator to observe ``state.db-wal`` so unrelated parent chat writes do
+    not wake the pane; if the coordinator is absent, ``follow`` watches
+    ``state.db`` directly and degrades gracefully on bounded timer wakes
+    (``_FOLLOW_RUNNING_WAKE_S`` while work is running, ``_FOLLOW_WAKE_S`` idle).
 """
 
 from __future__ import annotations
@@ -113,6 +112,31 @@ def lock_path(key: str, home: Optional[Path] = None) -> Path:
     return session_dir(key, home) / "watch.lock"
 
 
+def coordinator_alive(key: str, home: Optional[Path] = None) -> bool:
+    """True when a coordinator currently holds the advisory flock on ``watch.lock``."""
+    lp = lock_path(key, home)
+    if not lp.is_file():
+        return False
+    fd = -1
+    try:
+        fd = os.open(str(lp), os.O_RDONLY)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, IOError) as exc:
+        return exc.errno in (errno.EACCES, errno.EAGAIN)
+    else:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except (OSError, IOError):
+            pass
+        return False
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def atomic_write(path: Path, text: str) -> bool:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -184,6 +208,10 @@ class WatchSet:
         self.kq = select.kqueue()
         self.dirs: Dict[str, int] = {}
         self.files: Dict[str, int] = {}
+        self._dir_inos: Dict[str, Tuple[int, int]] = {}
+        self._file_inos: Dict[str, Tuple[int, int]] = {}
+        self.signal_woke: bool = False
+        self.fired_fds: set = set()
 
     def close(self) -> None:
         for fd in list(self.dirs.values()) + list(self.files.values()):
@@ -193,6 +221,8 @@ class WatchSet:
                 pass
         self.dirs.clear()
         self.files.clear()
+        self._dir_inos.clear()
+        self._file_inos.clear()
         for fd in getattr(self, "_wake_fds", ()):
             try:
                 os.close(fd)
@@ -216,18 +246,35 @@ class WatchSet:
         except OSError:
             pass
 
+    @staticmethod
+    def _path_ino(path: str) -> Optional[Tuple[int, int]]:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        return (st.st_dev, st.st_ino)
+
     def sync(self, dirs: Sequence[Path], files: Sequence[Path]) -> None:
-        want_dirs = {str(p) for p in dirs}
-        want_files = {str(p) for p in files}
+        # Preserve caller priority order (dict.fromkeys) so critical singleton
+        # files at the head of `files` (state.db, state.db-wal, reviews.json)
+        # are never dropped when len(files) exceeds _MAX_WATCH_FILES.
+        want_dirs = list(dict.fromkeys(str(p) for p in dirs))
+        want_files = list(dict.fromkeys(str(p) for p in files))
+        want_dir_set = set(want_dirs)
+        want_file_set = set(want_files)
 
         for path in list(self.dirs):
-            if path not in want_dirs:
+            cur_ino = self._path_ino(path) if path in want_dir_set else None
+            if path not in want_dir_set or cur_ino is None or cur_ino != self._dir_inos.get(path):
+                self._dir_inos.pop(path, None)
                 try:
                     os.close(self.dirs.pop(path))
                 except OSError:
                     pass
         for path in list(self.files):
-            if path not in want_files:
+            cur_ino = self._path_ino(path) if path in want_file_set else None
+            if path not in want_file_set or cur_ino is None or cur_ino != self._file_inos.get(path):
+                self._file_inos.pop(path, None)
                 try:
                     os.close(self.files.pop(path))
                 except OSError:
@@ -238,18 +285,22 @@ class WatchSet:
                 continue
             try:
                 fd = os.open(path, os.O_RDONLY)
+                st = os.fstat(fd)
             except OSError:
                 continue
             self.dirs[path] = fd
+            self._dir_inos[path] = (st.st_dev, st.st_ino)
             self._add(fd)
         for path in want_files:
             if path in self.files or len(self.files) >= _MAX_WATCH_FILES:
                 continue
             try:
                 fd = os.open(path, os.O_RDONLY)
+                st = os.fstat(fd)
             except OSError:
                 continue
             self.files[path] = fd
+            self._file_inos[path] = (st.st_dev, st.st_ino)
             self._add(fd)
 
     def wake_on_signal(self, signum: int) -> None:
@@ -272,87 +323,115 @@ class WatchSet:
         except (OSError, ValueError, AttributeError):
             self._wake_fd = None
 
-    def _drain_wake(self) -> None:
+    def _drain_wake(self) -> bool:
         fd = getattr(self, "_wake_fd", None)
         if fd is None:
-            return
+            return False
+        got = False
         try:
             while os.read(fd, 512):
-                pass
+                got = True
         except OSError:
             pass
+        return got
+
+    def clear_fired(self) -> None:
+        self.fired_fds.clear()
 
     def wait(self, timeout: Optional[float]) -> int:
+        self.signal_woke = False
         try:
             events = self.kq.control(None, 64, timeout)
         except OSError as exc:
             if exc.errno == errno.EINTR:
+                self.signal_woke = self._drain_wake()
                 return 0
             return 0
-        self._drain_wake()
+        for ev in events:
+            self.fired_fds.add(ev.ident)
+        self.signal_woke = self._drain_wake()
         return len(events)
 
-    def drain(self, quiet_for: float = _DEBOUNCE_S) -> None:
-        """Coalesce a burst of events (one append can raise two) into one render."""
-        deadline = time.time() + 2.0
-        while time.time() < deadline:
+    def drain(self, quiet_for: float = _DEBOUNCE_S, max_wait: float = 0.35) -> None:
+        """Coalesce a short burst of events into one render."""
+        deadline = time.monotonic() + max_wait
+        while time.monotonic() < deadline:
             if not self.wait(quiet_for):
                 return
 
 
-def collect_paths(home: Optional[Path] = None) -> Tuple[List[Path], List[Path]]:
-    """Directories and files whose changes mean "state changed"."""
-    from .state import hermes_home, live_root
+def collect_paths(
+    home: Optional[Path] = None, *, include_db: bool = True
+) -> Tuple[List[Path], List[Path]]:
+    """Directories and files whose changes mean "state changed".
+
+    Returned ``files`` are ordered by priority so ``WatchSet._MAX_WATCH_FILES``
+    always retains ``state.db``/``state.db-wal``, ``reviews.json``, manifests,
+    and active transcripts. Transcripts of already-completed delegations are
+    not opened in kqueue: they are immutable once settled, and opening 150+
+    historical log files per process wastes descriptors.
+    """
+    from .state import _manifest_has_live_task, hermes_home, live_root, read_manifest
+    base = hermes_home(home)
     root = live_root(home)
     dirs: List[Path] = []
     files: List[Path] = []
-    # On a fresh profile the live root does not exist yet. Its nearest existing
-    # ancestors are watched so the first delegation ever made is noticed when
-    # its directories appear, not on the slow fallback wake.
-    for ancestor in (root.parent.parent, root.parent):
-        if ancestor.is_dir() and not root.is_dir():
-            dirs.append(ancestor)
-    if root.is_dir():
-        dirs.append(root)
-        try:
-            children = sorted(root.iterdir(), key=lambda p: p.name, reverse=True)[:40]
-        except OSError:
-            children = []
-        for child in children:
-            if not child.is_dir():
-                continue
-            dirs.append(child)
-            try:
-                for entry in child.iterdir():
-                    # The manifest is rewritten in place when a task changes
-                    # state. Watching the directory alone does not see that: a
-                    # kqueue vnode on a directory fires for create/delete, not
-                    # for a write to a child, so the overview used to lag a
-                    # lifecycle change by the whole session-check interval.
-                    if entry.suffix == ".log" or entry.name == "manifest.json":
-                        files.append(entry)
-            except OSError:
-                continue
-    reviews = hermes_home(home) / "cache" / STATE_DIR_NAME
+
+    if include_db:
+        if base.is_dir():
+            dirs.append(base)
+        db = base / "state.db"
+        for suffix in ("", "-wal"):
+            candidate = Path(str(db) + suffix)
+            if candidate.exists():
+                files.append(candidate)
+
+    reviews = base / "cache" / STATE_DIR_NAME
     if reviews.is_dir():
         dirs.append(reviews)
         candidate = reviews / "reviews.json"
         if candidate.exists():
             files.append(candidate)
-    # Terminal state and token/cost data live in state.db, not in the manifest.
-    # Without a watch on the database a task that finishes only there kept its
-    # old "running" row until an unrelated transcript event happened to fire.
-    # The WAL is where SQLite writes first; both are heap files, so a vnode
-    # watch is enough and no polling is needed. The home directory is watched
-    # too so creating state.db (first run, first delegation) raises an event.
-    base = hermes_home(home)
-    if base.is_dir():
-        dirs.append(base)
-    db = base / "state.db"
-    for suffix in ("", "-wal"):
-        candidate = Path(str(db) + suffix)
-        if candidate.exists():
-            files.append(candidate)
+
+    for ancestor in (root.parent.parent, root.parent):
+        if ancestor.is_dir() and not root.is_dir():
+            dirs.append(ancestor)
+
+    manifests: List[Path] = []
+    active_logs: List[Path] = []
+    if root.is_dir():
+        dirs.append(root)
+        try:
+            all_children = [c for c in root.iterdir() if c.is_dir()]
+        except OSError:
+            all_children = []
+        # Keep any live delegation dir even if >40 newer completed dirs exist,
+        # plus the 40 newest dirs by name.
+        all_children.sort(key=lambda p: p.name, reverse=True)
+        selected: List[Path] = []
+        seen_dirs = set()
+        for child in all_children:
+            mp = child / "manifest.json"
+            is_live = (not mp.is_file()) or _manifest_has_live_task(read_manifest(mp))
+            if is_live or len(selected) < 40:
+                selected.append(child)
+                seen_dirs.add(str(child))
+        for child in selected:
+            dirs.append(child)
+            mp = child / "manifest.json"
+            is_live = True
+            if mp.is_file():
+                manifests.append(mp)
+                is_live = _manifest_has_live_task(read_manifest(mp))
+            if is_live:
+                try:
+                    for entry in child.iterdir():
+                        if entry.suffix == ".log":
+                            active_logs.append(entry)
+                except OSError:
+                    continue
+    files.extend(manifests)
+    files.extend(active_logs)
     return dirs, files
 
 
@@ -656,7 +735,7 @@ def reconcile_tabs(key: str, workers: Sequence, home: Optional[Path] = None,
             dismissed[wkey] = now
 
     # 2. Looking at a tab acknowledges it and restarts its linger clock.
-    active = _windows_in_view(session_id)
+    active = _windows_in_view(session_id) if tabs else set()
     for wkey, tab in tabs.items():
         if tab.get("window") in active:
             tab["seen"] = now
@@ -861,11 +940,12 @@ def load_view(key: str, home: Optional[Path] = None) -> Tuple[List, str, Dict]:
 
 def compose(key: str, home: Optional[Path] = None, session_label: str = "",
             width: int = 110, height: Optional[int] = None,
-            colour: bool = False) -> str:
+            colour: bool = False, *,
+            preloaded: Optional[Tuple[Sequence, str, Dict]] = None) -> str:
     """The overview text for this session at the given size."""
     from . import render as render_mod
     from .state import live_root
-    workers, note, layout = load_view(key, home)
+    workers, note, layout = preloaded if preloaded is not None else load_view(key, home)
     try:
         return render_mod.render(
             workers, width=width, height=height, session_label=session_label,
@@ -879,9 +959,10 @@ def compose(key: str, home: Optional[Path] = None, session_label: str = "",
 
 
 def render_and_publish(key: str, home: Optional[Path] = None,
-                       session_label: str = "") -> str:
+                       session_label: str = "", *,
+                       preloaded: Optional[Tuple[Sequence, str, Dict]] = None) -> str:
     """Write the plain overview to render.txt; the pane redraws when it changes."""
-    text = compose(key, home, session_label)
+    text = compose(key, home, session_label, preloaded=preloaded)
     current = ""
     try:
         current = render_path(key, home).read_text(encoding="utf-8")
@@ -933,29 +1014,22 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
     layout = read_layout(key, home)
     session_label = layout.get("session_name") or tmuxio.current_session_name() or ""
 
+    from .state import db_delegations, hermes_home, live_root
+    base = hermes_home(home)
     watcher = WatchSet()
-    last_pass = 0.0
+    last_pass_mono = 0.0
+    last_liveness_mono = time.monotonic()
     workers: List = []
+    last_db_rows: Optional[Dict] = None
+    note = ""
     reload_state = True
-    last_reload = time.time()
+    last_reload_mono = time.monotonic()
     dirs: List[Path] = []
     files: List[Path] = []
     badge = ""
     try:
         while True:
-            # state.db-wal fires on every Hermes write. Cap the pass rate so a
-            # busy session cannot turn the coordinator into a re-read loop; the
-            # first pass is never delayed.
-            if last_pass:
-                remaining = _MIN_RENDER_INTERVAL_S - (time.time() - last_pass)
-                if remaining > 0:
-                    watcher.wait(min(remaining, _SESSION_CHECK_S))
-                    live_pid = tmuxio.server_pid()
-                    if owner_pid and live_pid and live_pid != owner_pid:
-                        return 0
-                    if not tmuxio.session_alive(layout.get("session_id") or ""):
-                        return 0
-            last_pass = time.time()
+            last_pass_mono = time.monotonic()
             # Reconcile BEFORE blocking. The first pass must run immediately:
             # `up` starts this process after writing the layout, and a delegation
             # that already existed raised no vnode event, so waiting first would
@@ -963,44 +1037,88 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
             if reload_state:
                 dirs, files = collect_paths(home)
                 watcher.sync(dirs, files)
+                note = ""
                 try:
                     from . import state as state_mod
+                    last_db_rows = db_delegations(home)
                     workers = state_mod.load_workers(home)
-                except Exception:
+                except Exception as exc:
                     workers = []
+                    note = "state reader failed: %s" % (exc,)
             # A timer wake reuses the loaded records: it exists to notice which
             # tab is in view and to retire finished tabs, not to re-read state.
             layout = reconcile_tabs(key, workers, home)
-            render_and_publish(key, home, session_label)
+            render_and_publish(key, home, session_label, preloaded=(workers, note, layout))
             window_id = layout.get("workers_window")
             # Decorating is a write to someone else's window if that id names a
-            # foreign window on a new server.
-            if window_id and tmuxio.owns_window(window_id):
+            # foreign window on a new server; check `want != badge` first so an
+            # unchanged overview issues zero tmux subprocesses.
+            if window_id:
                 want = overview_glyph(workers, layout, bool(layout.get("ascii")))
-                if want != badge and tmuxio.window_option(window_id, "@hx_glyph", want):
-                    badge = want
+                if want != badge and tmuxio.owns_window(window_id):
+                    if tmuxio.window_option(window_id, "@hx_glyph", want):
+                        badge = want
 
-            pending = any("settled" in tab for tab in (layout.get("tabs") or {}).values()
-                          if isinstance(tab, dict))
-            running = any(getattr(w, "state", "") == "running" for w in workers)
-            fired = watcher.wait(_TICK_S if (pending or running) else _SESSION_CHECK_S)
-            live_pid = tmuxio.server_pid()
-            if owner_pid and live_pid and live_pid != owner_pid:
-                return 0          # a different server now answers this socket
-            if not tmuxio.session_alive(layout.get("session_id") or ""):
-                return 0          # the session this coordinator serves is gone
-            if fired:
-                # Any event means state may have changed, including a new
-                # delegation directory that no watched file knows about yet.
-                watcher.drain()
-                reload_state = True
-            else:
-                # Nothing changed on disk. Re-read on the slow cadence only, so
-                # the display-only "no output" label can still advance.
-                reload_state = not (pending or running) or \
-                    time.time() - last_reload >= _SESSION_CHECK_S
-            if reload_state:
-                last_reload = time.time()
+            while True:
+                watcher.clear_fired()
+                pending = any("settled" in tab for tab in (layout.get("tabs") or {}).values()
+                              if isinstance(tab, dict))
+                running = any(getattr(w, "state", "") == "running" for w in workers)
+                fired = watcher.wait(_TICK_S if (pending or running) else _SESSION_CHECK_S)
+                if fired:
+                    rem = _MIN_RENDER_INTERVAL_S - (time.monotonic() - last_pass_mono)
+                    if rem > 0:
+                        while True:
+                            rem = _MIN_RENDER_INTERVAL_S - (time.monotonic() - last_pass_mono)
+                            if rem <= 0:
+                                break
+                            time.sleep(min(rem, 0.25))
+                        watcher.wait(0)
+                    else:
+                        watcher.drain()
+                    last_pass_mono = time.monotonic()
+
+                    # Fast-path: parent Hermes writes to `messages`/`sessions` in
+                    # state.db-wal many times per second while chatting. When ONLY
+                    # home/state.db/state.db-wal fds fired (and live_root already
+                    # exists as its own watched dir) and `async_delegations` rows
+                    # are unchanged, skip full worker reload and tmux subprocesses.
+                    db_only_fds = set()
+                    for p_str in (str(base), str(base / "state.db"), str(base / "state.db-wal")):
+                        if p_str in watcher.dirs:
+                            db_only_fds.add(watcher.dirs[p_str])
+                        if p_str in watcher.files:
+                            db_only_fds.add(watcher.files[p_str])
+                    if (
+                        last_db_rows is not None
+                        and live_root(home).is_dir()
+                        and watcher.fired_fds
+                        and watcher.fired_fds.issubset(db_only_fds)
+                        and db_delegations(home) == last_db_rows
+                    ):
+                        if time.monotonic() - last_liveness_mono >= _TICK_S:
+                            last_liveness_mono = time.monotonic()
+                            live_pid = tmuxio.server_pid()
+                            if owner_pid and live_pid and live_pid != owner_pid:
+                                return 0
+                            if not tmuxio.session_alive(layout.get("session_id") or ""):
+                                return 0
+                        continue
+                    reload_state = True
+                else:
+                    # Nothing changed on disk. Re-read on the slow cadence only, so
+                    # the display-only "no output" label can still advance.
+                    reload_state = not (pending or running) or \
+                        time.monotonic() - last_reload_mono >= _SESSION_CHECK_S
+                last_liveness_mono = time.monotonic()
+                live_pid = tmuxio.server_pid()
+                if owner_pid and live_pid and live_pid != owner_pid:
+                    return 0          # a different server now answers this socket
+                if not tmuxio.session_alive(layout.get("session_id") or ""):
+                    return 0          # the session this coordinator serves is gone
+                if reload_state:
+                    last_reload_mono = time.monotonic()
+                break
     except KeyboardInterrupt:
         return 0
     finally:
@@ -1023,8 +1141,8 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
 
 # --------------------------------------------------------------------------- follow
 
-def _draw(text: str, pane_id: str) -> None:
-    width, height = tmuxio.pane_size(pane_id)
+def _draw(text: str, pane_id: str, size: Optional[Tuple[int, int]] = None) -> None:
+    width, height = size if size is not None else tmuxio.pane_size(pane_id)
     lines = text.splitlines()
     if len(lines) > height:
         lines = lines[:height]
@@ -1046,14 +1164,16 @@ def _draw(text: str, pane_id: str) -> None:
 
 
 def compose_for_pane(home: Optional[Path] = None, session_label: str = "",
-                     pane_id: str = "", key: str = "") -> str:
+                     pane_id: str = "", key: str = "", *,
+                     size: Optional[Tuple[int, int]] = None) -> str:
     """Render the overview at this pane's size, in colour when it can show it.
 
     The pane is the only consumer that knows its own size; ``render.txt`` stays
     the shared plain copy and doubles as the coordinator's redraw signal.
     """
     from .transcript import colour_enabled
-    width, height = tmuxio.pane_size(pane_id) if pane_id else (110, None)
+    width, height = (size if size is not None
+                     else (tmuxio.pane_size(pane_id) if pane_id else (110, None)))
     return compose(key, home, session_label, width=width, height=height,
                    colour=bool(pane_id) and colour_enabled())
 
@@ -1077,26 +1197,39 @@ def run_follow(home: Optional[Path] = None, key: Optional[str] = None) -> int:
         restore = quiet_tty()
     # A resized pane is redrawn at its new size at once, not on the next wake.
     watcher.wake_on_signal(signal.SIGWINCH)
+    last_drawn: Optional[Tuple[str, int, int]] = None
+    last_pass_mono = 0.0
     try:
         while True:
-            # A pane-side loop outlives its server when the server is killed
-            # outright (no `down` to close panes): tmux does not always deliver
-            # SIGHUP, so without this the process keeps redrawing into a dead
-            # pane forever. One cheap check per wake, and the loop is cheap.
             if pane_id and not tmuxio.pane_exists(pane_id):
                 return 0
-            text = compose_for_pane(home, session_label, pane_id, key)
-            if pane_id:
-                _draw(text, pane_id)
-            dirs, files = collect_paths(home)
+            last_pass_mono = time.monotonic()
+            size = tmuxio.pane_size(pane_id) if pane_id else None
+            text = compose_for_pane(home, session_label, pane_id, key, size=size)
+            if pane_id and size is not None:
+                frame_sig = (text, size[0], size[1])
+                if frame_sig != last_drawn:
+                    _draw(text, pane_id, size=size)
+                    last_drawn = frame_sig
+            # While the coordinator holds watch.lock, it already watches
+            # state.db-wal and rewrites render.txt whenever DB state changes;
+            # skipping direct DB watch in follow avoids waking on every parent
+            # chat write. If the coordinator dies, follow watches state.db itself.
+            coord_up = coordinator_alive(key, home)
+            dirs, files = collect_paths(home, include_db=not coord_up)
             watcher.sync([target.parent] + dirs, [target] + files)
-            # A bounded wait, not None: if the coordinator dies, no vnode event
-            # will ever arrive, and a blocking wait would freeze this pane at the
-            # last state it saw. One recompose a minute keeps the display honest
-            # (it re-reads the real artifacts, it does not poll for progress).
-            # Elapsed times are the one thing that changes without an event.
-            watcher.wait(_FOLLOW_RUNNING_WAKE_S if "RUNNING" in text else _FOLLOW_WAKE_S)
-            watcher.drain(quiet_for=0.05)
+            fired = watcher.wait(_FOLLOW_RUNNING_WAKE_S if "RUNNING" in text else _FOLLOW_WAKE_S)
+            if watcher.signal_woke:
+                last_drawn = None  # SIGWINCH: force immediate redraw at new size
+                continue
+            if fired:
+                if not coord_up:
+                    rem = _MIN_RENDER_INTERVAL_S - (time.monotonic() - last_pass_mono)
+                    if rem > 0:
+                        time.sleep(rem)
+                        watcher.wait(0)
+                        continue
+                watcher.drain(quiet_for=0.05, max_wait=0.25)
     except KeyboardInterrupt:
         return 0
     finally:

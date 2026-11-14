@@ -187,7 +187,7 @@ def _stat_sig(path: Path) -> Optional[Tuple[int, int, int, int]]:
 
 def _copy_log(parsed: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(parsed)
-    out["events"] = list(parsed.get("events") or [])
+    out["events"] = []
     return out
 
 
@@ -218,7 +218,7 @@ def parse_log(path: Path) -> Dict[str, Any]:
     except Exception:
         return result
 
-    events: List[Dict[str, str]] = result["events"]
+    events: List[Dict[str, str]] = []
     for line in raw.splitlines():
         if not line.strip():
             continue
