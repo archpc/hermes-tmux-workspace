@@ -1076,6 +1076,8 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
             # tab is in view and to retire finished tabs, not to re-read state.
             layout = reconcile_tabs(key, workers, home)
             # Keep permanent `hx:mail` and (when enabled) `hx:testbench` alive across crashes without stealing focus.
+            # Re-verify server ownership before mutating layout/windows so a coordinator racing
+            # `kill-server` + server restart never creates windows on the new server or rewrites old layout.json.
             mail_wid = ((layout.get("aux") or {}).get("mail")) or ""
             mail_sid = layout.get("session_id") or ""
             if mail_sid and (
@@ -1083,10 +1085,16 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
                 or not tmuxio.window_exists(mail_wid)
                 or not any(p["ours"] for p in tmuxio.list_panes(mail_wid))
             ):
+                live_srv = tmuxio.server_pid()
+                if owner_pid and live_srv != owner_pid:
+                    return 0
+                if not tmuxio.session_alive(mail_sid):
+                    return 0
                 from . import cli as cli_mod
                 restored_wid, _ = cli_mod.ensure_aux_window(
                     key, mail_sid, "mail", focus=False,
                     after_window=layout.get("workers_window"), home=home,
+                    owner_pid=owner_pid,
                 )
                 if restored_wid:
                     layout.setdefault("aux", {})["mail"] = restored_wid
@@ -1098,9 +1106,15 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
                 or not tmuxio.window_exists(tb_wid)
                 or not any(p["ours"] for p in tmuxio.list_panes(tb_wid))
             ):
+                live_srv = tmuxio.server_pid()
+                if owner_pid and live_srv != owner_pid:
+                    return 0
+                if not tmuxio.session_alive(mail_sid):
+                    return 0
                 restored_tb, _ = cli_mod_tb.ensure_aux_window(
                     key, mail_sid, "testbench", focus=False,
                     after_window=mail_wid or layout.get("workers_window"), home=home,
+                    owner_pid=owner_pid,
                 )
                 if restored_tb:
                     layout.setdefault("aux", {})["testbench"] = restored_tb

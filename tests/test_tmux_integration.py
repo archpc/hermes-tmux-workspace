@@ -787,10 +787,15 @@ class IntegrationTest(unittest.TestCase):
                     for tab in (layout.get("tabs") or {}).values():
                         self.assertEqual(len(box.panes_of(tab["window"])), 1,
                                          "a worker tab holds more than one pane")
-                    # One window per running worker, plus `agents`, `hx:mail`, and `hx:testbench`.
-                    self.assertEqual(len(box.own_windows()), count + 3,
+                    # One window per running worker, plus the configured permanent workspace windows.
+                    from hermes_tmux import cli as _cli
+                    static_tabs = [AGENTS, "hx:mail"] + (
+                        ["hx:testbench"] if _cli.testbench_tab_enabled() else []
+                    )
+                    expected_owned = count + len(static_tabs)
+                    self.assertEqual(len(box.own_windows()), expected_owned,
                                      "%d workers must own %d windows, got %r"
-                                     % (count, count + 3,
+                                     % (count, expected_owned,
                                         [w["name"] for w in box.own_windows()]))
                     overview = box.window(AGENTS)
                     self.assertIsNotNone(overview)

@@ -44,6 +44,8 @@ SOCKET = "hx_ab_%d" % os.getpid()
 CONFIG = "/dev/null"
 AGENTS = "agents"
 MAIL = "hx:mail"
+TESTBENCH = "hx:testbench"
+PERMANENT_TABS = (AGENTS, MAIL, TESTBENCH)
 BOOTSTRAP = "hx:bootstrap"
 
 
@@ -240,13 +242,12 @@ class AttachBootstrap(unittest.TestCase):
         """Wait until the bootstrap produced the whole workspace."""
         def ready():
             agents = _named(session, AGENTS)
-            mail = _named(session, MAIL)
-            if not agents or not mail:
+            if not agents or agents[0][2] != "1" or not agents[0][3]:
                 return False
-            if agents[0][2] != "1" or not agents[0][3]:
-                return False
-            if mail[0][2] != "1":
-                return False
+            for tab in PERMANENT_TABS:
+                found = _named(session, tab)
+                if not found or found[0][2] != "1":
+                    return False
             return _alive(_coordinator_pid(agents[0][3], home or self.home))
         return _wait_for(ready)
 
@@ -262,11 +263,11 @@ class AttachBootstrap(unittest.TestCase):
 
     def assert_clean_workspace(self, session, expect_shell=True):
         names = [w[1] for w in _windows(session)]
-        self.assertEqual(1, names.count(AGENTS), "duplicate agents window")
-        self.assertEqual(1, names.count(MAIL), "duplicate hx:mail window")
+        for tab in PERMANENT_TABS:
+            self.assertEqual(1, names.count(tab), "duplicate or missing %s window: %r" % (tab, names))
         self.assert_no_bootstrap_window(session)
-        self.assertEqual(expect_shell, "zsh" in names or any(
-            w[1] not in (AGENTS, MAIL) for w in _windows(session)))
+        non_workspace = [w for w in _windows(session) if w[1] not in PERMANENT_TABS]
+        self.assertEqual(expect_shell, bool(non_workspace))
 
     # ---------------- tests ----------------
 
@@ -277,8 +278,10 @@ class AttachBootstrap(unittest.TestCase):
         self.assertIn("main", _sessions())
         self.assertTrue(self.build_ready(), "workspace incomplete after fresh create")
         self.assert_clean_workspace("main")
-        # The shell pane the new session was created with survives.
-        self.assertEqual(3, len(_windows("main")))
+        # The single shell pane the new session was created with survives alongside the permanent tabs.
+        non_workspace = [w for w in _windows("main") if w[1] not in PERMANENT_TABS]
+        self.assertEqual(1, len(non_workspace),
+                         "expected 1 initial shell window alongside permanent tabs, got: %r" % _windows("main"))
 
     def test_02_reattach_healthy_is_a_no_op(self):
         self.run_hook()
@@ -371,8 +374,8 @@ class AttachBootstrap(unittest.TestCase):
         self.assertIn("main", _sessions())
         time.sleep(1.5)
         names = [w[1] for w in _windows("main")]
-        self.assertNotIn(AGENTS, names)
-        self.assertNotIn(MAIL, names)
+        for tab in PERMANENT_TABS:
+            self.assertNotIn(tab, names)
         self.assertEqual([], self.bootstrap_logs("main"))
 
     def test_09_server_restart_rebuilds_from_scratch(self):

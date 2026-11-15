@@ -571,6 +571,7 @@ def ensure_aux_window(
     run: bool = False,
     after_window: Optional[str] = None,
     home: Optional[Path] = None,
+    owner_pid: Optional[str] = None,
 ) -> Tuple[Optional[str], str]:
     """Ensure ``hx:<role>`` exists with one owned pane; focus only when asked.
 
@@ -604,6 +605,9 @@ def ensure_aux_window(
         if not is_def and "TESTBENCH_HOME" not in os.environ:
             p_env["TESTBENCH_HOME"] = str(home / "cache" / "testbench")
 
+    if owner_pid and tmuxio.server_pid() != owner_pid:
+        return None, "stale_server"
+
     status = "existing"
     if wid is not None:
         panes = tmuxio.list_panes(wid)
@@ -613,6 +617,8 @@ def ensure_aux_window(
             tmuxio.respawn(ours[0]["pane_id"], run_cmd)
             status = "running"
         elif not ours:
+            if owner_pid and tmuxio.server_pid() != owner_pid:
+                return None, "stale_server"
             _cwd, cmd = _aux_command(role, shell, run=run)
             rebuilt = tmuxio.split_window(wid, cmd, horizontal=False, env=p_env)
             if not rebuilt:
@@ -622,6 +628,8 @@ def ensure_aux_window(
     else:
         if not session_id:
             return None, "failed"
+        if owner_pid and tmuxio.server_pid() != owner_pid:
+            return None, "stale_server"
         cwd, cmd = _aux_command(role, shell, run=run)
         wid = tmuxio.new_window(
             session_id,
@@ -633,8 +641,16 @@ def ensure_aux_window(
         )
         if not wid:
             return None, "failed"
+        if owner_pid and tmuxio.server_pid() != owner_pid:
+            # Raced server replacement on the same socket: remove only if ours and leave old layout untouched.
+            if tmuxio.owns_window(wid):
+                tmuxio.run("kill-window", "-t", wid)
+            return None, "stale_server"
         tmuxio.window_option(wid, "pane-border-status", "off")
         status = "opened"
+
+    if owner_pid and tmuxio.server_pid() != owner_pid:
+        return None, "stale_server"
 
     if ((layout.get("aux") or {}).get(role)) != wid:
         def _record(current):
