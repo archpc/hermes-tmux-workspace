@@ -30,7 +30,8 @@ def _installed_testbench() -> Path | None:
 class PermanentTestBenchTabTests(unittest.TestCase):
     def setUp(self):
         import pwd
-        scratch = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".hermes/cache/scratch"
+        tb_sc = os.environ.get("TESTBENCH_SCRATCH_DIR", "").strip()
+        scratch = Path(tb_sc) if tb_sc else (Path(pwd.getpwuid(os.getuid()).pw_dir) / ".hermes/cache/scratch")
         scratch.mkdir(parents=True, exist_ok=True)
         self.tmp = tempfile.TemporaryDirectory(dir=str(scratch), prefix="hxtb-")
         self.root = Path(self.tmp.name)
