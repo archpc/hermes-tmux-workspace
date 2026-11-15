@@ -4,6 +4,7 @@ active-only log watching, and run_watch throttle enforcement.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
@@ -30,10 +31,60 @@ def _watch_fd_capacity() -> int:
     return max(0, soft - used)
 
 
+@contextlib.contextmanager
+def no_live_tmux(tmux_tmpdir: Path):
+    """Point bare ``tmux`` calls at a private, empty socket directory.
+
+    ``tmuxio`` shells out to ``tmux`` with no ``-S``/``-L``, so the target is
+    whatever $TMUX names, else $TMUX_TMPDIR/tmux-<uid>/default. A fixture that
+    lets the real ``reconcile_tabs`` run must sever both, or it operates on the
+    developer's live workspace.
+    """
+    keys = ("TMUX", "TMUX_PANE", "TMUX_TMPDIR")
+    saved = {k: os.environ.get(k) for k in keys}
+    os.environ.pop("TMUX", None)
+    os.environ.pop("TMUX_PANE", None)
+    Path(tmux_tmpdir).mkdir(parents=True, exist_ok=True)
+    os.environ["TMUX_TMPDIR"] = str(tmux_tmpdir)
+    try:
+        yield
+    finally:
+        for k, value in saved.items():
+            if value is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = value
+
+
+def run_mocked_coordinator(
+    home: Path,
+    key: str,
+    *,
+    session_alive,
+    counting_reconcile,
+    tmux_tmpdir: Path,
+):
+    """Run one coordinator loop with tmux mocked, fenced off any live server.
+
+    ``reconcile_tabs`` keeps its real implementation: the tests measure how
+    often it runs. That means the only thing standing between the test and the
+    developer's tmux server is ``no_live_tmux`` and the two patches below.
+    """
+    with mock.patch.dict(os.environ, {"HERMES_TMUX": "1"}), \
+         no_live_tmux(tmux_tmpdir), \
+         mock.patch.object(watch.tmuxio, "server_pid", return_value="123"), \
+         mock.patch.object(watch.tmuxio, "session_alive", side_effect=session_alive), \
+         mock.patch.object(watch, "reconcile_tabs", side_effect=counting_reconcile), \
+         mock.patch.object(cli, "ensure_aux_window", return_value=(None, "")), \
+         mock.patch.object(cli, "testbench_tab_enabled", return_value=False):
+        return watch.run_watch(home=home, key=key)
+
+
 class WatchSetAndPerfRegressions(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="hx_c2c3_")
         self.base = Path(self._tmp.name)
+        self.tmux_tmp = self.base / "tmux"
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -191,13 +242,9 @@ class WatchSetAndPerfRegressions(unittest.TestCase):
 
         writer = threading.Thread(target=spam_log, daemon=True)
         writer.start()
-        with mock.patch.dict(os.environ, {"HERMES_TMUX": "1"}), \
-             mock.patch.object(watch.tmuxio, "server_pid", return_value="123"), \
-             mock.patch.object(watch.tmuxio, "session_alive", side_effect=fake_session_alive), \
-             mock.patch.object(watch, "reconcile_tabs", side_effect=counting_reconcile), \
-             mock.patch.object(cli, "ensure_aux_window", return_value=(None, "")), \
-             mock.patch.object(cli, "testbench_tab_enabled", return_value=False):
-            watch.run_watch(home=home, key=key)
+        run_mocked_coordinator(home, key, session_alive=fake_session_alive,
+                               counting_reconcile=counting_reconcile,
+                               tmux_tmpdir=self.tmux_tmp)
         writer.join(timeout=2)
 
         self.assertGreaterEqual(len(passes), 1, "coordinator never reconciled")
@@ -259,13 +306,9 @@ class WatchSetAndPerfRegressions(unittest.TestCase):
             # HERMES_TMUX is forced on: the gate is orthogonal to WAL
             # reconciliation, and TestBench's isolation sets HERMES_TMUX=0,
             # which would make run_watch return before the first pass.
-            with mock.patch.dict(os.environ, {"HERMES_TMUX": "1"}), \
-                 mock.patch.object(watch.tmuxio, "server_pid", return_value="123"), \
-                 mock.patch.object(watch.tmuxio, "session_alive", side_effect=fake_session_alive), \
-                 mock.patch.object(watch, "reconcile_tabs", side_effect=counting_reconcile), \
-                 mock.patch.object(cli, "ensure_aux_window", return_value=(None, "")), \
-                 mock.patch.object(cli, "testbench_tab_enabled", return_value=False):
-                watch.run_watch(home=home, key=key)
+            run_mocked_coordinator(home, key, session_alive=fake_session_alive,
+                                   counting_reconcile=counting_reconcile,
+                                   tmux_tmpdir=self.tmux_tmp)
         finally:
             t.join(timeout=2)
             con.close()
