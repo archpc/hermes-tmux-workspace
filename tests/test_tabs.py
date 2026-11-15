@@ -473,7 +473,7 @@ class TabsTest(unittest.TestCase):
         with Sandbox() as box:
             win = self._up(box)
             ours = [w for w in box.windows() if w["ours"]]
-            self.assertEqual([w["name"] for w in ours], ["agents", "hx:mail"],
+            self.assertEqual([w["name"] for w in ours], ["agents", "hx:mail", "hx:testbench"],
                              "up owns unexpected static windows: %r"
                              % [w["name"] for w in ours])
             panes = box.panes_of(win["id"])

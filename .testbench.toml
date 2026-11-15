@@ -1,0 +1,29 @@
+[project]
+name = "hermes-tmux-workspace"
+languages = ["python"]
+
+[[suite]]
+name = "fast-unit"
+adapter = "python_unittest"
+profile = "unit"
+command = ["/Users/sein/.local/bin/python3.14", "-W", "default", "-m", "unittest", "tests.test_render", "tests.test_labels", "tests.test_transcript", "tests.test_tab_merge", "-v"]
+timeout_s = 60.0
+description = "Sub-second pure renderer, label, transcript, and tab-merge unit tests (no tmux server)"
+
+[[suite]]
+name = "permanent-aux-and-tabs"
+adapter = "python_unittest"
+profile = "terminal"
+command = ["/Users/sein/.local/bin/python3.14", "-W", "default", "-m", "unittest", "tests.test_testbench_aux", "tests.test_mail_aux", "tests.test_tabs", "tests.test_close_mark", "-v"]
+timeout_s = 180.0
+needs_tmux = true
+description = "Isolated tmux server lifecycle tests for hx:testbench, hx:mail, worker tabs, and close mark"
+
+[[suite]]
+name = "full-tmux-regression"
+adapter = "python_unittest"
+profile = "regression"
+command = ["/Users/sein/.local/bin/python3.14", "-W", "default", "-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v"]
+timeout_s = 360.0
+needs_tmux = true
+description = "Complete hermes-tmux-workspace suite on isolated tmux sockets"

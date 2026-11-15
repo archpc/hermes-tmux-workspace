@@ -1075,7 +1075,7 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
             # A timer wake reuses the loaded records: it exists to notice which
             # tab is in view and to retire finished tabs, not to re-read state.
             layout = reconcile_tabs(key, workers, home)
-            # Keep permanent `hx:mail` alive across crashes without stealing focus.
+            # Keep permanent `hx:mail` and (when enabled) `hx:testbench` alive across crashes without stealing focus.
             mail_wid = ((layout.get("aux") or {}).get("mail")) or ""
             mail_sid = layout.get("session_id") or ""
             if mail_sid and (
@@ -1090,6 +1090,20 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
                 )
                 if restored_wid:
                     layout.setdefault("aux", {})["mail"] = restored_wid
+                    mail_wid = restored_wid
+            from . import cli as cli_mod_tb
+            tb_wid = ((layout.get("aux") or {}).get("testbench")) or ""
+            if mail_sid and cli_mod_tb.testbench_tab_enabled() and (
+                not tb_wid
+                or not tmuxio.window_exists(tb_wid)
+                or not any(p["ours"] for p in tmuxio.list_panes(tb_wid))
+            ):
+                restored_tb, _ = cli_mod_tb.ensure_aux_window(
+                    key, mail_sid, "testbench", focus=False,
+                    after_window=mail_wid or layout.get("workers_window"), home=home,
+                )
+                if restored_tb:
+                    layout.setdefault("aux", {})["testbench"] = restored_tb
             render_and_publish(key, home, session_label, preloaded=(workers, note, layout))
             window_id = layout.get("workers_window")
             # Decorating is a write to someone else's window if that id names a
