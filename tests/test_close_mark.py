@@ -211,6 +211,7 @@ class CloseMarkTest(unittest.TestCase):
                 #    is ours.
                 text = _status_text(box)
                 self.assertEqual(text.count(closemark.MARK), 1, "status: %r" % text)
+                windows_before_close = len(box.windows())
                 start = text.index("click me")
                 for column in range(start, start + len("click me") + 8):
                     client.click(column)
@@ -218,7 +219,7 @@ class CloseMarkTest(unittest.TestCase):
                         break
                 self.assertFalse(T._window_exists(tab["window"]),
                                  "no click on or after the name closed the tab (status: %r)" % text)
-                self.assertEqual(len(box.windows()), 4,
+                self.assertEqual(len(box.windows()), windows_before_close - 1,
                                  "a click closed more than the one tab: %r" % box.windows())
             finally:
                 client.close()
