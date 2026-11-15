@@ -12,7 +12,22 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from hermes_tmux import state, watch
+from hermes_tmux import cli, state, watch
+
+
+def _watch_fd_capacity() -> int:
+    """Descriptors this process can still open, used to size the watch cap."""
+    import resource
+    soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    if soft in (resource.RLIM_INFINITY, -1):
+        return watch._MAX_WATCH_FILES
+    try:
+        # The listing holds one descriptor of its own for the duration of the
+        # call, so the observed count is one higher than the steady state.
+        used = len(os.listdir("/dev/fd")) - 1
+    except OSError:
+        used = 0
+    return max(0, soft - used)
 
 
 class WatchSetAndPerfRegressions(unittest.TestCase):
@@ -54,8 +69,13 @@ class WatchSetAndPerfRegressions(unittest.TestCase):
 
     def test_watchset_sync_preserves_caller_priority_order_at_cap(self) -> None:
         """Critical singleton files passed first (state.db, state.db-wal,
-        reviews.json) must never be evicted by unordered set iteration when
-        more than _MAX_WATCH_FILES candidates are passed.
+        reviews.json) must never be evicted by unordered iteration when more
+        than _MAX_WATCH_FILES candidates are passed.
+
+        The cap is a ceiling, not a promise: when the process cannot hold
+        _MAX_WATCH_FILES descriptors (macOS soft RLIMIT_NOFILE is often 256,
+        which the kqueue FD and stdio already eat into), sync must keep the
+        caller-priority prefix and drop the tail, never an arbitrary subset.
         """
         files = []
         for idx in range(watch._MAX_WATCH_FILES + 30):
@@ -65,13 +85,19 @@ class WatchSetAndPerfRegressions(unittest.TestCase):
 
         ws = watch.WatchSet()
         try:
+            # Measured after WatchSet() so the kqueue descriptor is counted.
+            expected = min(watch._MAX_WATCH_FILES, _watch_fd_capacity())
+            if expected < 32:
+                self.skipTest("only %d descriptors available; cap cannot be exercised" % expected)
             ws.sync([], files)
-            self.assertEqual(len(ws.files), watch._MAX_WATCH_FILES)
+            self.assertEqual(len(ws.files), expected)
+            # Everything watched is exactly the caller-priority prefix
+            self.assertEqual(list(ws.files), [str(fp) for fp in files[:expected]])
             # Every one of the first 20 highest-priority files must be watched
             for fp in files[:20]:
                 self.assertIn(str(fp), ws.files)
             # Overflow tail files must be the ones left out
-            for fp in files[watch._MAX_WATCH_FILES:]:
+            for fp in files[expected:]:
                 self.assertNotIn(str(fp), ws.files)
         finally:
             ws.close()
@@ -165,12 +191,16 @@ class WatchSetAndPerfRegressions(unittest.TestCase):
 
         writer = threading.Thread(target=spam_log, daemon=True)
         writer.start()
-        with mock.patch.object(watch.tmuxio, "server_pid", return_value="123"), \
+        with mock.patch.dict(os.environ, {"HERMES_TMUX": "1"}), \
+             mock.patch.object(watch.tmuxio, "server_pid", return_value="123"), \
              mock.patch.object(watch.tmuxio, "session_alive", side_effect=fake_session_alive), \
-             mock.patch.object(watch, "reconcile_tabs", side_effect=counting_reconcile):
+             mock.patch.object(watch, "reconcile_tabs", side_effect=counting_reconcile), \
+             mock.patch.object(cli, "ensure_aux_window", return_value=(None, "")), \
+             mock.patch.object(cli, "testbench_tab_enabled", return_value=False):
             watch.run_watch(home=home, key=key)
         writer.join(timeout=2)
 
+        self.assertGreaterEqual(len(passes), 1, "coordinator never reconciled")
         self.assertLessEqual(len(passes), 3, "expected <=3 passes in 1.6s, got %d" % len(passes))
         if len(passes) >= 2:
             self.assertGreaterEqual(passes[1] - passes[0], 0.85)
@@ -226,9 +256,15 @@ class WatchSetAndPerfRegressions(unittest.TestCase):
         t = threading.Thread(target=drive_db, daemon=True)
         t.start()
         try:
-            with mock.patch.object(watch.tmuxio, "server_pid", return_value="123"), \
+            # HERMES_TMUX is forced on: the gate is orthogonal to WAL
+            # reconciliation, and TestBench's isolation sets HERMES_TMUX=0,
+            # which would make run_watch return before the first pass.
+            with mock.patch.dict(os.environ, {"HERMES_TMUX": "1"}), \
+                 mock.patch.object(watch.tmuxio, "server_pid", return_value="123"), \
                  mock.patch.object(watch.tmuxio, "session_alive", side_effect=fake_session_alive), \
-                 mock.patch.object(watch, "reconcile_tabs", side_effect=counting_reconcile):
+                 mock.patch.object(watch, "reconcile_tabs", side_effect=counting_reconcile), \
+                 mock.patch.object(cli, "ensure_aux_window", return_value=(None, "")), \
+                 mock.patch.object(cli, "testbench_tab_enabled", return_value=False):
                 watch.run_watch(home=home, key=key)
         finally:
             t.join(timeout=2)
