@@ -15,6 +15,9 @@
 #   --dry-run   print the decision, do nothing
 #   --new       force a fresh session instead of attaching
 # Opt out per shell:  export TMUX_AUTO_ATTACH=0
+#   export HERMES_TMUX=0       no workspace bootstrap for this shell
+#   TMUX_ATTACH_SOCKET=name    private server (`tmux -L name`), for tests
+#   TMUX_ATTACH_CONFIG=path    private config (`tmux -f path`), for tests
 
 emulate -L zsh
 setopt pipe_fail
@@ -57,7 +60,7 @@ pane_has_job() {   # $1 = pane_pid, $2 = pane_tty
 
 session_busy() {   # $1 = session_name
   local name=$1 line pid
-  for line in "${(@f)$($TMUX_BIN list-panes -s -t "$name" -F '#{pane_pid} #{pane_tty}' 2>/dev/null)}"; do
+  for line in "${(@f)$(tmx list-panes -s -t "$name" -F '#{pane_pid} #{pane_tty}' 2>/dev/null)}"; do
     [[ -z $line ]] && continue
     pid=${line%% *}
     if pane_has_job "$pid"; then
@@ -69,13 +72,135 @@ session_busy() {   # $1 = session_name
 
 session_label() {  # $1 = session_name -> short note for the picker
   local name=$1 cmds attached note=""
-  cmds=$($TMUX_BIN list-panes -s -t "$name" -F '#{pane_current_command}' 2>/dev/null \
+  cmds=$(tmx list-panes -s -t "$name" -F '#{pane_current_command}' 2>/dev/null \
     | grep -vxE 'zsh|bash|sh|fish|dash|login|tcsh|csh' | sort -u | paste -sd ',' -)
   [[ -n $cmds ]] && note+="cmd: $cmds; "
-  attached=$($TMUX_BIN display-message -p -t "$name" '#{session_attached}' 2>/dev/null)
+  attached=$(tmx display-message -p -t "$name" '#{session_attached}' 2>/dev/null)
   [[ -n $attached && $attached != 0 ]] && note+="${attached} client(s); "
   session_busy "$name" && note+="job detected; "
   print -r -- "${note%; }"
+}
+
+# ---------------- workspace bootstrap -----------------------------------------
+# A recreated session holds one pane and nothing else; `agents` and the permanent
+# hx:mail tab are built by `hermes-tmux up`, which needs a real pane context
+# (TMUX_PANE) to know which session and socket it is serving. So the workspace is
+# built by a short-lived detached pane inside the target session and socket,
+# running the tool itself: no initialization logic is duplicated here. The pane
+# exits when `up` returns and tmux closes its window; `-d` never selects it, so
+# the user's window selection and an already attached client never move.
+#
+# Unset TMUX_ATTACH_SOCKET/CONFIG keeps the old behaviour exactly: tmux resolves
+# $TMUX or the default socket. A test passes a private `-L` socket so this script
+# can never reach the user's server.
+
+TMUX_ARGS=()
+[[ -n ${TMUX_ATTACH_SOCKET:-} ]] && TMUX_ARGS+=(-L "$TMUX_ATTACH_SOCKET")
+[[ -n ${TMUX_ATTACH_CONFIG:-} ]] && TMUX_ARGS+=(-f "$TMUX_ATTACH_CONFIG")
+tmx() { $TMUX_BIN "${TMUX_ARGS[@]}" "$@" }
+
+hx_home() {        # Hermes state root, as this shell resolves it
+  print -r -- "${HERMES_HOME:-$HOME/.hermes}"
+}
+
+# The window is the workspace: `agents` carries the state key and the profile it
+# was built under, `@hx_home` (stamped by the tool, watch.py). Reading the key
+# from the window instead of guessing it from the shell is what keeps a profile
+# whose HERMES_HOME differs from the server's from re-bootstrapping forever.
+# Names are compared with the `#N` suffix `free_window_name` adds when a foreign
+# window already holds `agents` or `hx:mail`.
+workspace_healthy() {   # $1 = exact session name; true when nothing to build
+  local s=$1 row name ours rest key home key_found="" home_found="" mail=0 pid
+  local rows=$(tmx list-windows -t "=$s" \
+    -F '#{window_name}|#{@hx}|#{@hx_key}|#{@hx_home}' 2>/dev/null)
+  [[ -z $rows ]] && return 1
+  for row in ${(f)rows}; do
+    name=${row%%|*}
+    rest=${row#*|}
+    ours=${rest%%|*}
+    rest=${rest#*|}
+    key=${rest%%|*}
+    home=${rest#*|}
+    [[ $ours == 1 ]] || continue
+    if [[ $name == agents || $name == 'agents#'* ]]; then
+      if [[ -n $key ]]; then
+        key_found=$key
+        home_found=$home
+      fi
+    elif [[ $name == hx:mail || $name == 'hx:mail#'* ]]; then
+      mail=1
+    fi
+  done
+  [[ -z $key_found || $mail == 0 ]] && return 1
+  local root=${home_found:-$(hx_home)}
+  local pidfile="$root/cache/hermes-tmux/sessions/${key_found}/watch.pid"
+  if [[ -r $pidfile ]]; then
+    pid=$(<$pidfile)
+    # `kill -0` alone accepts a recycled pid; the command line must still be the
+    # coordinator of THIS key.
+    if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null \
+       && [[ $(ps -o command= -p "$pid" 2>/dev/null) == *"hermes_tmux watch --key ${key_found}"* ]]; then
+      return 0
+    fi
+  fi
+  # The pid file appears a moment after `up` returns (the coordinator writes it
+  # once it holds watch.lock). A live coordinator of this key is the same fact.
+  pgrep -f "hermes_tmux watch --key ${key_found}\$" >/dev/null 2>&1
+}
+
+ensure_workspace() {    # $1 = exact session name, the only session touched
+  local s=$1
+  # Same falsey spellings as the tool's gate: an opt-out is never overridden.
+  case ${(L)${HERMES_TMUX:-}} in
+    (0|false|no|off|disable|disabled) return 0 ;;
+  esac
+  workspace_healthy "$s" && return 0
+  if [[ $DRY == 1 ]]; then
+    print "bootstrap workspace: $s"
+    return 0
+  fi
+  # One bootstrap at a time. A live pane of that name is one in flight; a dead
+  # one is what `remain-on-exit` leaves behind and must not block repair forever,
+  # so it is removed here (a dead pane holds no work).
+  local wid dead name
+  for row in ${(f)"$(tmx list-panes -s -t "=$s" -F '#{window_id}|#{window_name}|#{pane_dead}' 2>/dev/null)"}; do
+    [[ -z $row ]] && continue
+    wid=${row%%|*}
+    dead=${row##*|}
+    name=${${row#*|}%%|*}
+    [[ $name == hx:bootstrap ]] || continue
+    if [[ $dead == 1 ]]; then
+      tmx kill-window -t "$wid"
+    else
+      return 0
+    fi
+  done
+  local bin=${commands[hermes-tmux]:-$HOME/.local/bin/hermes-tmux}
+  if [[ ! -x $bin ]]; then
+    print -u2 -- "tmux-attach: hermes-tmux not found; $s has no workspace built"
+    return 0
+  fi
+  # Absolute interpreter and launcher: a window is forked from the *server's*
+  # environment, whose PATH can be older than this shell's.
+  local py=${commands[python3]:-} cmd="${(q)bin} up"
+  [[ -n $py ]] && cmd="${(q)py} ${(q)bin} up"
+  local log="$(hx_home)/cache/hermes-tmux/bootstrap-${${s//[^A-Za-z0-9._-]/_}}.log"
+  if [[ ! -d ${log:h} ]] && ! mkdir -p "${log:h}" 2>/dev/null; then
+    print -u2 -- "tmux-attach: cannot write $log; workspace not built"
+    return 0
+  fi
+  # HERMES_TMUX is forced on: the decision is made here, and an inherited
+  # HERMES_TMUX=0 from the server's old environment must not silently disable it.
+  local -a env_args=(-e HERMES_TMUX=1)
+  [[ -n ${HERMES_HOME:-} ]] && env_args+=(-e "HERMES_HOME=$HERMES_HOME")
+  if wid=$(tmx new-window -d -P -F '#{window_id}' -t "=$s:" -n hx:bootstrap \
+       -c "$HOME" "${env_args[@]}" -- /bin/sh -c "exec $cmd >>${(q)log} 2>&1"); then
+    # This window is a tool, not a tab: a dead one must never linger in the list.
+    [[ -n $wid ]] && tmx set-option -w -t "$wid" remain-on-exit off
+  else
+    print -u2 -- "tmux-attach: could not start the workspace bootstrap in $s"
+  fi
+  return 0
 }
 
 new_session() {    # create a session with a free name, then attach
@@ -83,8 +208,8 @@ new_session() {    # create a session with a free name, then attach
   name=$base
   # "=name" is an exact target: a bare name is a prefix match, so looking for
   # "main" would report a free name as taken whenever "main-2" exists.
-  $TMUX_BIN has-session -t "=$name" 2>/dev/null && name="${base}-2"
-  while $TMUX_BIN has-session -t "=$name" 2>/dev/null; do
+  tmx has-session -t "=$name" 2>/dev/null && name="${base}-2"
+  while tmx has-session -t "=$name" 2>/dev/null; do
     name="${base}-${n}"
     (( n++ ))
   done
@@ -94,8 +219,9 @@ new_session() {    # create a session with a free name, then attach
   # to a "duplicate session" error.
   local tries=0
   while [[ $DRY == 0 && $tries -lt 20 ]]; do
-    if $TMUX_BIN new-session -d -s "$name" -c "${HOME}" 2>/dev/null; then
-      exec $TMUX_BIN attach-session -t "$name"
+    if tmx new-session -d -s "$name" -c "${HOME}" 2>/dev/null; then
+      ensure_workspace "$name"
+      exec $TMUX_BIN "${TMUX_ARGS[@]}" attach-session -t "$name"
     fi
     name="${base}-${n}"
     (( n++, tries++ ))
@@ -109,15 +235,16 @@ new_session() {    # create a session with a free name, then attach
 }
 
 attach_to() {      # $1 = session_name, $REASON = why (dry-run only)
+  ensure_workspace "$1"
   if [[ $DRY == 1 ]]; then
     print "attach: $1${REASON:+   ($REASON)}"
     exit 0
   fi
-  exec $TMUX_BIN attach-session -t "$1"
+  exec $TMUX_BIN "${TMUX_ARGS[@]}" attach-session -t "$1"
 }
 
 # ---------------- main ---------------------------------------------------------
-sessions=(${(f)"$($TMUX_BIN list-sessions -F '#{session_name}' 2>/dev/null)"})
+sessions=(${(f)"$(tmx list-sessions -F '#{session_name}' 2>/dev/null)"})
 sessions=(${sessions:#})
 
 (( ${#sessions} == 0 )) && new_session
@@ -126,7 +253,7 @@ sessions=(${sessions:#})
 # Default target: most recently used session.
 # '|' as the field separator: a session name may contain a space, and the old
 # space-separated form silently truncated such a name to its first word.
-last=$($TMUX_BIN list-sessions -F '#{session_last_attached}|#{session_name}' 2>/dev/null \
+last=$(tmx list-sessions -F '#{session_last_attached}|#{session_name}' 2>/dev/null \
   | sort -t'|' -k1,1 -n -r | head -1 | cut -d'|' -f2-)
 [[ -z $last ]] && last=${sessions[1]}
 
@@ -136,7 +263,7 @@ if (( ${#sessions} == 1 )); then
   REASON="job running"
   session_busy "$only" && attach_to "$only"
   REASON="idle, single session"
-  clients=$($TMUX_BIN display-message -p -t "$only" '#{session_attached}' 2>/dev/null)
+  clients=$(tmx display-message -p -t "$only" '#{session_attached}' 2>/dev/null)
   if [[ -n $clients && $clients != 0 ]]; then
     print -r -- "$only is already open in $clients terminal window(s)."
     print -rn -- "[j]oin it, [n]ew session, [q]uit? "
