@@ -15,12 +15,18 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import tempfile
 import time
 import unittest
+from pathlib import Path
+from unittest import mock
 
+from hermes_tmux import watch
+from tests.test_carbon_watch_and_perf import run_mocked_coordinator
 from tests.test_tmux_integration import (
-    PY, REPO, Sandbox, _pid_alive, _q, _tmux, wait_for,
+    PY, REPO, TMUX, Sandbox, _pid_alive, _q, _tmux, wait_for,
 )
 
 
@@ -144,6 +150,87 @@ def tearDownModule():
     """Kill only this process's private server, and remove its socket file."""
     from tests.test_tmux_integration import tearDownModule as _harness_teardown
     _harness_teardown()
+class MockedCoordinatorTmuxFenceTest(unittest.TestCase):
+    """A fixture that runs the real ``reconcile_tabs`` with a mocked tmux client
+    must still not mutate whichever tmux server the process can reach.
+
+    ``run_mocked_coordinator`` keeps reconciliation real on purpose (the tests
+    count its passes), so the only protection is severing $TMUX/$TMUX_PANE and
+    pointing $TMUX_TMPDIR at a private empty directory. Without that, a run
+    inside any tmux pane creates one worker window per running delegation in the
+    developer's own session. A disposable server here plays that live server: if
+    the fence regresses, windows appear on it and this test fails.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="hx_fence_")
+        self.root = Path(self._tmp.name)
+        self.sock = self.root / "sock"
+
+    def tearDown(self) -> None:
+        self._tmux("-S", self.sock, "kill-server")
+        self._tmp.cleanup()
+
+    def _tmux(self, *args: str):
+        proc = subprocess.run([TMUX, *args], capture_output=True, text=True, timeout=15)
+        return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+    def _windows(self):
+        rc, out = self._tmux("-S", str(self.sock), "list-windows", "-a",
+                             "-F", "#{session_name}:#{window_index} #{window_name}")
+        return out.splitlines() if rc == 0 else []
+
+    def test_mocked_coordinator_creates_no_windows_on_the_ambient_server(self) -> None:
+        rc, out = self._tmux("-S", str(self.sock), "new-session", "-d", "-s", "live",
+                             "-x", "120", "-y", "36", "exec /bin/zsh -f")
+        if rc != 0:
+            raise unittest.SkipTest("cannot create a disposable tmux server: %s" % out)
+        pane = self._tmux("-S", str(self.sock), "list-panes", "-t", "live",
+                          "-F", "#{pane_id}")[1].split()[0]
+        server_pid = self._tmux("-S", str(self.sock), "display-message", "-p", "#{pid}")[1]
+        before = self._windows()
+        self.assertTrue(before, "disposable server has no windows to protect")
+
+        home = self.root / "home"
+        dd = home / "cache" / "delegation" / "live" / "deleg_spam0001"
+        dd.mkdir(parents=True)
+        log = dd / "task-0.log"
+        log.write_text("08:00:01 tool      | -> terminal(ls)\n", encoding="utf-8")
+        (dd / "manifest.json").write_text(json.dumps({
+            "delegation_id": "deleg_spam0001",
+            "started": "2026-11-13 08:00:00",
+            "tasks": [{"index": 0, "goal": "fence-probe", "log": str(log), "status": "running"}],
+        }), encoding="utf-8")
+
+        passes = []
+        original_reconcile = watch.reconcile_tabs
+
+        def counting_reconcile(k, workers, h=None):
+            passes.append(k)
+            return original_reconcile(k, workers, h)
+
+        def session_alive(_sid):
+            return not passes          # one pass, then exit
+
+        saved = {k: os.environ.get(k) for k in ("TMUX", "TMUX_PANE", "TMUX_TMPDIR")}
+        os.environ["TMUX"] = "%s,%s,0" % (self.sock, server_pid)
+        os.environ["TMUX_PANE"] = pane
+        try:
+            with mock.patch.object(watch, "_TICK_S", 0.05), \
+                 mock.patch.object(watch, "_MIN_RENDER_INTERVAL_S", 0.0):
+                run_mocked_coordinator(home, "fence-probe", session_alive=session_alive,
+                                       counting_reconcile=counting_reconcile,
+                                       tmux_tmpdir=self.root / "private-tmux")
+        finally:
+            for k, value in saved.items():
+                if value is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = value
+
+        self.assertEqual(len(passes), 1, "coordinator did not reconcile exactly once")
+        self.assertEqual(self._windows(), before,
+                         "mocked coordinator created windows on the ambient server")
 
 
 if __name__ == "__main__":
