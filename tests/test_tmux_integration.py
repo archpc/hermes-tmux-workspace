@@ -1310,6 +1310,92 @@ class IntegrationTest(unittest.TestCase):
                                     "rea pane printed nothing about REA: %r" % text[:300])
                     self.assertNotIn("fake", text.lower())
 
+    def test_tests_run_routes_and_preserves_the_pane_and_status(self):
+        with Sandbox() as box:
+            primary = _pane_pid(box.pane_id)
+            bin_dir = box.home / ".local/bin"
+            bin_dir.mkdir(parents=True)
+            self.assertEqual(_tmux("set-environment", "-t", box.name, "HOME", str(box.home))[0], 0)
+            (bin_dir / "tmux").symlink_to(TMUX)
+            box.export("HOME", str(box.home))
+            box.export("PATH", f"{bin_dir}:/usr/bin:/bin")
+            binary = bin_dir / "testbench"
+            test_log = box.home / "cache/hermes-tmux/tests.log"
+
+            self.assertEqual(box.cli("tests"), 0)
+            try:
+                missing_rc = box.cli("tests", "--run", timeout=5)
+            except AssertionError as exc:
+                window = box.window("hx:tests")
+                assert window is not None
+                pane = box.panes_of(window["id"])[0]["id"]
+                self.fail(f"{exc}; hx:tests output: {box.capture(pane)!r}")
+            self.assertEqual(missing_rc, 127)
+            tests_window = box.window("hx:tests")
+            assert tests_window is not None
+            win = tests_window["id"]
+            pane = box.panes_of(win)[0]["id"]
+            self.assertIn("TestBench unavailable; no tests ran", box.capture(pane))
+            self.assertIn("exit status: 127", test_log.read_text())
+
+            for rc in (0, 1):
+                binary.write_text(f'#!/bin/sh\nprintf "TestBench args: %s\\n" "$*"\nexit {rc}\n')
+                binary.chmod(0o700)
+                self.assertEqual(box.cli("tests", "--run"), rc)
+                self.assertEqual(box.window("hx:tests"), tests_window)
+                self.assertEqual(box.panes_of(win)[0]["id"], pane)
+                self.assertEqual(_format(box.name, "#{window_id}"), win)
+                text = test_log.read_text()
+                self.assertIn(f"TestBench args: run {REPO} --profile regression --suite full-tmux-regression --stream", text)
+                self.assertIn(f"exit status: {rc}", text)
+                self.assertTrue(wait_for(lambda: _pane_command(pane) in ("zsh", "bash", "sh")))
+            self.assertEqual(_pane_pid(box.pane_id), primary)
+
+    def test_tests_run_reports_interpreter_start_failure(self):
+        with Sandbox() as box:
+            box.export("HX_PYTHON", str(box.home / "missing-python"))
+            self.assertEqual(box.cli("tests", "--run", timeout=8), 127)
+            tests_window = box.window("hx:tests")
+            assert tests_window is not None
+            pane = box.panes_of(tests_window["id"])[0]["id"]
+            self.assertIn("missing-python", box.capture(pane))
+
+    def test_tests_run_interrupt_reaps_testbench_and_keeps_test_shell(self):
+        for target in ("test pane", "invoking process"):
+            with self.subTest(target=target):
+                self._assert_tests_run_interrupt(target)
+
+    def _assert_tests_run_interrupt(self, target):
+        with Sandbox() as box:
+            bin_dir = box.home / ".local/bin"
+            bin_dir.mkdir(parents=True)
+            self.assertEqual(_tmux("set-environment", "-t", box.name, "HOME", str(box.home))[0], 0)
+            binary = bin_dir / "testbench"
+            binary.write_text(f"#!{PY}\nimport os, signal\nprint('ready', os.getpid(), flush=True)\nsignal.pause()\n")
+            binary.chmod(0o700)
+            env = dict(os.environ, HOME=str(box.home), HERMES_HOME=str(box.home), HERMES_TMUX="1", TMUX_PANE=box.pane_id,
+                       TMUX=_format(box.pane_id, "#{socket_path},#{pid},0"))
+            log = box.home / "cache/hermes-tmux/tests.log"
+            with subprocess.Popen([PY, "-m", "hermes_tmux", "tests", "--run"], env=env, cwd=REPO) as command:
+                try:
+                    self.assertTrue(wait_for(lambda: log.is_file() and "ready " in log.read_text()))
+                    pid = int(log.read_text().split("ready ")[1].splitlines()[0])
+                    tests_window = box.window("hx:tests")
+                    assert tests_window is not None
+                    pane = box.panes_of(tests_window["id"])[0]["id"]
+                    if target == "test pane":
+                        self.assertEqual(_tmux("send-keys", "-t", pane, "C-c")[0], 0)
+                    else:
+                        command.send_signal(2)  # SIGINT as if typed in the invoking pane
+                    self.assertEqual(command.wait(timeout=10), 130)
+                    self.assertTrue(wait_for(lambda: _pane_command(pane) in ("zsh", "bash", "sh")))
+                    self.assertIn("exit status: 130", log.read_text())
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(pid, 0)
+                finally:
+                    if command.poll() is None:
+                        command.kill()
+
     def test_two_sessions_never_share_workspace_state(self):
         """Concurrency isolation: one server, two sessions, disjoint layouts."""
         with Sandbox() as first:
