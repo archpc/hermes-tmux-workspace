@@ -195,11 +195,16 @@ window for the client that used it last; the overview and tab bar follow.
 | Pane | Shows | Never |
 |---|---|---|
 | `hx:logs` | `tail -n 200 -F` of the real `~/.hermes/logs/agent.log` | if the log is missing, one line naming the missing path, never invented log content |
-| `hx:tests` | the last recorded run, or the opt-in command; `tests --run` records it | does not execute the suite by default (that would recurse into a running suite) |
+| `hx:tests` | the last recorded run, or the opt-in command; `tests --run` runs the regression suite via TestBench | no automatic run and no direct fallback if TestBench is missing |
 | `hx:debug` | live env (`HERMES_HOME`, `HERMES_TMUX`, `TMUX_PANE`), session key, window/pane inventory with ownership flags | no invented health status |
 | `hx:rea` | `rea --version` when the CLI exists, plus a note that REA MCP state is served by Hermes | no simulated REA output |
 
-All four are created lazily on first use and reused afterwards.
+All four are created lazily on first use and reused afterwards. `tests --run`
+focuses `hx:tests`, streams sanitized TestBench output into the pane and
+`tests.log`, and returns the TestBench exit status to the invoking shell. A
+completed run includes its TestBench run ID. The pane returns to its shell.
+Ctrl-C from either pane interrupts the run. Missing TestBench returns 127;
+disabled workspace, no tmux, and no matching suite return nonzero.
 
 ## Where the data comes from
 

@@ -490,7 +490,12 @@ def cmd_watch(args) -> int:
 
 # --------------------------------------------------------------------------- aux panes
 
-def _aux_command(role: str, shell: str, run: bool = False) -> Tuple[str, str]:
+def _tests_log() -> Path:
+    from .state import hermes_home
+    return hermes_home() / "cache" / watch.STATE_DIR_NAME / "tests.log"
+
+
+def _aux_command(role: str, shell: str, run: bool = False, *, receipt: Optional[Path] = None) -> Tuple[str, str]:
     """Return (cwd, command) for one auxiliary pane.
 
     Every pane shows real output or a plain shell. Nothing is synthesised: the
@@ -517,10 +522,25 @@ def _aux_command(role: str, shell: str, run: bool = False) -> Tuple[str, str]:
         # Never auto-run: this pane is opened from inside the very suite it would
         # run, so running it by default duplicates work and recurses. `--run`
         # opts in and records the output, which is the only writer of tests.log.
-        log = hermes_home() / "cache" / watch.STATE_DIR_NAME / "tests.log"
-        cmd = q(_python()) + " -m unittest discover -s tests -t ."
+        log = _tests_log()
         if run:
-            return str(repo), "( " + cmd + " ) 2>&1 | tee " + q(str(log)) + "; exec " + shell
+            from .suite_run import testbench_binary
+            argv = [_python(), "-m", "hermes_tmux.suite_run", str(repo), str(log), testbench_binary()]
+            store = _pane_env().get("TESTBENCH_HOME")
+            if store:
+                argv[:0] = ["/usr/bin/env", f"TESTBENCH_HOME={store}"]
+            launch = "trap ':' INT; cd " + q(str(repo)) + " && "
+            if receipt is not None:
+                argv.append(str(receipt))
+                # The Python runner may never start (bad interpreter, cwd or import).
+                dest, tmp = q(str(receipt)), q(str(receipt.with_suffix(".shell")))
+                fallback = (
+                    f"; rc=$?; if [ -d {q(str(receipt.parent))} ] && [ ! -e {dest} ]; then "
+                    f"printf '%s\\n' \"$rc\" > {tmp} && /bin/mv -f {tmp} {dest}; fi"
+                )
+            else:
+                fallback = ""
+            return str(repo), launch + shlex.join(argv) + fallback + "; trap - INT; exec " + q(shell)
         if log.is_file():
             return str(repo), (
                 "printf '%s\\n' '--- last recorded test run ---'; tail -n 60 "
@@ -572,6 +592,7 @@ def ensure_aux_window(
     after_window: Optional[str] = None,
     home: Optional[Path] = None,
     owner_pid: Optional[str] = None,
+    receipt: Optional[Path] = None,
 ) -> Tuple[Optional[str], str]:
     """Ensure ``hx:<role>`` exists with one owned pane; focus only when asked.
 
@@ -613,13 +634,14 @@ def ensure_aux_window(
         panes = tmuxio.list_panes(wid)
         ours = [pane for pane in panes if pane["ours"]]
         if run and ours:
-            _cwd, run_cmd = _aux_command(role, shell, run=True)
-            tmuxio.respawn(ours[0]["pane_id"], run_cmd)
+            _cwd, run_cmd = _aux_command(role, shell, run=True, receipt=receipt)
+            if not tmuxio.respawn(ours[0]["pane_id"], run_cmd):
+                return None, "failed"
             status = "running"
         elif not ours:
             if owner_pid and tmuxio.server_pid() != owner_pid:
                 return None, "stale_server"
-            _cwd, cmd = _aux_command(role, shell, run=run)
+            _cwd, cmd = _aux_command(role, shell, run=run, receipt=receipt)
             rebuilt = tmuxio.split_window(wid, cmd, horizontal=False, env=p_env)
             if not rebuilt:
                 return None, "failed"
@@ -630,7 +652,7 @@ def ensure_aux_window(
             return None, "failed"
         if owner_pid and tmuxio.server_pid() != owner_pid:
             return None, "stale_server"
-        cwd, cmd = _aux_command(role, shell, run=run)
+        cwd, cmd = _aux_command(role, shell, run=run, receipt=receipt)
         wid = tmuxio.new_window(
             session_id,
             tmuxio.free_window_name(session_id, name),
@@ -663,32 +685,81 @@ def ensure_aux_window(
     return wid, status
 
 
+def _run_tests_in_aux(key: str, session_id: str, sdir: Path, layout: dict) -> int:
+    from .suite_run import run, testbench_binary
+
+    with (sdir / "tests-run.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("hermes-tmux: tests are already running in hx:tests", file=sys.stderr)
+            return 1
+        wid = (layout.get("aux") or {}).get("tests")
+        caller = os.environ.get("TMUX_PANE")
+        if wid and any(p["ours"] and p["pane_id"] == caller for p in tmuxio.list_panes(wid)):
+            # From the test shell itself, don't respawn the caller.
+            return run(_repo_root(), _tests_log(), testbench_binary())
+
+        with tempfile.TemporaryDirectory(prefix="hx-tests-", dir=sdir) as td:
+            receipt = Path(td) / "exit"
+            wid, _status = ensure_aux_window(
+                key, session_id, "tests", focus=True, run=True,
+                after_window=layout.get("workers_window"), receipt=receipt,
+            )
+            if not wid:
+                print("hermes-tmux: could not start tests in hx:tests", file=sys.stderr)
+                return 1
+            print("hermes-tmux: running the suite in hx:tests", flush=True)
+            # The manifest bounds the suite to 360s; allow time for startup and cleanup.
+            startup = time.monotonic() + 5
+            deadline = time.monotonic() + 420
+            interrupted = False
+            while not receipt.exists() and time.monotonic() < deadline:
+                try:
+                    if time.monotonic() >= startup and not (receipt.parent / "started").exists():
+                        break
+                    time.sleep(0.1)
+                except KeyboardInterrupt:
+                    interrupted = True
+                    (receipt.parent / "cancel").touch()
+            try:
+                rc = int(receipt.read_text(encoding="ascii"))
+            except (OSError, ValueError):
+                print("hermes-tmux: hx:tests did not report an exit status", file=sys.stderr)
+                return 1
+            if interrupted:
+                rc = 130
+            if rc:
+                print(f"hermes-tmux: TestBench exited {rc}; see hx:tests or {_tests_log()}", file=sys.stderr)
+            return rc
+
+
 def cmd_aux(args) -> int:
     role = args.role
+    run_requested = getattr(args, "run", False)
     if not gate.enabled():
-        print("hermes-tmux: %s" % gate.disabled_reason())
-        return 0
+        print("hermes-tmux: %s" % gate.disabled_reason(), file=sys.stderr if run_requested else sys.stdout)
+        return 1 if run_requested else 0
     if not tmuxio.in_tmux():
-        print("hermes-tmux: not inside tmux.")
-        return 0
+        print("hermes-tmux: not inside tmux.", file=sys.stderr if run_requested else sys.stdout)
+        return 1 if run_requested else 0
     key = tmuxio.session_key()
-    _ensure_state_dir(key)
+    sdir = _ensure_state_dir(key)
     layout = watch.read_layout(key)
     recorded_sid = layout.get("session_id") or ""
     session_id = recorded_sid if (recorded_sid and tmuxio.session_alive(recorded_sid)) else (
         tmuxio.current_session_id() or ""
     )
+    if run_requested:
+        return _run_tests_in_aux(key, session_id, sdir, layout)
     name = "hx:" + role
-    run_now = bool(getattr(args, "run", False))
     wid, status = ensure_aux_window(
-        key, session_id, role, focus=True, run=run_now, after_window=layout.get("workers_window")
+        key, session_id, role, focus=True, after_window=layout.get("workers_window")
     )
     if not wid:
         print("hermes-tmux: could not create %s" % name)
         return 1
-    if status == "running":
-        print("hermes-tmux: running the suite in %s" % name)
-    elif status == "opened":
+    if status == "opened":
         print("hermes-tmux: opened %s" % name)
     else:
         print("hermes-tmux: focused %s" % name)

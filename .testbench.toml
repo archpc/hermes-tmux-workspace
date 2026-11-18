@@ -20,6 +20,14 @@ needs_tmux = true
 description = "Isolated tmux server lifecycle tests for hx:testbench, hx:mail, worker tabs, and close mark"
 
 [[suite]]
+name = "tests-routing"
+adapter = "python_unittest"
+profile = "terminal"
+command = ["/Users/sein/.local/bin/python3.14", "-W", "default", "-m", "unittest", "tests.test_honesty.AuxCommandTest", "tests.test_tmux_integration.IntegrationTest.test_tests_run_routes_and_preserves_the_pane_and_status", "tests.test_tmux_integration.IntegrationTest.test_tests_run_interrupt_reaps_testbench_and_keeps_test_shell", "tests.test_tmux_integration.IntegrationTest.test_tests_run_reports_interpreter_start_failure", "-v"]
+timeout_s = 60.0
+needs_tmux = true
+
+[[suite]]
 name = "full-tmux-regression"
 adapter = "python_unittest"
 profile = "regression"

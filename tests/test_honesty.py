@@ -327,7 +327,6 @@ class TestsRunBranchTest(unittest.TestCase):
         os.environ["HERMES_HOME"] = str(home)
         os.environ["HERMES_TMUX"] = "1"
         try:
-            args = type("A", (), {"role": "tests", "run": True})()
             with mock.patch.object(tmuxio, "in_tmux", return_value=True), \
                  mock.patch.object(tmuxio, "current_session_id", return_value="$0"), \
                  mock.patch.object(tmuxio, "session_key", return_value="k"), \
@@ -337,11 +336,11 @@ class TestsRunBranchTest(unittest.TestCase):
                                    return_value=[{"pane_id": "%2", "ours": True}]), \
                  mock.patch.object(tmuxio, "respawn") as respawn, \
                  mock.patch.object(tmuxio, "select_window"):
-                rc = cli.cmd_aux(args)
-            self.assertEqual(rc, 0)
+                wid, status = cli.ensure_aux_window("k", "$0", "tests", run=True)
+            self.assertEqual((wid, status), ("@1", "running"))
             self.assertTrue(respawn.called,
                             "tests --run focused the pane instead of running in it")
-            self.assertIn("tee", respawn.call_args[0][1])
+            self.assertNotIn("unittest", respawn.call_args[0][1])
             self.assertIn("tests.log", respawn.call_args[0][1])
         finally:
             os.environ.pop("HERMES_HOME", None)
@@ -350,6 +349,23 @@ class TestsRunBranchTest(unittest.TestCase):
 
 
 class AuxCommandTest(unittest.TestCase):
+    def test_explicit_run_fails_when_disabled_or_outside_tmux(self):
+        from unittest.mock import patch
+        from hermes_tmux import tmuxio
+        args = type("Args", (), {"role": "tests", "run": True})()
+        with patch.object(tmuxio, "in_tmux", return_value=False):
+            for enabled in ("0", "1"):
+                with patch.dict(os.environ, {"HERMES_TMUX": enabled}):
+                    self.assertNotEqual(cli.cmd_aux(args), 0)
+
+    def test_missing_receipt_dir_does_not_replace_runner_status(self):
+        from unittest.mock import patch
+        from hermes_tmux import suite_run
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with patch("sys.argv", ["suite_run", td, str(root / "tests.log"), "", str(root / "gone/exit")]):
+                self.assertEqual(suite_run.main(), 127)
+
     def test_tests_pane_does_not_run_by_default(self):
         _cwd, cmd = cli._aux_command("tests", "/bin/zsh")
         self.assertNotIn("tee", cmd)
@@ -358,7 +374,7 @@ class AuxCommandTest(unittest.TestCase):
 
     def test_tests_run_writes_the_log_it_advertises(self):
         _cwd, cmd = cli._aux_command("tests", "/bin/zsh", run=True)
-        self.assertIn("tee", cmd)
+        self.assertNotIn("unittest", cmd)
         self.assertIn("tests.log", cmd)
 
 
