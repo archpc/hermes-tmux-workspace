@@ -25,11 +25,17 @@ from . import closemark, gate, tmuxio, watch
 from .env import pane_env, python as _env_python, repo_root as _env_repo_root
 
 WORKERS_WINDOW = watch.OVERVIEW_WINDOW
-AUX_ROLES = ("logs", "tests", "debug", "rea", "mail", "testbench")
+AUX_ROLES = ("logs", "tests", "debug", "rea", "mail", "testbench", "coord")
 
 
 def testbench_tab_enabled() -> bool:
     return os.environ.get("HERMES_TMUX_TESTBENCH", "1").strip().lower() not in (
+        "0", "false", "off", "no"
+    )
+
+
+def coord_tab_enabled() -> bool:
+    return os.environ.get("HERMES_TMUX_COORD", "1").strip().lower() not in (
         "0", "false", "off", "no"
     )
 
@@ -332,12 +338,19 @@ def _up() -> int:
     )
     if not mail_wid:
         print("hermes-tmux: warning: could not create hx:mail")
+    tb_wid = ""
     if testbench_tab_enabled():
         tb_wid, _tb_state = ensure_aux_window(
             key, session_id, "testbench", focus=False, after_window=mail_wid or window_id
         )
         if not tb_wid:
             print("hermes-tmux: warning: could not create hx:testbench")
+    if coord_tab_enabled():
+        coord_wid, _coord_state = ensure_aux_window(
+            key, session_id, "coord", focus=False, after_window=tb_wid or mail_wid or window_id
+        )
+        if not coord_wid:
+            print("hermes-tmux: warning: could not create hx:coord")
     _start_watcher(key)
     watch.render_and_publish(key, session_label=session_name)
     print("hermes-tmux: workspace ready  (%s)" % window_id)
@@ -572,6 +585,20 @@ def _aux_command(role: str, shell: str, run: bool = False, *, receipt: Optional[
             "if [ -x \"$HOME/.local/bin/testbench\" ]; then exec \"$HOME/.local/bin/testbench\" tui; "
             "elif command -v testbench >/dev/null 2>&1; then exec testbench tui; "
             "else printf '%s\\n' 'testbench binary not installed yet (expected ~/.local/bin/testbench)'; exec " + shell + "; fi")
+
+    if role == "coord":
+        # Read-only coordination view: refresh `hermes coord` in place. No daemon —
+        # the pane itself is the refresh loop; Ctrl-C drops to a shell. The probe
+        # keeps older installs (no coord subcommand) on a clean fallback message.
+        # HX_HERMES_BIN pins a specific launcher (profiles/tests), like HX_PYTHON.
+        hb = "\"${HX_HERMES_BIN:-hermes}\""
+        return str(home), (
+            "if command -v " + hb + " >/dev/null 2>&1 && " + hb + " coord --json >/dev/null 2>&1; then "
+            "trap 'break' INT; "
+            "while :; do printf '\\033[H\\033[2J'; " + hb + " coord 2>&1; sleep 10; done; "
+            "exec " + q(shell) + "; "
+            "else printf '%s\\n' 'hermes coord unavailable on this install (needs the coordination CLI)'; "
+            "exec " + q(shell) + "; fi")
 
     # role == "rea": show what is actually installed, then a shell.
     return str(home), (

@@ -201,9 +201,24 @@ class Sandbox:
             raise unittest.SkipTest("cannot create tmux session: %s" % out)
         self.created = True
         self.pane_id = out.strip().splitlines()[-1].strip()
+        # Stable reader-window name: tmux automatic-rename flips it between the
+        # running command names (zsh/Python) on a lag, which shifts every status
+        # column and makes status-line click tests race. Pin it.
+        _tmux("set-option", "-w", "-t", self.pane_id, "automatic-rename", "off")
+        _tmux("rename-window", "-t", self.pane_id, "reader")
         self.run("export HERMES_HOME=%s" % self.home)
         self.run("export HERMES_TMUX=1")
         self.run("export PYTHONPATH=%s" % REPO)
+        # hx:coord renders `hermes coord`; give the sandbox a deterministic shim
+        # so the pane runs its refresh loop instead of the fallback shell (a real
+        # interactive shell would source the user's rc files into the sandbox).
+        shim_dir = self.home / "bin"
+        shim_dir.mkdir(parents=True, exist_ok=True)
+        shim = shim_dir / "hermes"
+        shim.write_text('#!/bin/sh\nif [ "$1" = coord ]; then printf "COORD-FIXTURE\\n"; exit 0; fi\nexit 1\n',
+                        encoding="utf-8")
+        shim.chmod(0o755)
+        self.run("export HX_HERMES_BIN=%s" % shim)
         return self
 
     def __exit__(self, *exc):
@@ -473,7 +488,11 @@ class TabsTest(unittest.TestCase):
         with Sandbox() as box:
             win = self._up(box)
             ours = [w for w in box.windows() if w["ours"]]
-            self.assertEqual([w["name"] for w in ours], ["agents", "hx:mail", "hx:testbench"],
+            from hermes_tmux import cli as _cli
+            expected = ["agents", "hx:mail"] + (
+                ["hx:testbench"] if _cli.testbench_tab_enabled() else []) + (
+                ["hx:coord"] if _cli.coord_tab_enabled() else [])
+            self.assertEqual([w["name"] for w in ours], expected,
                              "up owns unexpected static windows: %r"
                              % [w["name"] for w in ours])
             panes = box.panes_of(win["id"])

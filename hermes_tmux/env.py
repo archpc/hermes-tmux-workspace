@@ -28,8 +28,8 @@ def python() -> str:
 #: read from the shell that ran the command; the tmux server's environment is
 #: older and does not have them.
 _PASSTHROUGH = ("HERMES_TMUX_TRANSCRIPT", "HERMES_TMUX_LINGER_S", "HERMES_TMUX_CLOSE_MARK",
-                "HERMES_TMUX_TESTBENCH", "NO_COLOR", "HXMAIL_DB", "HXMAIL_LOCAL_DIR",
-                "TESTBENCH_HOME")
+                "HERMES_TMUX_TESTBENCH", "HERMES_TMUX_COORD", "NO_COLOR", "HXMAIL_DB",
+                "HXMAIL_LOCAL_DIR", "TESTBENCH_HOME", "HX_HERMES_BIN")
 
 
 def pane_env() -> Dict[str, str]:
