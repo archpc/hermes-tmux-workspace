@@ -28,6 +28,15 @@ timeout_s = 60.0
 needs_tmux = true
 
 [[suite]]
+name = "interactive-tab"
+adapter = "python_unittest"
+profile = "terminal"
+command = ["/Users/sein/.local/bin/python3.14", "-W", "default", "-m", "unittest", "tests.test_interactive_tab", "-v"]
+timeout_s = 60.0
+needs_tmux = true
+description = "Exercise fresh Hermes tabs through tmux key input on a private socket"
+
+[[suite]]
 name = "full-tmux-regression"
 adapter = "python_unittest"
 profile = "regression"

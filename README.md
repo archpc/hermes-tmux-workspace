@@ -82,6 +82,17 @@ hermes-tmux up
 Uninstall: `hermes-tmux down` closes only the panes it created; delete the
 symlink afterwards.
 
+### Optional: interactive Hermes tabs
+
+Source `scripts/hermes-tab.conf` from your `tmux.conf` after any existing `C`
+binding, then reload the config. With the default prefix, `Ctrl-b Shift-C`
+opens and focuses a fresh interactive `hermes` tab. `Ctrl-b c` is unchanged.
+The tab starts in the invoking pane's directory and uses tmux's session
+and server environment, including `PATH` and `HERMES_HOME` when set there.
+It does not copy pane-local exports or a profile selected by a running process.
+Interactive tabs are user-owned: `/exit` closes only that tab, and `hermes-tmux down`
+leaves them alone.
+
 ## Quick start
 
 ```sh
