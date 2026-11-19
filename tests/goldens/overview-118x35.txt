@@ -1,0 +1,25 @@
+  HERMES AGENTS · main                                                                                       1 running
+
+  RUNNING
+  ● Implement the renderer and unit tests
+    deepseek-v4.1-flash · 42s · 3 tools · read_file                                                         6cfc92ad#0
+
+  RECENT
+  ✓ Recent task number 0 with a fairly long title to clip                                                       2m ago
+    10s · deepseek-v4.1-flash · All eight tests pass.                                                       recent00#2
+
+  ✓ Recent task number 1 with a fairly long title to clip                                                       2m ago
+    11s · deepseek-v4.1-flash · All eight tests pass.                                                       recent01#2
+
+  ✓ Recent task number 2 with a fairly long title to clip                                                       3m ago
+    12s · deepseek-v4.1-flash · All eight tests pass.                                                       recent02#2
+
+  ✓ Recent task number 3 with a fairly long title to clip                                                       3m ago
+    13s · deepseek-v4.1-flash · All eight tests pass.                                                       recent03#2
+
+  ✓ Recent task number 4 with a fairly long title to clip                                                       4m ago
+    14s · deepseek-v4.1-flash · All eight tests pass.                                                       recent04#2
+
+  ✓ Recent task number 5 with a fairly long title to clip                                                       4m ago
+    15s · deepseek-v4.1-flash · All eight tests pass.                                                       recent05#2
+    + 4 older  (hermes-tmux status --all)

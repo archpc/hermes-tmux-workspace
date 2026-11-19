@@ -32,6 +32,14 @@ ATTENTION_TTL_S = 2 * 3600
 RECENT_ROWS = 6
 #: Text is easier to scan in a column than across a 188-column pane.
 MAX_CONTENT_WIDTH = 118
+#: Scanned fields tolerate a wider measure than prose; past ~150 the right-aligned
+#: age/ID drifts from its row. A step, not continuous scaling: no resize jitter,
+#: and below EXPANDED_MIN_WIDTH the output is byte-identical to the compact layout.
+EXPANDED_CONTENT_WIDTH = 150
+EXPANDED_MIN_WIDTH = 200
+#: A tall pane fills with history; a short pane (the 14-inch MBP) keeps the default
+#: budget. Live sections are drawn first and never trimmed to make room.
+TALL_PANE_MIN_HEIGHT = 50
 
 _FAIL_STATES = ("failed", "fail", "error", "errored", "crashed", "interrupted",
                 "cancelled", "canceled", "timeout", "timed_out", "killed")
@@ -563,7 +571,8 @@ def render(
                             colour=colour, session_label=session_label,
                             ascii_mode=ascii_mode)
 
-    pen = _Pen(min(width, MAX_CONTENT_WIDTH), colour)
+    measure = EXPANDED_CONTENT_WIDTH if width >= EXPANDED_MIN_WIDTH else MAX_CONTENT_WIDTH
+    pen = _Pen(min(width, measure), colour)
     groups = classify(worker_list, now, seen, since)
     _header(pen, summary(groups, now), session_label, ascii_mode)
 
@@ -594,6 +603,11 @@ def render(
             # and a short pane drops the second line of each row before it
             # drops rows.
             left = int(height) - len(pen.lines) - 3
+            # A tall pane shows history up to what fits rather than an arbitrary
+            # six rows; the footer "+N older" stays truthful. A short pane keeps
+            # the caller's budget so the compact layout is unchanged.
+            if int(height) >= TALL_PANE_MIN_HEIGHT:
+                limit = len(recent)
             detail = left >= 2 * min(limit, len(recent), 3)
             limit = max(0, min(limit, left // (2 if detail else 1)))
             spaced = detail and left >= 3 * min(limit, len(recent))
