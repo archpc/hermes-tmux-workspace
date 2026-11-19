@@ -78,6 +78,11 @@ def _fit_line(text: str, width: int) -> str:
     return labels.take_cells(text, width).rstrip()
 
 
+#: A date-only string carrying a timezone designator, e.g. ``2026-11-19+02:00``
+#: or ``2026-11-19+00:00`` (the Z-suffix form after replacement).
+_DATE_ONLY_OFFSET_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})([+-]\d{2}(?::?\d{2})?)$")
+
+
 def _parse_dt(value: Any) -> Optional[datetime]:
     """Accept 'YYYY-MM-DD HH:MM:SS' and ISO-8601, with or without a 'Z'."""
     text = _as_text(value).strip()
@@ -86,6 +91,12 @@ def _parse_dt(value: Any) -> Optional[datetime]:
     if text.endswith(("Z", "z")):
         text = text[:-1] + "+00:00"
     text = text.replace("T", " ", 1) if "T" in text and " " not in text else text
+    # A date-only offset must not reach fromisoformat as-is: it reinterprets the
+    # offset as a time of day and drops the sign ('2026-11-19+02:00' -> 02:00).
+    # Give it an explicit midnight so the offset is honoured like any datetime.
+    date_offset = _DATE_ONLY_OFFSET_RE.match(text)
+    if date_offset:
+        text = f"{date_offset.group(1)} 00:00:00{date_offset.group(2)}"
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
             return datetime.strptime(text, fmt)
