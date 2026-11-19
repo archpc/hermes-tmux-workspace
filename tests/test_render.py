@@ -544,9 +544,17 @@ class TestParseDtBoundaries(unittest.TestCase):
 
     def test_never_raises_on_hostile_input(self):
         for value in (None, 12345, b"2026-11-19", ["x"], {"a": 1}, float("nan"),
-                      "2026-11-19+02", "2026-11-19+0200", "2026-11-19 T10:00"):
+                      "2026-11-19+02", "2026-11-19+0200", "2026-11-19 T10:00",
+                      "0001-01-01Z", "0001-01-01+02:00", "9999-12-31Z",
+                      "9999-12-31-12:00", "9999-12-31T23:59:59+14:00"):
             result = render_mod._parse_dt(value)
             self.assertTrue(result is None or isinstance(result, datetime), repr(value))
+
+    def test_offset_with_seconds_matches_full_form(self):
+        self.assertEqual(
+            render_mod._parse_dt("2026-11-19+02:00:00"),
+            render_mod._parse_dt("2026-11-19T00:00:00+02:00:00"),
+        )
 
 
 if __name__ == "__main__":

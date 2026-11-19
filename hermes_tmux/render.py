@@ -79,8 +79,11 @@ def _fit_line(text: str, width: int) -> str:
 
 
 #: A date-only string carrying a timezone designator, e.g. ``2026-11-19+02:00``
-#: or ``2026-11-19+00:00`` (the Z-suffix form after replacement).
-_DATE_ONLY_OFFSET_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})([+-]\d{2}(?::?\d{2})?)$")
+#: or ``2026-11-19+00:00`` (the Z-suffix form after replacement). Offsets may
+#: carry seconds (``+02:00:00``); fromisoformat accepts them.
+_DATE_ONLY_OFFSET_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})([+-]\d{2}(?::?\d{2}(?::\d{2}(?:\.\d+)?)?)?)$"
+)
 
 
 def _parse_dt(value: Any) -> Optional[datetime]:
@@ -107,7 +110,13 @@ def _parse_dt(value: Any) -> Optional[datetime]:
     except ValueError:
         return None
     if dt.tzinfo is not None:
-        dt = dt.astimezone().replace(tzinfo=None)
+        try:
+            dt = dt.astimezone().replace(tzinfo=None)
+        except (OverflowError, OSError):
+            # Local-time conversion can leave the datetime range at the
+            # MINYEAR/MAXYEAR boundary (e.g. '0001-01-01Z' in a western tz).
+            # The parser's contract is never to raise on hostile input.
+            return None
     return dt
 
 
