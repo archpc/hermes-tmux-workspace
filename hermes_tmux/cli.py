@@ -588,17 +588,18 @@ def _aux_command(role: str, shell: str, run: bool = False, *, receipt: Optional[
 
     if role == "coord":
         # Read-only coordination view: refresh `hermes coord` in place. No daemon —
-        # the pane itself is the refresh loop; Ctrl-C drops to a shell. The probe
-        # keeps older installs (no coord subcommand) on a clean fallback message.
-        # HX_HERMES_BIN pins a specific launcher (profiles/tests), like HX_PYTHON.
+        # the pane itself is the refresh loop; Ctrl-C drops to a shell. The render is
+        # retried (not a one-shot probe) so a transient failure recovers and a later
+        # installed CLI is picked up; an absent CLI shows a persistent notice re-checked
+        # every 30s. HX_HERMES_BIN pins a specific launcher (profiles/tests), like HX_PYTHON.
         hb = "\"${HX_HERMES_BIN:-hermes}\""
         return str(home), (
-            "if command -v " + hb + " >/dev/null 2>&1 && " + hb + " coord --json >/dev/null 2>&1; then "
             "trap 'break' INT; "
-            "while :; do printf '\\033[H\\033[2J'; " + hb + " coord 2>&1; sleep 10; done; "
-            "exec " + q(shell) + "; "
-            "else printf '%s\\n' 'hermes coord unavailable on this install (needs the coordination CLI)'; "
-            "exec " + q(shell) + "; fi")
+            "while :; do printf '\\033[H\\033[2J'; "
+            "if command -v " + hb + " >/dev/null 2>&1 && " + hb + " coord 2>&1; then sleep 10; "
+            "else printf '%s\\n' 'hermes coord unavailable (needs the coordination CLI); retrying in 30s'; sleep 30; "
+            "fi; done; "
+            "exec " + q(shell))
 
     # role == "rea": show what is actually installed, then a shell.
     return str(home), (
