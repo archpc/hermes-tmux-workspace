@@ -37,6 +37,15 @@ needs_tmux = true
 description = "Exercise fresh Hermes tabs through tmux key input on a private socket"
 
 [[suite]]
+name = "real-hermes-tabs"
+adapter = "python_unittest"
+profile = "terminal"
+command = ["/Users/sein/.local/bin/python3.14", "-W", "default", "-m", "unittest", "tests.test_real_hermes_tabs", "-v"]
+timeout_s = 120.0
+needs_tmux = true
+description = "Real offline Hermes CLI through Ctrl-b Shift-C: distinct sessions, independent /exit, user-owned windows"
+
+[[suite]]
 name = "full-tmux-regression"
 adapter = "python_unittest"
 profile = "regression"
