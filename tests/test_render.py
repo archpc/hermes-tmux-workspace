@@ -495,5 +495,67 @@ class TestStateLabel(unittest.TestCase):
                                     last_event=stamp(NOW - timedelta(hours=5))), "done")
 
 
+class TestParseDtBoundaries(unittest.TestCase):
+    """_parse_dt accepts 'YYYY-MM-DD HH:MM:SS' and ISO-8601, with or without Z.
+
+    A date-only string carrying a timezone designator must denote the SAME
+    instant as its full-datetime form. Found by the mutation/fuzz campaign:
+    datetime.fromisoformat() reinterprets a date-only offset as a time of day
+    ('2026-11-19+02:00' -> 02:00:00, sign dropped), and the Z-suffix path turned
+    '2026-11-19Z' into local midnight while '2026-11-19T00:00:00Z' converted to
+    local time correctly. Assertions compare against the full-datetime path so
+    they hold in any host timezone.
+    """
+
+    def test_date_only_z_equals_full_datetime_z(self):
+        self.assertEqual(
+            render_mod._parse_dt("2026-11-19Z"),
+            render_mod._parse_dt("2026-11-19T00:00:00Z"),
+        )
+
+    def test_date_only_lowercase_z_equals_full_datetime_z(self):
+        self.assertEqual(
+            render_mod._parse_dt("2026-11-19z"),
+            render_mod._parse_dt("2026-11-19T00:00:00z"),
+        )
+
+    def test_date_only_positive_offset_equals_full_form(self):
+        self.assertEqual(
+            render_mod._parse_dt("2026-11-19+02:00"),
+            render_mod._parse_dt("2026-11-19T00:00:00+02:00"),
+        )
+
+    def test_date_only_negative_offset_keeps_sign(self):
+        self.assertEqual(
+            render_mod._parse_dt("2026-11-19-05:00"),
+            render_mod._parse_dt("2026-11-19T00:00:00-05:00"),
+        )
+        self.assertNotEqual(
+            render_mod._parse_dt("2026-11-19-05:00"),
+            render_mod._parse_dt("2026-11-19+05:00"),
+        )
+
+    def test_plain_date_still_local_midnight(self):
+        self.assertEqual(render_mod._parse_dt("2026-11-19"), datetime(2026, 11, 19))
+
+    def test_invalid_values_return_none(self):
+        for value in ("", "   ", "Z", "z", "2026-02-30", "2026-13-01", "2026-11-19 25:00:00", "TTT"):
+            self.assertIsNone(render_mod._parse_dt(value), value)
+
+    def test_never_raises_on_hostile_input(self):
+        for value in (None, 12345, b"2026-11-19", ["x"], {"a": 1}, float("nan"),
+                      "2026-11-19+02", "2026-11-19+0200", "2026-11-19 T10:00",
+                      "0001-01-01Z", "0001-01-01+02:00", "9999-12-31Z",
+                      "9999-12-31-12:00", "9999-12-31T23:59:59+14:00"):
+            result = render_mod._parse_dt(value)
+            self.assertTrue(result is None or isinstance(result, datetime), repr(value))
+
+    def test_offset_with_seconds_matches_full_form(self):
+        self.assertEqual(
+            render_mod._parse_dt("2026-11-19+02:00:00"),
+            render_mod._parse_dt("2026-11-19T00:00:00+02:00:00"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

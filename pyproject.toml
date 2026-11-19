@@ -1,0 +1,21 @@
+# Mutation-testing opt-in for TestBench (ADR-0008). The mutation adapter stages a
+# disposable copy and runs mutmut under Seatbelt; this checkout is never mutated.
+# Scope: pure display/gate logic vs the hermetic fast test layer. The full tmux
+# regression suite remains the sign-off gate and is intentionally not re-run per
+# mutant (minutes per mutant would make the campaign infeasible).
+[tool.mutmut]
+source_paths = ["hermes_tmux/"]
+only_mutate = [
+    "hermes_tmux/render.py",
+    "hermes_tmux/labels.py",
+    "hermes_tmux/transcript.py",
+    "hermes_tmux/gate.py",
+    "hermes_tmux/env.py",
+]
+pytest_add_cli_args_test_selection = [
+    "tests/test_render.py",
+    "tests/test_labels.py",
+    "tests/test_transcript.py",
+    "tests/test_gate.py",
+    "tests/test_carbon_unicode_and_escapes.py",
+]
