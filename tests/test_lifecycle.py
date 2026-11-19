@@ -23,7 +23,15 @@ DEADLINE_S = 6.0
 
 
 class LifecyclePropagationTest(unittest.TestCase):
+    """One sandbox, one flip: a manifest rewrite must repaint before the slow poll."""
     def _manifest(self, box: Sandbox, deleg: str, status: str) -> None:
+        """Rewrite every task's status in place, the way the writer does.
+
+        Same path, whole document, rewritten in place (no rename): a content
+        write to a child of a watched directory, which no directory vnode
+        reports. The test can only pass if ``manifest.json`` itself is
+        registered.
+        """
         path = box.home / "cache/delegation/live" / deleg / "manifest.json"
         data = json.loads(path.read_text())
         for task in data["tasks"]:
@@ -31,12 +39,25 @@ class LifecyclePropagationTest(unittest.TestCase):
         path.write_text(json.dumps(data))
 
     def _overview_text(self, box: Sandbox) -> str:
+        """The visible screen only.
+
+        Scrollback can hold "RUNNING" from an earlier pass or an earlier test that
+        reused the pane id, so capturing with history would make the assertion
+        satisfiable by stale text.
+        """
         pane = box.layout().get("overview_pane")
         self.assertTrue(pane, box.layout())
         # Visible screen only: scrollback can hold an earlier test's content.
         return _tmux("capture-pane", "-p", "-t", pane)[1]
 
     def test_completion_reaches_the_overview_without_waiting_for_the_poll(self):
+        """A manifest write reaches the overview well inside one session-check interval.
+
+        The 2.5 s sleep first drains the event burst raised while the workspace was
+        built: a flip landing inside that burst would be rendered by its wake-up, and
+        the test would pass with the manifest watch removed. ``DEADLINE_S`` is 6 s
+        against a 20 s poll, so only the explicit watch can explain a pass.
+        """
         with Sandbox() as box:
             deleg = "deleg_life0001"
             box.add_delegation(deleg, [{"goal": "lifecycle"}])

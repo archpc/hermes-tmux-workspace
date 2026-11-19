@@ -45,6 +45,12 @@ def _resolve_runtime():
 
     Reads the absolute paths embedded in the ``hermes`` launcher script and
     keeps the one that is a Hermes checkout with a usable venv.
+
+    The launcher script is the only discovery point: nothing here hardcodes an
+    install location, so the test works wherever the CLI was installed and
+    skips where it was not. The check is deliberately strict (``hermes_cli``
+    package *and* a ``.venv/bin/python``), because the test execs that
+    interpreter directly and depends on it already carrying the dependencies.
     """
     launcher = shutil.which("hermes")
     if not launcher:
@@ -61,21 +67,40 @@ def _resolve_runtime():
     return None
 
 
+# Resolved once at import: no tmux at all skips on the sandbox, a missing
+# runtime skips this module. Both skips are reported separately, because they
+# are different facts about the machine.
 RUNTIME = None if T.SKIP else _resolve_runtime()
 SKIP_REASON = "tmux not installed" if T.SKIP else (
     "no usable Hermes runtime resolved from PATH" if RUNTIME is None else None)
 
 
 def tearDownModule():
+    # Imported modules do not get their teardown run by the test runner, so the
+    # sandbox module's cleanup is called explicitly here.
     T.tearDownModule()
 
 
 @unittest.skipIf(SKIP_REASON is not None, SKIP_REASON or "")
 class RealHermesTabsTest(unittest.TestCase):
+    """Drives the real CLI; skips (rather than fails) without a runtime.
+
+    What this adds over the fake-launcher module is only what a fake cannot
+    show: two Shift-C tabs really are two Hermes sessions, and ``/exit`` in one
+    really closes one window. The workspace's own bookkeeping is checked only as
+    a negative — this module never invokes ``down``/``close``, it asserts these
+    tabs carry no ``@hx`` marker — and is covered positively elsewhere.
+    """
+
     def test_shift_c_tabs_are_independent_real_sessions(self):
+        # The assertion is for the type checker's benefit; the class skip has
+        # already established it at runtime.
         assert RUNTIME is not None  # narrowed by the class skip
         python, root = RUNTIME
         with T.Sandbox() as box:
+            # A launcher that execs the resolved interpreter straight into
+            # ``hermes_cli.main``. -B and PYTHONDONTWRITEBYTECODE keep the
+            # disposable home free of bytecode.
             launcher = box.home / "hermes"
             launcher.write_text(
                 "#!/bin/sh\n"
@@ -84,12 +109,19 @@ class RealHermesTabsTest(unittest.TestCase):
                 "from hermes_cli.main import main; sys.exit(main())' \"$@\"\n",
                 encoding="utf-8")
             launcher.chmod(0o700)
+            # Offline by construction: a dead endpoint (127.0.0.1:9, where
+            # nothing listens), no telemetry, and a CLI interface. No model
+            # prompt is ever sent, so no request should leave the machine — and
+            # the pin means an accidental one cannot reach a provider.
             (box.home / "config.yaml").write_text(
                 'model:\n  default: offline-smoke\n  provider: custom\n'
                 '  base_url: http://127.0.0.1:9/v1\n'
                 'display:\n  interface: cli\n'
                 'telemetry:\n  shared_metrics:\n    enabled: false\n'
                 '    send: false\n    offer_version: 2\n', encoding="utf-8")
+            # Server-side environment for every pane: the key binding fragment,
+            # the disposable home, no lazy installs, and PATH with the stub
+            # launcher first so ``hermes`` inside the pane is that script.
             for args in (
                 ("source-file", str(T.REPO / "scripts" / "hermes-tab.conf")),
                 ("set-option", "-gw", "remain-on-exit", "failed"),
@@ -108,6 +140,8 @@ class RealHermesTabsTest(unittest.TestCase):
                        HERMES_GATEWAY_NO_SUPERVISE="1",
                        HERMES_DISABLE_LAZY_INSTALLS="1",
                        PYTHONDONTWRITEBYTECODE="1")
+            # The gateway runs as an unsupervised child process, logging to a
+            # file the assertions can quote when a wait times out.
             log = box.home / "smoke-gateway.log"
             with log.open("w") as output:
                 gateway = subprocess.Popen(
@@ -132,6 +166,9 @@ class RealHermesTabsTest(unittest.TestCase):
                     window = T._format(box.name, "#{window_id}")
                     self.assertEqual(T._window_name(window), "Hermes")
                     pane = T._format(box.name, "#{pane_id}")
+                    # "Session: <id>" is printed by the real CLI; waiting for
+                    # it rather than sleeping is what makes the timing robust
+                    # on a slow machine.
                     pattern = r"Session:\s+([\w-]+)"
                     self.assertTrue(T.wait_for(
                         lambda: bool(re.search(pattern, box.capture(pane))),
@@ -159,6 +196,9 @@ class RealHermesTabsTest(unittest.TestCase):
                     in ("sh", "bash", "zsh")),
                     T._format(shell, "#{pane_current_command}"))
 
+                # /exit closes the window it was typed in and nothing else: the
+                # sibling Hermes tab, the new shell window and the invoking pane
+                # all survive.
                 for index in (0, 1):
                     rc, out = T._tmux("select-window", "-t", windows[index])
                     self.assertEqual(rc, 0, out)
@@ -171,6 +211,8 @@ class RealHermesTabsTest(unittest.TestCase):
                 self.assertTrue(T._window_exists(shell))
                 self.assertTrue(T._pane_exists(box.pane_id))
             finally:
+                # The gateway is a real child process: terminate, then escalate
+                # to kill so a stuck process cannot outlive the sandbox.
                 client.close()
                 gateway.terminate()
                 try:

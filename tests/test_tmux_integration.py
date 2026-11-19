@@ -70,6 +70,11 @@ AGENTS = "agents"
 
 
 def _tmux(*args: str) -> Tuple[int, str]:
+    """One tmux command on the private server, stdout and stderr merged.
+
+    tmux reports refusals on stderr, and the tests want a single blob plus a
+    status rather than two streams.
+    """
     proc = subprocess.run([TMUX, "-L", SOCKET, "-f", CONFIG, *args],
                           capture_output=True, text=True, timeout=15)
     return proc.returncode, (proc.stdout + proc.stderr).rstrip("\n")
@@ -133,6 +138,12 @@ def tearDownModule():
 
 def wait_for(predicate: Callable[[], bool], timeout: float = 12.0,
              interval: float = 0.05) -> bool:
+    """Poll ``predicate`` until true or ``timeout`` expires; exceptions mean "not yet".
+
+    Predicates here read tmux or files that can disappear between calls, so a
+    single failed read is not a verdict. Tests that wait on the coordinator pass
+    20 s or more; the 12 s default covers one tmux read.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -148,6 +159,7 @@ def wait_for(predicate: Callable[[], bool], timeout: float = 12.0,
 
 
 def _format(target: str, fmt: str) -> str:
+    """A ``display-message -p`` expansion, '' when tmux did not answer."""
     rc, out = _tmux("display-message", "-p", "-t", target, fmt)
     return out.strip() if rc == 0 else ""
 
@@ -159,10 +171,12 @@ def _pane_exists(pane_id: Optional[str]) -> bool:
 
 
 def _window_exists(window_id: Optional[str]) -> bool:
+    """True only when the id resolves to itself (tmux exits 0 for a missing target)."""
     return bool(window_id) and _format(window_id, "#{window_id}") == window_id
 
 
 def _pane_pid(pane_id: str) -> Optional[int]:
+    """``#{pane_pid}`` as an int, or None when the pane does not resolve."""
     text = _format(pane_id, "#{pane_pid}")
     try:
         return int(text)
@@ -171,10 +185,15 @@ def _pane_pid(pane_id: str) -> Optional[int]:
 
 
 def _pane_command(pane_id: str) -> str:
+    """``pane_current_command``, used to tell the follower from a shell."""
     return _format(pane_id, "#{pane_current_command}")
 
 
 def _window_index(window_id: str) -> int:
+    """``#{window_index}`` as an int, -1 when unknown.
+
+    -1 sorts before every real tab rather than looking like tab 0.
+    """
     try:
         return int(_format(window_id, "#{window_index}"))
     except (TypeError, ValueError):
@@ -188,6 +207,11 @@ class Sandbox:
     """One disposable tmux session + its private HERMES_HOME."""
 
     def __init__(self, columns: int = 160, rows: int = 45):
+        """Allocate the name and a private home; create nothing yet.
+
+        ``_tmp`` is unused: ``test_concurrency._spawn`` assigns ``box._tmp``
+        itself, and nothing reads the value stored here.
+        """
         _counter[0] += 1
         self.name = "hx_it_%d_%d" % (os.getpid(), _counter[0])
         self.home = Path(tempfile.mkdtemp(prefix="hxtmux_home_"))
@@ -199,6 +223,12 @@ class Sandbox:
 
     # -- lifecycle ---------------------------------------------------------
     def __enter__(self) -> "Sandbox":
+        """Create a detached session running ``zsh -f``, then export into it.
+
+        HERMES_HOME, HERMES_TMUX and PYTHONPATH are set in the pane, not in this
+        process: ``cli`` types into that shell, so every command sees this
+        sandbox's profile and the private socket.
+        """
         rc, out = _tmux("new-session", "-d", "-P", "-F", "#{pane_id}",
                         "-s", self.name,
                         "-x", str(self.columns), "-y", str(self.rows),
@@ -213,6 +243,9 @@ class Sandbox:
         return self
 
     def __exit__(self, *exc):
+        """Kill the session by name and remove the home; the server belongs to module
+        teardown.
+        """
         if self.created:
             _tmux("kill-session", "-t", self.name)
         shutil.rmtree(self.home, ignore_errors=True)
@@ -220,6 +253,8 @@ class Sandbox:
 
     # -- driving the pane ---------------------------------------------------
     def pane(self, index: int = 0) -> str:
+        """The nth pane id of the session's first window, '' when there is no such pane.
+        """
         rc, out = _tmux("list-panes", "-t", self.pane_id, "-F", "#{pane_id}")
         panes = out.split()
         return panes[index] if len(panes) > index else ""
@@ -243,19 +278,29 @@ class Sandbox:
             return -1
 
     def export(self, name: str, value: str) -> None:
+        """Export in the pane shell; raises when zsh refused it."""
         rc = self.run("export %s=%s" % (name, value))
         if rc != 0:
             raise AssertionError("could not export %s" % name)
 
     def cli(self, *args: str, timeout: float = 20.0) -> int:
+        """Run ``python -m hermes_tmux ...`` in the pane, inheriting its exports."""
         return self.run("%s -m hermes_tmux %s" % (PY, " ".join(args)), timeout=timeout)
 
     def capture(self, target: Optional[str] = None) -> str:
+        """Visible screen plus scrollback of a pane, as text."""
         rc, out = _tmux("capture-pane", "-p", "-t", target or self.pane_id)
         return out
 
     # -- observation --------------------------------------------------------
     def windows(self) -> List[dict]:
+        """Windows with their own ``@hx`` marker, read through the format ``#{@hx}``.
+
+        Unlike ``test_tabs`` this harness uses the format read. That is safe only
+        because a window-format read falls back to the session, and no session here is
+        marked; ownership decisions that matter are asserted through pane options and
+        through the product's own ``show-options`` reads.
+        """
         rc, out = _tmux("list-windows", "-t", self.name,
                         "-F", "#{window_id}\t#{window_name}\t#{window_index}\t#{@hx}")
         rows = []
@@ -278,15 +323,23 @@ class Sandbox:
         return None
 
     def windows_named(self, name: str) -> List[dict]:
+        """Windows whose name is exactly this, in list order."""
         return [win for win in self.windows() if win["name"] == name]
 
     def own_windows(self) -> List[dict]:
+        """Windows carrying our marker, i.e. the workspace's own."""
         return [win for win in self.windows() if win["ours"]]
 
     def pane_title(self, pane_id: str) -> str:
+        """``#{pane_title}``. Informational only: v3 does not put identity there."""
         return _format(pane_id, "#{pane_title}")
 
     def panes_of(self, window_id: str) -> List[dict]:
+        """Panes of a window with the format-read marker, title and command.
+
+        ``ours`` here is the inherited value — it is used for reporting, never as the
+        proof that a pane may be killed.
+        """
         rc, out = _tmux("list-panes", "-t", window_id,
                         "-F", "#{pane_id}\t#{@hx}\t#{pane_title}\t#{pane_current_command}")
         rows = []
@@ -308,6 +361,7 @@ class Sandbox:
         return _option_value(rc, out, option)
 
     def layout(self) -> dict:
+        """The session's layout document, or {} before one exists."""
         child = self.tab_dir()
         if child is None:
             return {}
@@ -317,6 +371,7 @@ class Sandbox:
             return {}
 
     def tab_dir(self) -> Optional[Path]:
+        """The state directory holding layout.json, or None."""
         root = self.home / "cache" / "hermes-tmux" / "sessions"
         if not root.is_dir():
             return None
@@ -326,18 +381,22 @@ class Sandbox:
         return None
 
     def key(self) -> str:
+        """The workspace key, i.e. the state directory's name."""
         child = self.tab_dir()
         if child is None:
             raise AssertionError("no session state directory was written")
         return child.name
 
     def tabs(self) -> Dict[str, dict]:
+        """Tab records keyed ``<delegation_id>#<task_index>``."""
         return dict(self.layout().get("tabs") or {})
 
     def dismissed(self) -> Dict[str, float]:
+        """Keys of closed/retired tabs with the time of the decision."""
         return dict(self.layout().get("dismissed") or {})
 
     def render_text(self) -> str:
+        """The last published overview text, or ''."""
         child = self.tab_dir()
         if child is None:
             return ""
@@ -348,6 +407,7 @@ class Sandbox:
 
     # -- fixtures ----------------------------------------------------------
     def live(self) -> Path:
+        """Create and return the fixtures' ``cache/delegation/live`` root."""
         root = self.home / "cache" / "delegation" / "live"
         root.mkdir(parents=True, exist_ok=True)
         return root
@@ -361,6 +421,12 @@ class Sandbox:
     def add_delegation(self, deleg_id: str, tasks: List[dict],
                        model: str = "deepseek/deepseek-v4.1-flash-1017",
                        started: Optional[str] = None) -> Path:
+        """Write a manifest plus one ``task-N.log`` per task, as the real writer does.
+
+        ``status`` defaults to running and ``started`` to today: a task finished before
+        ``up`` is history and gets no tab, so a fixture meant to be live must look live.
+        ``lines`` replaces the default header when a test needs exact transcript text.
+        """
         started = started or datetime.now().strftime("%Y-%m-%d 09:00:00")
         d = self.live() / deleg_id
         d.mkdir(parents=True, exist_ok=True)
@@ -400,6 +466,11 @@ class Sandbox:
 
     def set_task_status(self, deleg_id: str, index: int, status: str,
                         exit_reason: Optional[str] = None) -> None:
+        """Rewrite one task's status (and optional exit_reason) atomically.
+
+        Raises for an unknown index so a mistyped fixture cannot pass while asserting
+        nothing.
+        """
         path = self.live() / deleg_id / "manifest.json"
         data = json.loads(path.read_text(encoding="utf-8"))
         found = False
@@ -414,6 +485,11 @@ class Sandbox:
         self._atomic_json(path, data)
 
     def append_event(self, deleg_id: str, task: int, role: str, text: str) -> None:
+        """Append one line in the writer's event format.
+
+        A write to a child of a watched directory is exactly the event the
+        coordinator's kqueue reports, so this is also how a test forces a pass.
+        """
         log = self.live() / deleg_id / ("task-%d.log" % task)
         stamp = time.strftime("%H:%M:%S")
         with open(log, "a", encoding="utf-8") as fh:
@@ -447,6 +523,7 @@ class Sandbox:
 
 
 def _option_value(rc: int, out: str, option: str) -> str:
+    """Parse ``option value`` out of ``show-options`` output; '' on a failed call."""
     if rc != 0:
         return ""
     for line in out.splitlines():
@@ -458,6 +535,7 @@ def _option_value(rc: int, out: str, option: str) -> str:
 
 @unittest.skipIf(SKIP, "tmux not installed")
 class IntegrationTest(unittest.TestCase):
+    """End-to-end behaviour against real tmux, one Sandbox per test."""
     maxDiff = None
 
     # -- shared helpers ----------------------------------------------------
@@ -476,6 +554,11 @@ class IntegrationTest(unittest.TestCase):
         return win
 
     def wait_tabs(self, box: Sandbox, count: int, timeout: float = 20.0) -> dict:
+        """Wait for ``count`` tabs whose recorded panes all exist.
+
+        The pane check matters because a record is published after its window is made;
+        the layout can briefly name a pane tmux has not listed yet.
+        """
         ok = wait_for(
             lambda: len(box.tabs()) == count
             and all(_pane_exists(tab.get("pane") or "") for tab in box.tabs().values()),
@@ -487,6 +570,10 @@ class IntegrationTest(unittest.TestCase):
         return box.layout()
 
     def assert_one_pane_per_tab(self, box: Sandbox, layout: dict, name: str = "") -> None:
+        """One pane in the window, and it is the tab's pane, with ``@hx`` on both.
+
+        The pane marker is read with ``show-options -p`` so inheritance cannot fake it.
+        """
         for wkey, tab in (layout.get("tabs") or {}).items():
             panes = box.panes_of(tab["window"])
             self.assertEqual(len(panes), 1,
@@ -500,11 +587,21 @@ class IntegrationTest(unittest.TestCase):
                              "%s: window %s has no @hx of its own" % (wkey, tab["window"]))
 
     def glyph(self, box: Sandbox, kind: str) -> str:
+        """The state glyph the product would draw for ``kind``, with this layout's ASCII
+        mode.
+        """
         from hermes_tmux import labels
         return labels.glyph(kind, bool(box.layout().get("ascii")))
 
     # ---- 1. startup ------------------------------------------------------
     def test_up_builds_workers_window_and_overview(self):
+        """``up`` builds the overview window and the running worker's tab beside it.
+
+        The worker tab is required to be a DIFFERENT window from ``agents``: packing it
+        into the overview was the v2 shape and is the regression this pins. The pane
+        must also print the transcript path it follows, so a pane that merely exists
+        (and runs nothing) fails.
+        """
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00001", [{"goal": "audit the parser"}])
             win = self.up(box)
@@ -529,6 +626,13 @@ class IntegrationTest(unittest.TestCase):
                             % box.capture(tab["pane"])[:300])
 
     def test_up_is_idempotent_and_reuses_panes(self):
+        """A second ``up`` changes no process and no record.
+
+        Reuse is asserted by pid, not by pane id: a restarted display loop keeps the id
+        and changes the pid. The tab record is compared whole, so a repointed ``pane``
+        or ``window`` is caught, and the static window count catches a duplicate
+        ``agents``.
+        """
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00002", [{"goal": "task one"}])
             self.up(box)
@@ -554,6 +658,12 @@ class IntegrationTest(unittest.TestCase):
 
     # ---- 2. worker tabs --------------------------------------------------
     def test_worker_panes_created_per_running_worker(self):
+        """Three running workers give three windows, each named for its own goal.
+
+        Three distinct windows rule out the v2 packing; the name is recomputed with
+        ``labels.tab_label`` because sibling de-duplication is part of the naming
+        contract. The overview window must hold exactly one pane.
+        """
         from hermes_tmux import labels
         goals = ["w0", "w1", "w2"]
         with Sandbox() as box:
@@ -664,6 +774,11 @@ class IntegrationTest(unittest.TestCase):
                               "%s: tab glyph does not carry state" % wkey)
 
     def test_new_worker_gets_its_own_pane_and_old_pane_is_not_stolen(self):
+        """A worker that appears later gets new ids; the existing tab is left alone.
+
+        The control is the first worker's record and pane: "a new pane was created" is
+        only good if the old one was neither repointed nor destroyed.
+        """
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00005", [{"goal": "first"}])
             self.up(box)
@@ -691,6 +806,11 @@ class IntegrationTest(unittest.TestCase):
                             "the first worker's pane was destroyed for the new one")
 
     def test_worker_command_focuses_the_pane_in_stable_slot_order(self):
+        """``worker 2`` is the second tab by window index, and it focuses that pane.
+
+        The target is derived by sorting the layout's windows, so the test does not
+        assume creation order equals display order.
+        """
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00019",
                                [{"goal": "w%d" % i} for i in range(3)])
@@ -773,6 +893,12 @@ class IntegrationTest(unittest.TestCase):
                                  "a stale layout made us mark the user's pane as ours")
 
     def test_worker_window_counts_for_zero_through_eight_workers(self):
+        """Window count is exactly workers + static windows, for 0..8.
+
+        The static set is computed from ``cli.testbench_tab_enabled()`` instead of
+        hard-coded, because whether ``hx:testbench`` exists is a configuration fact.
+        Every worker tab must still hold one pane at each count.
+        """
         for count in (0, 1, 2, 3, 4, 8):
             with self.subTest(workers=count):
                 with Sandbox() as box:
@@ -804,6 +930,11 @@ class IntegrationTest(unittest.TestCase):
 
     # ---- 3. events -------------------------------------------------------
     def test_up_rebuilds_a_lost_overview_without_repurposing_survivors(self):
+        """A new overview is built; no surviving worker pane is repurposed as one.
+
+        Reuse is asserted by pid: the tab's pane must still run the same process, and
+        the new overview must be neither the dead id nor the worker's pane.
+        """
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00106", [{"goal": "rebuild"}])
             self.up(box)
@@ -845,6 +976,11 @@ class IntegrationTest(unittest.TestCase):
                             "the live coordinator was not recognised")
 
     def test_events_stream_in_order_into_the_worker_pane(self):
+        """Appended events reach the worker pane, in order.
+
+        Order is asserted by text position in the capture: a follower that re-reads
+        the file could show them out of order and still contain each string.
+        """
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00007", [{"goal": "ordered"}])
             self.up(box)
@@ -862,6 +998,11 @@ class IntegrationTest(unittest.TestCase):
             self.assertLess(painted.index("step1"), painted.index("step2"))
 
     def test_overview_updates_on_transcript_events_without_restart(self):
+        """A transcript append repaints the overview without a restart.
+
+        The command text is asserted, not just the goal, so a repaint of the existing
+        record cannot satisfy it.
+        """
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00008", [{"goal": "live update"}])
             self.up(box)
@@ -964,6 +1105,10 @@ class IntegrationTest(unittest.TestCase):
             self.assertIn("run ended: error", box.render_text())
 
     def test_missing_delegation_directory_is_tolerated(self):
+        """An empty profile is described truthfully instead of erroring.
+
+        Both surfaces are checked: the pane render and the ``status`` text.
+        """
         with Sandbox() as box:
             self.up(box)
             self.assertTrue(wait_for(
@@ -975,6 +1120,11 @@ class IntegrationTest(unittest.TestCase):
 
     # ---- 5. review lifecycle --------------------------------------------
     def test_review_record_changes_display_and_is_listed(self):
+        """A recorded review appears in the row and in ``review list``.
+
+        The absence before recording is asserted first; without it, the string could
+        be present for another reason and the test would pin nothing.
+        """
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00010", [{"goal": "reviewable"}])
             self.up(box)
@@ -991,6 +1141,12 @@ class IntegrationTest(unittest.TestCase):
             self.assertIn("deleg_aaa00010", box.capture())
 
     def test_reviewer_role_never_inferred_from_executor(self):
+        """A goal that mentions review does not make the executor a reviewer.
+
+        The role set is read from ``state.load_workers``, the authority; the render is
+        checked only for the RUNNING label and for the absence of the word, because
+        prose is not where role is decided.
+        """
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00011", [{"goal": "please review this code"}])
             self.up(box)
@@ -1010,6 +1166,12 @@ class IntegrationTest(unittest.TestCase):
 
     # ---- 6. detach / reattach -------------------------------------------
     def test_detach_and_reattach_preserves_panes_and_watcher(self):
+        """Detach and reattach change no tab identity and start no second coordinator.
+
+        A real client on a pty is used because ``attach`` refuses a non-terminal. The
+        comparison is (window, pane) pairs, since the coordinator may legitimately add
+        bookkeeping; the watcher pid must be unchanged, not merely alive.
+        """
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00012", [{"goal": "survivor"}])
             self.up(box)
@@ -1118,6 +1280,12 @@ class IntegrationTest(unittest.TestCase):
                              "the overview pane survived down")
 
     def test_down_closes_only_our_windows_and_keeps_user_work(self):
+        """``down`` removes the workspace and its state directory, nothing else.
+
+        A reader's ``userwork`` window is the control; the state directory being empty
+        is the assertion that keeps ``sessions/`` from growing one dead directory per
+        run.
+        """
         with Sandbox() as box:
             _tmux("new-window", "-d", "-t", box.name, "-n", "userwork", "exec /bin/zsh -f")
             box.add_delegation("deleg_aaa00013", [{"goal": "teardown"}])
@@ -1246,6 +1414,11 @@ class IntegrationTest(unittest.TestCase):
                             "a pane with no option of its own was reported ours")
 
     def test_foreign_pane_is_never_killed(self):
+        """``close_pane`` refuses a pane we did not create (``not ours``).
+
+        The test exits non-zero from the child when the guard allows the kill, so a
+        regression cannot be mistaken for a passing probe.
+        """
         with Sandbox() as box:
             _tmux("new-window", "-d", "-t", box.name, "-n", "userwork", "exec /bin/zsh -f")
             user_win = box.window("userwork")
@@ -1259,6 +1432,11 @@ class IntegrationTest(unittest.TestCase):
 
     # ---- 8. aux panes ----------------------------------------------------
     def test_aux_panes_are_lazy_and_reused(self):
+        """Aux windows are created on first use and reused afterwards, by window id.
+
+        The id, not the name, is compared: a recreate could reuse the name and still
+        have built a second window.
+        """
         with Sandbox() as box:
             box.add_delegation("deleg_aaa00014", [{"goal": "aux"}])
             self.up(box)
@@ -1311,6 +1489,14 @@ class IntegrationTest(unittest.TestCase):
                     self.assertNotIn("fake", text.lower())
 
     def test_tests_run_routes_and_preserves_the_pane_and_status(self):
+        """``tests --run`` routes through TestBench, keeping window, pane and shell.
+
+        A fake ``testbench`` on PATH records its argv, so the routing (profile,
+        suite, ``--stream``) and the propagated exit status are both observable. The
+        pane must be the same pane afterwards, running a shell, and the reader's own
+        pane pid must be unchanged: a test runner that hijacks the caller's pane is
+        the failure.
+        """
         with Sandbox() as box:
             primary = _pane_pid(box.pane_id)
             bin_dir = box.home / ".local/bin"
@@ -1352,6 +1538,7 @@ class IntegrationTest(unittest.TestCase):
             self.assertEqual(_pane_pid(box.pane_id), primary)
 
     def test_tests_run_reports_interpreter_start_failure(self):
+        """A missing interpreter is reported in the pane with 127, not silently."""
         with Sandbox() as box:
             box.export("HX_PYTHON", str(box.home / "missing-python"))
             self.assertEqual(box.cli("tests", "--run", timeout=8), 127)
@@ -1361,11 +1548,23 @@ class IntegrationTest(unittest.TestCase):
             self.assertIn("missing-python", box.capture(pane))
 
     def test_tests_run_interrupt_reaps_testbench_and_keeps_test_shell(self):
+        """Interrupting reaps TestBench and leaves the pane usable.
+
+        Both SIGINT paths are exercised: Ctrl-C typed into the tests pane and SIGINT to
+        the invoking process. Exit 130, a shell left in the pane, and a TestBench pid
+        that no longer exists are the three claims; the last is what separates "the
+        command returned" from "the child was reaped".
+        """
         for target in ("test pane", "invoking process"):
             with self.subTest(target=target):
                 self._assert_tests_run_interrupt(target)
 
     def _assert_tests_run_interrupt(self, target):
+        """Drive ``tests --run`` in a real process against a TestBench that blocks.
+
+        The blocking child prints its pid, which is how "reaped" is checked after the
+        interrupt; the pane must be back to a shell, so the next run is not wedged.
+        """
         with Sandbox() as box:
             bin_dir = box.home / ".local/bin"
             bin_dir.mkdir(parents=True)
@@ -1438,6 +1637,7 @@ class IntegrationTest(unittest.TestCase):
 
     # ---- 9. gate / fallback ---------------------------------------------
     def test_gate_off_builds_nothing(self):
+        """``HERMES_TMUX=0`` builds no window and says why; ``status`` still works."""
         with Sandbox() as box:
             box.run("export HERMES_TMUX=0")
             box.add_delegation("deleg_aaa00015", [{"goal": "gated"}])
@@ -1448,6 +1648,11 @@ class IntegrationTest(unittest.TestCase):
             self.assertIn("gated", box.capture())
 
     def test_outside_tmux_degrades_gracefully(self):
+        """``up`` outside tmux exits 0 with a message, and ``status`` still prints.
+
+        No TMUX/TMUX_PANE is inherited, so this is the real "not in tmux" path rather
+        than a mock of it.
+        """
         home = Path(tempfile.mkdtemp(prefix="hxtmux_home_"))
         try:
             env = {k: v for k, v in os.environ.items()
@@ -1469,10 +1674,12 @@ class IntegrationTest(unittest.TestCase):
 
 
 def _q(text: str) -> str:
+    """Single-quote a Python snippet for the pane shell."""
     return "'" + text.replace("'", "'\\''") + "'"
 
 
 def _pid_alive(pid: Optional[int]) -> bool:
+    """``kill(pid, 0)`` probe for a pid this suite started."""
     if not pid:
         return False
     try:
@@ -1483,6 +1690,11 @@ def _pid_alive(pid: Optional[int]) -> bool:
 
 
 def _watcher_pid(box: Sandbox) -> Optional[int]:
+    """The live coordinator pid recorded under this home, or None.
+
+    A recorded pid is only returned when the process still answers ``kill(pid, 0)``;
+    liveness of the workspace itself is asserted separately by callers.
+    """
     root = box.home / "cache" / "hermes-tmux" / "sessions"
     if not root.is_dir():
         return None

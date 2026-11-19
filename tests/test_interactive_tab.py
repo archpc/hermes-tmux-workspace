@@ -1,4 +1,23 @@
-"""Exercise the optional binding through a real client on a private socket."""
+"""Exercise the optional key binding through a real client on a private socket.
+
+No mocks: a tmux client is attached on a pty, ``scripts/hermes-tab.conf`` is
+sourced into the sandbox's private server, and the bytes ``C`` are typed at the
+client. The binding is ``C`` -> ``new-window -c "#{pane_current_path}" -n Hermes
+"exec hermes"``: uppercase, so lowercase ``c`` keeps the reader's own meaning
+(the test rebinds ``c`` explicitly rather than assuming a default).
+
+A fake ``hermes`` on PATH is the probe, not a stand-in for the product: it
+prints the cwd, HERMES_HOME, a marker variable, argc and TMUX_PANE, which is
+how the test can tell a tab that inherited the SESSION environment from one
+that merely started. ``update-environment`` is cleared and the marker is set
+with ``set-environment`` on the server, so ``env=tmux session`` proves the new
+window forked from the server, not from the pane that pressed the key.
+
+What is pinned: each press opens an independent tab in the directory the reader
+was in, that tab is NOT ours (no ``@hx`` on window or pane, no close mark, so
+``down`` must leave it standing), and closing one tab with ``/exit`` does not
+touch the other.
+"""
 from __future__ import annotations
 
 import os
@@ -10,17 +29,46 @@ from tests.test_close_mark import Client
 
 
 def tearDownModule():
+    """The private server and temp homes belong to ``test_tabs``.
+
+    Reusing its teardown keeps one cleanup rule for both modules: only the
+    pid-scoped socket is killed, and every temp home is removed.
+    """
     T.tearDownModule()
 
 
 @unittest.skipIf(T.SKIP, "tmux not installed")
 class InteractiveTabTest(unittest.TestCase):
+    """One real tmux client on a pty, driving the uppercase ``C`` binding."""
     def tmux(self, *args):
+        """Run a tmux command and require success.
+
+        A binding that failed to load would otherwise surface much later as an
+        assertion about a window that never appeared.
+        """
         rc, out = T._tmux(*args)
         self.assertEqual(rc, 0, (args, out))
         return out
 
     def test_key_opens_two_independent_user_tabs(self):
+        """``C`` opens a tab that belongs to the reader, in the directory they were in.
+
+        The binding comes from ``scripts/hermes-tab.conf`` (``C`` -> ``new-window -c
+        #{pane_current_path} -n Hermes "exec hermes"``); lower-case ``c`` is rebound in
+        the test so it stays an ordinary new-window. The launcher on PATH prints the
+        cwd, HERMES_HOME, a marker variable, argc and TMUX_PANE, which is what makes
+        the environment claim checkable: the tab must see the session's
+        ``HX_TAB_MARKER``
+        ("tmux session") rather than the pane-local export, because
+        ``update-environment`` is cleared. Each press must land in the directory the
+        reader had cd'd to.
+
+        Ownership is the negative control: neither the window nor the pane may carry
+        ``@hx`` and the tab must not get the close mark, so ``down`` later must leave
+        both user tabs standing while it removes the workspace. Finally ``/exit`` in
+        the first tab closes only that tab: the second still runs and still receives
+        keystrokes, proving they were independent shells and not two views of one.
+        """
         with T.Sandbox() as box:
             fragment = T.REPO / "scripts" / "hermes-tab.conf"
             self.tmux("bind-key", "c", "new-window", "-c", "#{pane_current_path}")

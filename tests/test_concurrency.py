@@ -79,6 +79,7 @@ def tearDownModule():
 # --------------------------------------------------------------- small readers
 
 def _sessions_dir(box: Sandbox) -> Path:
+    """This profile's session-state root (one directory per workspace key)."""
     return box.home / "cache" / "hermes-tmux" / "sessions"
 
 
@@ -95,6 +96,7 @@ def _session_key(box: Sandbox) -> str:
 
 
 def _layout_at(box: Sandbox, key: str) -> Dict:
+    """Read one key's layout; {} when it does not exist or is unreadable."""
     path = _sessions_dir(box) / key / "layout.json"
     if not path.exists():
         return {}
@@ -114,6 +116,7 @@ def _layout_panes(layout: Dict) -> Set[str]:
 
 
 def _watch_pid_at(box: Sandbox, key: str) -> Optional[int]:
+    """The coordinator pid recorded under one key, or None."""
     path = _sessions_dir(box) / key / "watch.pid"
     if not path.exists():
         return None
@@ -133,6 +136,7 @@ def _pane_pid(pane_id: str) -> str:
 
 
 def _server_pid(pane_id: str) -> str:
+    """``#{pid}``: the tmux server process. Equal values mean one server."""
     return _tmux("display-message", "-p", "-t", pane_id, "#{pid}")[1].strip()
 
 
@@ -173,10 +177,12 @@ def _workspace_panes(box: Sandbox) -> Set[str]:
 
 
 def _client_ttys() -> str:
+    """TTYs of attached clients, newline-joined: '' means nobody is attached."""
     return _tmux("list-clients", "-F", "#{client_tty}")[1].strip()
 
 
 def _client_sessions() -> str:
+    """Session names of attached clients."""
     return _tmux("list-clients", "-F", "#{client_session}")[1].strip()
 
 
@@ -226,10 +232,20 @@ def _burn_pane_ids(box: Sandbox, count: int) -> None:
 
 @unittest.skipIf(SKIP, "tmux not installed")
 class ConcurrencyIsolationTest(unittest.TestCase):
+    """Three properties that need a real server because they are about tmux behaviour.
+    """
     maxDiff = None
 
     # ---- 1. two sessions, one server ------------------------------------
     def test_two_sessions_same_server_are_isolated(self):
+        """One server, two sessions: separate keys, panes, coordinators.
+
+        Equal digest halves prove both sessions talk to the same server instance, so
+        the isolation comes from the session and the key, not from two accidental
+        servers. ``down`` in one is the negative control: the other session's pane
+        pids, worker tabs and coordinator must be untouched. Pane pids, not ids,
+        because an id can be reissued.
+        """
         with Sandbox() as a, Sandbox() as b:
             self.assertEqual(_server_pid(a.pane_id), _server_pid(b.pane_id),
                              "the two sandboxes are not on one server")
@@ -310,6 +326,15 @@ class ConcurrencyIsolationTest(unittest.TestCase):
 
     # ---- 2. restart ------------------------------------------------------
     def test_restart_does_not_adopt_old_panes(self):
+        """A new server instance never adopts the previous incarnation's layout.
+
+        The burn prevents a spurious pane-id intersection after ids restart at
+        ``%0``: without it a fresh server could reissue an old id and
+        "disjoint" would be luck. That is what makes the assertion meaningful.
+        Only the private socket is killed. The old layout must still exist and
+        parse to the same document afterwards (ignored, not deleted or rewritten),
+        the key must differ, and no old pane may answer with its old pid.
+        """
         box = Sandbox()
         with box:
             _burn_pane_ids(box, _BURN)
@@ -369,6 +394,14 @@ class ConcurrencyIsolationTest(unittest.TestCase):
 
     # ---- 3. detach / reattach -------------------------------------------
     def test_detach_reattach_keeps_panes_and_coordinator(self):
+        """Detaching a real client changes nothing a reader can see.
+
+        A real attach needs a tty and TERM=xterm-256color, and the pty is sized to the
+        session so attaching cannot resize it. Tab identity is compared as
+        (window, pane) pairs, not whole records: the coordinator legitimately adds
+        ``seen``/``settled`` while the client is away, and asserting on the full record
+        would fail for correct behaviour.
+        """
         with Sandbox() as box:
             box.add_delegation(TAG_D, [{"goal": "keep me"}])
             self.assertEqual(box.cli("up"), 0)

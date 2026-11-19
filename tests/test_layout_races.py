@@ -28,7 +28,15 @@ ROUNDS = 20
 
 
 class LayoutTransactionTest(unittest.TestCase):
+    """Real processes and the real layout file; tmux is real where the race needs it."""
     def test_parallel_updates_do_not_lose_each_other(self):
+        """Eight writers, twenty appends each, all through ``update_layout``.
+
+        Per-writer counts are asserted as well as presence: an update lost near the
+        end still leaves the key present, so only the length discriminates. The old
+        read-modify-write shape fails here because the last writer's snapshot drops
+        every append made after its read.
+        """
         key = "race"
         home = Path(tempfile.mkdtemp(prefix="hxrace_"))
         try:
@@ -116,6 +124,12 @@ class LayoutTransactionTest(unittest.TestCase):
             self.assertIn("logs", (layout.get("aux") or {}), layout)
 
     def test_logs_after_up_keeps_the_worker_tab_record(self):
+        """The exact reported damage: ``up`` then ``logs`` must keep the worker tab.
+
+        Two claims: the aux write does not clobber ``tabs`` (and the pane it names is
+        still live), and the coordinator's next pass does not drop the ``aux`` entry
+        it did not write. The appended event is what forces that pass.
+        """
         with Sandbox() as box:
             box.add_delegation("deleg_race0001", [{"goal": "race"}])
             self.assertEqual(box.cli("up"), 0)

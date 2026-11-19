@@ -2,6 +2,33 @@
 
 Formatter is fed lines and returns display lines; no terminal, no clock, no
 tmux. ``run_tail(..., follow=False)`` is exercised against a temporary file.
+
+The invariant every case here serves is *one event, one terminal line*: nothing
+is dropped except the fixed file header and three duplicates the writer itself
+produces (a ``think`` that previews the ``assistant`` line after it, the
+``start`` line that restates a kickoff goal, and the ``end`` line whose exit
+reason merely repeats the status already printed). Tests that assert a line is
+*absent* are the ones defending that rule; tests that assert a malformed line
+*survives* defend the other half of it — a foreign line is evidence.
+
+Two groups, with different isolation:
+
+* ``Formatter`` tests are pure. They feed writer-format strings and inspect the
+  returned display lines; width, colour and ASCII mode are constructor
+  arguments, so nothing depends on the environment.
+* ``run_tail`` tests write a real file under ``SCRATCH`` and call it with
+  ``follow=False``; two tests spawn ``python -m hermes_tmux tail`` as a
+  subprocess because the rotation and busy-loop defects only appear in the
+  follower loop, and both are timing-sensitive (sleeps of 1.3 s / 1.5 s / 2.0 s
+  against a 1 s poll). They are slower than the rest of the file and the CPU
+  bound in ``test_unreadable_file_does_not_busy_loop`` is a 0.5 core average,
+  not a precise measurement.
+
+``SCRATCH`` is hardcoded to ``/Users/sein/.hermes/cache/scratch/hxlab`` on this
+branch (the ``TMPDIR``-portable version lives on another branch). Both ``setUp``
+methods ``makedirs`` that root and put every fixture inside it, so the run
+ignores ``TMPDIR`` and fails with ``PermissionError`` on any account that cannot
+create ``/Users/sein``.
 """
 
 from __future__ import annotations
@@ -17,8 +44,14 @@ from hermes_tmux import transcript
 from hermes_tmux.transcript import Formatter, run_tail
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+#: Fixed fixture root on this branch; see the module docstring. Every temporary
+#: transcript directory is created inside it.
 SCRATCH = "/Users/sein/.hermes/cache/scratch/hxlab"
 
+# The six lines the writer puts at the top of every transcript, verbatim. The
+# formatter suppresses them because the pane header and the kickoff event
+# already state the same facts; the tests feed them through the real matcher
+# rather than a shortened stand-in.
 HEADER_LINES = [
     "=== Hermes subagent live transcript ===",
     "delegation: deleg_fixt0001   task: 0",
@@ -30,11 +63,16 @@ HEADER_LINES = [
 
 
 def visible(text):
+    """The characters a pane shows: SGR sequences removed."""
     return ANSI_RE.sub("", text)
 
 
 def feed(stream, *lines):
-    """Flush every displayed line of ``stream`` into one list."""
+    """Flush every displayed line of ``stream`` into one list.
+
+    Blank lines are part of the output contract (they separate what the worker
+    said), so the helper keeps them rather than filtering.
+    """
     out = []
     for line in lines:
         out.extend(stream.feed(line))
@@ -42,6 +80,13 @@ def feed(stream, *lines):
 
 
 class TestHeader(unittest.TestCase):
+    """Header suppression, and the gate that stops it applying too late.
+
+    The header is skipped only until the first real event. After that, a line
+    that looks like a header is a quote inside the transcript or a second file
+    concatenated onto this one, and both must be shown.
+    """
+
     def test_header_lines_are_skipped_before_the_first_event(self):
         fmt = Formatter(width=100)
         for line in HEADER_LINES:
@@ -51,6 +96,7 @@ class TestHeader(unittest.TestCase):
         fmt = Formatter(width=100)
         for line in HEADER_LINES:
             fmt.feed(line)
+        # A ``start`` line becomes the TASK row plus the blank that follows it.
         self.assertEqual(fmt.feed("09:00:00  start  | Do the thing"),
                          ["09:00:00  TASK  Do the thing", ""])
 
@@ -64,6 +110,13 @@ class TestHeader(unittest.TestCase):
 
 
 class TestForeignLines(unittest.TestCase):
+    """Lines that are not events, or not roles we know.
+
+    These are the omission tests: a truncated write, a rotation warning or a
+    role added after this code was written must reach the reader, dimmed and
+    intact. Dropping one would make the transcript disagree with the file.
+    """
+
     def test_malformed_line_after_events_is_never_dropped(self):
         fmt = Formatter(width=100)
         fmt.feed("09:00:01  assistant  | hello")
@@ -72,17 +125,22 @@ class TestForeignLines(unittest.TestCase):
         self.assertIn("THIS IS NOT AN EVENT", out[0])
 
     def test_malformed_line_before_events_is_shown_too(self):
+        # Not the header, not an event: shown before any event has been seen.
         fmt = Formatter(width=100)
         out = fmt.feed("WARNING: log was rotated")
         self.assertIn("WARNING: log was rotated", "\n".join(out))
 
     def test_blank_lines_between_events_are_not_lines(self):
+        # Blank input produces nothing: the formatter adds its own separators,
+        # so echoing the file's blank lines would double the spacing.
         fmt = Formatter(width=100)
         fmt.feed("09:00:01  assistant  | hello")
         self.assertEqual(fmt.feed("   "), [])
         self.assertEqual(fmt.feed(""), [])
 
     def test_unknown_role_keeps_its_name(self):
+        # The parse anchors on the timestamp, so a role this module has never
+        # seen still renders under its own name instead of being swallowed.
         fmt = Formatter(width=100)
         out = fmt.feed("09:00:09  warning  | careful")
         self.assertEqual(len(out), 1)
@@ -91,7 +149,16 @@ class TestForeignLines(unittest.TestCase):
 
 
 class TestThinkCollapse(unittest.TestCase):
+    """The ``think``/``assistant`` duplicate, and the line of lookahead it needs.
+
+    A ``think`` is held until the next line shows whether it was a preview of
+    the assistant text that followed. Held state is why these are the only
+    formatter tests where input order and ``flush()`` matter.
+    """
+
     def test_think_that_previews_the_assistant_line_is_collapsed(self):
+        # The held think is dropped, so the output starts at the assistant
+        # block: blank, text, blank. Nothing is left to flush.
         fmt = Formatter(width=100)
         self.assertEqual(fmt.feed("09:00:02  think  | I'll read the layout first."), [])
         out = fmt.feed("09:00:03  assistant  | I'll read the layout first. Then the tests.")
@@ -99,6 +166,8 @@ class TestThinkCollapse(unittest.TestCase):
         self.assertEqual(fmt.flush(), [])
 
     def test_think_followed_by_something_else_is_emitted_first(self):
+        # Not a preview, so the held line is released *before* the new one, in
+        # the order the writer produced them.
         fmt = Formatter(width=100)
         fmt.feed("09:00:02  think  | I should look at the tests")
         out = fmt.feed("09:00:03  tool  | -> read_file(tests/test_render.py)")
@@ -107,6 +176,8 @@ class TestThinkCollapse(unittest.TestCase):
         self.assertIn("read_file", out[1])
 
     def test_think_at_end_of_file_is_flushed(self):
+        # A held line with nothing after it must still be shown; ``flush`` is
+        # idempotent because the follower calls it on every quiet poll.
         fmt = Formatter(width=100)
         self.assertEqual(fmt.feed("09:00:02  think  | still thinking"), [])
         out = fmt.flush()
@@ -115,6 +186,8 @@ class TestThinkCollapse(unittest.TestCase):
         self.assertEqual(fmt.flush(), [])
 
     def test_think_followed_by_a_shorter_assistant_text_is_kept(self):
+        # Only a *prefix* relationship suppresses the think. Unrelated text
+        # keeps both lines (held think, then the assistant block's three).
         fmt = Formatter(width=100)
         fmt.feed("09:00:02  think  | a completely different opening")
         out = fmt.feed("09:00:03  assistant  | something else entirely")
@@ -125,7 +198,11 @@ class TestThinkCollapse(unittest.TestCase):
 
 
 class TestKickoff(unittest.TestCase):
+    """The kickoff event: TASK line, optional context line, blank separator."""
+
     def test_kickoff_renders_task_and_context(self):
+        # Three lines: the goal is already the TASK row, so the second line
+        # carries only ``context:`` rather than repeating it.
         fmt = Formatter(width=100)
         out = fmt.feed("09:00:00  user  | kickoff: Build the thing | context: branch feat/x")
         self.assertEqual(len(out), 3)
@@ -135,6 +212,8 @@ class TestKickoff(unittest.TestCase):
         self.assertEqual(out[2], "")
 
     def test_start_line_after_kickoff_is_suppressed(self):
+        # ``_goal_shown`` is set by the kickoff and never reset within one
+        # file: the writer's ``start`` line is the same goal, verbatim.
         fmt = Formatter(width=100)
         fmt.feed("09:00:00  user  | kickoff: Build the thing")
         self.assertEqual(fmt.feed("09:00:00  start  | Build the thing"), [])
@@ -148,6 +227,15 @@ class TestKickoff(unittest.TestCase):
 
 
 class TestToolAndResult(unittest.TestCase):
+    """Tool calls and results: one fitted line each, clipped visibly.
+
+    The clip marker counts *characters* hidden, not columns: it is a "how much
+    text you are not seeing" budget, and the column fitting happens separately
+    in ``_fit``. Two columns are held back from the pane width (``_MARGIN``) so
+    a pane created wider than the client that draws it cannot wrap one
+    character onto its own line.
+    """
+
     def test_tool_call_is_one_line_with_arrow_stripped(self):
         fmt = Formatter(width=100)
         out = fmt.feed("09:00:04  tool  | -> read_file(path=a.py)")
@@ -156,6 +244,7 @@ class TestToolAndResult(unittest.TestCase):
         self.assertNotIn("->", out[0])
 
     def test_tool_call_is_fitted_to_the_width(self):
+        # The pane width minus the two-column margin is the hard bound here.
         for width in (60, 80, 100):
             fmt = Formatter(width=width)
             line = fmt.feed("09:00:04  tool  | -> execute_code(" + "x" * 300 + ")")[0]
@@ -165,6 +254,8 @@ class TestToolAndResult(unittest.TestCase):
             self.assertIn("chars)", line)
 
     def test_tool_call_clipping_counts_what_is_hidden(self):
+        # The marker must end the line and carry a positive count: a marker of
+        # "0 chars" would claim a clip that did not happen.
         fmt = Formatter(width=60)
         args = "x" * 300
         line = visible(fmt.feed("09:00:04  tool  | -> execute_code(" + args + ")")[0])
@@ -194,6 +285,8 @@ class TestToolAndResult(unittest.TestCase):
         self.assertLessEqual(len(visible(out[0])), 58)
 
     def test_error_result_shows_the_message(self):
+        # The payload's ``output`` field is the message when no named ``error``
+        # exists; the JSON framing around it is dropped.
         fmt = Formatter(width=100)
         out = fmt.feed('09:00:21  result  | terminal ERROR 5.0s: '
                        '{"output": "FAILED (errors=1)", "exit_code": 1}')
@@ -202,6 +295,7 @@ class TestToolAndResult(unittest.TestCase):
         self.assertIn("FAILED (errors=1)", out[0])
 
     def test_named_error_field_is_what_is_shown(self):
+        # ``error`` wins over ``output``; the JSON key itself must not leak.
         fmt = Formatter(width=100)
         out = fmt.feed('09:00:21  result  | tool ERROR 0.4s: '
                        '{"output": "", "exit_code": 1, "error": "permission denied"}')
@@ -209,6 +303,9 @@ class TestToolAndResult(unittest.TestCase):
         self.assertNotIn('"error"', out[0])
 
     def test_error_result_is_not_fitted_to_one_line(self):
+        # Deliberate asymmetry: an ERROR is printed in full and left to the
+        # terminal to wrap, so the message is never truncated and never grows a
+        # chars marker. The test asserts both halves.
         fmt = Formatter(width=40)
         out = fmt.feed('09:00:21  result  | tool ERROR 0.4s: '
                        '{"output": "", "error": "' + "e" * 300 + '"}')
@@ -224,7 +321,16 @@ class TestToolAndResult(unittest.TestCase):
 
 
 class TestFinal(unittest.TestCase):
+    """The run's last lines: ``final status=… duration=…`` and ``end … exit_reason=…``.
+
+    ``end`` repeats the status ``final`` already printed, so it renders only
+    when the reason is news. Both forms can appear alone: a follower started
+    mid-file sees only the ``end`` line.
+    """
+
     def test_final_line_shows_status_and_duration(self):
+        # A clean finish is separated from the transcript by one blank line and
+        # reports the duration in the humanised form, not raw seconds.
         fmt = Formatter(width=100)
         out = fmt.feed("09:02:14  final  | status=completed duration=134s summary: all good")
         self.assertEqual(len(out), 2)
@@ -240,6 +346,7 @@ class TestFinal(unittest.TestCase):
     def test_end_line_repeats_nothing_when_the_reason_matches(self):
         fmt = Formatter(width=100)
         fmt.feed("09:02:14  final  | status=completed duration=134s")
+        # reason == status, so the closing line adds nothing.
         self.assertEqual(fmt.feed("09:02:14  final  | end status=completed exit_reason=completed"),
                          [])
 
@@ -252,6 +359,8 @@ class TestFinal(unittest.TestCase):
         self.assertIn("exit: max_iterations", out[0])
 
     def test_end_line_alone_shows_the_reason(self):
+        # The comparison is against the status in the same line, not against a
+        # remembered one, so this works without a preceding ``final``.
         fmt = Formatter(width=100)
         out = fmt.feed("09:02:14  final  | end status=failed exit_reason=timeout")
         self.assertEqual(len(out), 1)
@@ -259,6 +368,13 @@ class TestFinal(unittest.TestCase):
 
 
 class TestStyle(unittest.TestCase):
+    """Colour and ASCII: same characters, different presentation.
+
+    Colour on must be the plain text with SGR inserted, never a different
+    layout — the pane and a pipe must agree. ASCII mode replaces every glyph
+    and every ellipsis, because a non-UTF-8 locale turns them into mojibake.
+    """
+
     def test_colour_off_has_no_escape_byte(self):
         fmt = Formatter(width=100, colour=False)
         out = feed(fmt, "09:00:00  user  | kickoff: Build it",
@@ -284,6 +400,8 @@ class TestStyle(unittest.TestCase):
         self.assertEqual([visible(line) for line in coloured], plain)
 
     def test_ascii_mode_uses_ascii_markers(self):
+        # Index-based assertions only where the marker is the whole claim: the
+        # bullet becomes ">", the error mark becomes "x".
         fmt = Formatter(width=100, colour=False, ascii_mode=True)
         out = feed(fmt, "09:00:03  tool  | -> read_file(a)",
                    "09:00:04  result  | read_file ok 0.1s: x",
@@ -303,6 +421,16 @@ class TestStyle(unittest.TestCase):
 
 
 class TestRunTail(unittest.TestCase):
+    """``run_tail(follow=False)`` against a real file: a one-shot read.
+
+    The file path is printed first so a reader always knows where the full text
+    is, and the exit code is 0 for every outcome including a missing file — the
+    pane must not die because a transcript has not been created yet.
+
+    The fixture directory lives under ``SCRATCH``; ``setUp`` creates the root if
+    it is absent and ``tearDown`` removes only the files it created.
+    """
+
     def setUp(self):
         os.makedirs(SCRATCH, exist_ok=True)
         self.dir = tempfile.mkdtemp(dir=SCRATCH)
@@ -318,6 +446,9 @@ class TestRunTail(unittest.TestCase):
             handle.write(text)
 
     def run_once(self):
+        # stdout is captured instead of redirected to a pty: ``colour_enabled``
+        # then says "not a tty" and the output is plain, which is what the
+        # assertions below expect.
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             code = run_tail(self.path, follow=False)
@@ -341,6 +472,8 @@ class TestRunTail(unittest.TestCase):
         self.assertIn("thinking about it", out)
 
     def test_missing_file_does_not_write_events(self):
+        # An empty transcript is one line of path plus the blank separator;
+        # nothing is invented for a file with no events.
         self.write("")
         code, out = self.run_once()
         self.assertEqual(code, 0)
@@ -371,7 +504,9 @@ class TestNarrowAndMidFile(unittest.TestCase):
 
     def test_fitted_lines_never_exceed_a_narrow_pane(self):
         # Below about 40 columns the timestamp and tool name alone are wider
-        # than the pane; the terminal wraps those.
+        # than the pane; the terminal wraps those. The test asserts the fitted
+        # part never *adds* to the problem: no line this module produces may
+        # exceed the pane width.
         for width in (40, 46, 61, 93):
             fmt = Formatter(width=width, colour=False)
             for line in ("12:00:00  tool  | -> execute_code(" + "x" * 50 + ")",
@@ -380,6 +515,9 @@ class TestNarrowAndMidFile(unittest.TestCase):
                     self.assertLessEqual(len(out), width, (width, out))
 
     def test_clip_marker_is_whole_or_absent(self):
+        # A 20-column pane is narrower than the marker itself; the regex is the
+        # negative control for a half-written "(+12 c" — either the whole marker
+        # or a bare ellipsis, never a fragment.
         out = Formatter(width=20, colour=False).feed(
             "12:00:00  tool  | -> execute_code(" + "x" * 50 + ")")[0]
         self.assertNotRegex(out, r"\(\+\d+ c(?!hars\))")
@@ -401,6 +539,10 @@ class TestUntrustedText(unittest.TestCase):
     terminal. OSC 52 sets a clipboard, OSC 8 forges a link, CSI clears a pane,
     and a bare NUL/CR edits the line that was just drawn."""
 
+    #: Each entry is a complete attack, not a fragment: clipboard write, forged
+    #: hyperlink, clear+home, window title, NUL, carriage return, 8-bit CSI and
+    #: a bidi override. The last one reorders what is displayed while the bytes
+    #: stay identical.
     HOSTILE = [
         "\x1b]52;c;cHduZWQ=\x07",
         "\x1b]8;;https://evil.example\x1b\\x\x1b]8;;\x1b\\",
@@ -413,6 +555,8 @@ class TestUntrustedText(unittest.TestCase):
     ]
 
     def displayed(self, line):
+        # Assembled with "\n" so one assertion can look for a byte anywhere in
+        # the rendered block rather than per line.
         out = Formatter(width=90, colour=False).feed(line)
         return "\n".join(out)
 
@@ -430,6 +574,8 @@ class TestUntrustedText(unittest.TestCase):
                 self.assertIn("b", out)
 
     def test_tool_and_foreign_lines_are_defused_too(self):
+        # Defusing happens before the event parse, so it covers the tool and
+        # "not an event" branches without either of them remembering to ask.
         for line in ("09:00:00  tool  | -> read(\x1b]52;c;x\x07)",
                      "noise \x1b]52;c;x\x07",
                      '09:00:00  result  | t ok 0.1s: {"output": "\x1b[2J"}'):
@@ -437,13 +583,22 @@ class TestUntrustedText(unittest.TestCase):
             self.assertNotIn("\x1b", out, line)
 
     def test_tab_is_kept(self):
+        # Tabs are the one control character kept: they are layout the writer
+        # may have used, and the terminal expands them harmlessly.
         out = self.displayed("09:00:00  assistant  | a\tb")
         self.assertIn("a\tb", out)
 
 
 class TestRotation(unittest.TestCase):
     """Replacing the file is not truncating it: a larger replacement used to be
-    read from the old offset, showing half a line and skipping the start."""
+    read from the old offset, showing half a line and skipping the start.
+
+    Both tests drive ``python -m hermes_tmux tail`` as a subprocess, because the
+    follower loop is the thing under test. They are timing-sensitive: the first
+    waits 1.3 s before the replacement so the follower has taken its initial
+    read and is parked on a 1 s poll; the second measures CPU over 2 s, which is
+    a coarse bound (a spin burns ~2 s of CPU, a correct wait ~0).
+    """
 
     def setUp(self):
         os.makedirs(SCRATCH, exist_ok=True)
@@ -456,12 +611,18 @@ class TestRotation(unittest.TestCase):
         os.rmdir(self.dir)
 
     def test_replacement_from_the_beginning(self):
+        # ``os.replace`` keeps the path and changes the inode. The follower
+        # keys on (st_dev, st_ino), so it must restart at offset 0 and show the
+        # whole new file. "MENT-HEAD" is the negative control: it is the tail of
+        # "REPLACEMENT-HEAD" and can only appear if the reader started mid-line.
         import subprocess
         import sys
         import time
 
         with open(self.path, "w", encoding="utf-8") as handle:
             handle.write("09:00:00  assistant  | first\n")
+        # NO_COLOR/TERM=dumb keep the child's output plain, so the assertions
+        # match text rather than escape-laden lines.
         env = {**os.environ, "NO_COLOR": "1", "TERM": "dumb"}
         proc = subprocess.Popen(
             [sys.executable, "-m", "hermes_tmux", "tail", self.path],
@@ -485,10 +646,13 @@ class TestRotation(unittest.TestCase):
         self.assertNotIn("MENT-HEAD", out.replace("REPLACEMENT-HEAD", ""))
         self.assertIn("first", out)
 
-
     def test_unreadable_file_does_not_busy_loop(self):
         # stat() succeeds and open() fails: the old loop treated the empty read
         # as "no new data" and retried with no wait, burning a core.
+        #
+        # This relies on chmod 000 actually denying the read, i.e. on not
+        # running as root; as root the file stays readable and the test proves
+        # nothing about the spin path (it still passes, vacuously).
         import resource
         import subprocess
         import sys
@@ -505,6 +669,8 @@ class TestRotation(unittest.TestCase):
         try:
             time.sleep(2.0)
         finally:
+            # Restore permissions first: tearDown has to unlink the file, and
+            # the directory removal fails on a file it cannot read.
             os.chmod(self.path, 0o600)
             proc.terminate()
             try:
