@@ -17,7 +17,10 @@ from hermes_tmux import transcript
 from hermes_tmux.transcript import Formatter, run_tail
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-SCRATCH = "/Users/sein/.hermes/cache/scratch/hxlab"
+# Portable scratch parent: the system temp dir (TMPDIR on macOS, /tmp on CI),
+# not a hardcoded user home. A fixed /Users/<name> path is unwritable on any
+# other account (e.g. CI runners) and leaks a private path into the repo.
+SCRATCH = os.path.join(tempfile.gettempdir(), "hxlab")
 
 HEADER_LINES = [
     "=== Hermes subagent live transcript ===",
