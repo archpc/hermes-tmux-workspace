@@ -912,9 +912,11 @@ def cmd_aux(args) -> int:
     """Ensure one `hx:<role>` window and focus it (or run the suite for `tests`).
 
     The session the aux window is created in is the *recorded* one while it
-    lives, otherwise the current session — the same anchor rule `up` uses, so a
-    second terminal cannot build the permanent tabs in a different session of
-    the same group and end up with two `hx:mail`s.
+    lives, otherwise the current session (focus semantics). That fallback is
+    deliberately NOT `up`'s anchor rule (the group's lowest session, DESIGN §7):
+    aux is a navigation command, so it follows the terminal you typed in. The
+    recorded-session branch still keeps a second terminal from building a second
+    `hx:mail` in another session of the same group.
 
     Exit status: 0 for "opened/focused", 1 for a refused run (`tests --run` with
     a disabled gate, outside tmux, or already running). A plain aux command

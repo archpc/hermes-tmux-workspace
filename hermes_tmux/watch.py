@@ -302,8 +302,9 @@ class WatchSet:
       inode and would fire nothing ever again; ``sync`` re-opens on a
       ``(st_dev, st_ino)`` change.
     * **the set is capped** (``_MAX_WATCH_DIRS``/``_MAX_WATCH_FILES``) because
-      the process inherits the launchd soft ``RLIMIT_NOFILE`` (256 on macOS)
-      and must leave room for the descriptors it is not watching. The cap keeps
+      the process must stay under its ``RLIMIT_NOFILE`` soft limit (often 256
+      under launchd on macOS, higher from a login shell — environment-dependent)
+      and leave room for the descriptors it is not watching. The cap keeps
       the *caller-priority prefix*, never an arbitrary subset.
     * **events are not queued per path**: ``wait`` returns a count and records
       the ids that fired in ``fired_fds``; ``sync`` re-arms everything with
@@ -525,7 +526,8 @@ def collect_paths(
     * ``dirs``: the Hermes home (only for its own file creation, when watching
       the DB), the hermes-tmux state dir (``reviews.json`` appears there), the
       nearest existing ancestors of ``live/`` (a brand-new profile has no live
-      root yet), the live root, and up to 40 delegation dirs;
+      root yet), the live root, every live delegation dir, and a 40-dir
+      name-order sample of the rest (the whole set capped at ``_MAX_WATCH_DIRS``);
     * ``files``: ``state.db``, ``state.db-wal``, ``reviews.json``, then every
       manifest of the selected dirs, then the logs of live delegations, then the
       logs of up to 8 completed delegations from that same sample.
