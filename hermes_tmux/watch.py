@@ -19,6 +19,31 @@ detach/reattach):
     not wake the pane; if the coordinator is absent, ``follow`` watches
     ``state.db`` directly and degrades gracefully on bounded timer wakes
     (``_FOLLOW_RUNNING_WAKE_S`` while work is running, ``_FOLLOW_WAKE_S`` idle).
+
+Division of labour. As between these two processes, only the coordinator mutates
+tmux state and ``layout.json``; ``follow`` reads state and draws. (The CLI
+commands do the same mutations on demand, under the same locks.) Everything the
+coordinator does is idempotent per pass, because a pass can die half-way (tmux
+timeout, SIGTERM, a killed server) and the next one must converge from whatever
+is on disk.
+
+What this module is not. It does not decide what a worker's state *is* — that
+is ``state.load_workers``. It does not decide whether work is good, and it
+never invents an event: every redraw is caused by a vnode that actually fired
+or by a timer whose only job is to let a display-only label age. Silence in a
+transcript is not progress, and it is not failure either.
+
+Concurrency in one paragraph. ``layout.json`` is shared by the coordinator,
+``up``, ``open``, every aux command and ``down``. Reads go through
+``read_layout``; writes go through ``update_layout`` (flock on
+``.layout.lock``, read-modify-write). A tab *pass* is not atomic — it reads the
+layout, spends seconds in tmux, then writes — so its write is a three-way merge
+(``_merge``) of "what I saw" against "what is there now" that only applies this
+pass's own deltas. Writing the whole document back is what once reverted a tab
+``open`` had just published and produced a duplicate window for the same
+worker. The coordinator's own liveness is a separate flock on ``watch.lock``:
+whoever holds it *is* the coordinator, which is the identity ``down`` and
+``follow`` test (a command line can be forged, an open lock cannot).
 """
 
 from __future__ import annotations
@@ -59,13 +84,18 @@ def linger_s() -> float:
 
 OVERVIEW_WINDOW = "agents"
 #: Idle wake while a tab is waiting to retire or be acknowledged; otherwise the
-#: coordinator sleeps for the whole session-check interval.
+#: coordinator sleeps for the whole session-check interval. A settled tab must
+#: age out on time even when nothing on disk changes, which is why this is a
+#: timer and not an event.
 _TICK_S = 5.0
 _DEBOUNCE_S = 0.12
 #: Floor between event-driven passes. state.db-wal is written on every Hermes
 #: event, so an unthrottled vnode loop would re-read 40 transcripts many times a
 #: second. One second still reads as live and keeps the coordinator cheap.
 _MIN_RENDER_INTERVAL_S = 1.0
+#: Unused today: nothing reads it. The loop's waits come from ``_TICK_S`` and
+#: ``_SESSION_CHECK_S``; the constant remains only so the numbers in this block
+#: stay together.
 _TIMER_WAKE_S = 60.0
 #: Upper bound on how long the pane may go without re-reading state. Only used so
 #: the pane degrades (stale but truthful) instead of freezing when nothing fires.
@@ -87,33 +117,55 @@ _VNODE_FLAGS = (
 # --------------------------------------------------------------------------- paths
 
 def state_root(home: Optional[Path] = None) -> Path:
+    """``<HERMES_HOME>/cache/hermes-tmux``: one directory per install, not per server."""
     from .state import hermes_home
     base = hermes_home(home)
     return base / "cache" / STATE_DIR_NAME
 
 
 def session_dir(key: str, home: Optional[Path] = None) -> Path:
+    """Per-workspace directory: layout, render.txt, lock, pid, watch.log.
+
+    Named by the workspace key, which already contains the server digest, so two
+    servers never share one. Everything here is disposable: ``down`` removes it
+    once no coordinator holds the lock.
+    """
     return state_root(home) / "sessions" / key
 
 
 def layout_path(key: str, home: Optional[Path] = None) -> Path:
+    """``layout.json``: the only durable record of what this workspace built."""
     return session_dir(key, home) / "layout.json"
 
 
 def render_path(key: str, home: Optional[Path] = None) -> Path:
+    """``render.txt``: the plain overview text, doubled as the redraw signal."""
     return session_dir(key, home) / "render.txt"
 
 
 def pid_path(key: str, home: Optional[Path] = None) -> Path:
+    """``watch.pid``: a hint only. Identity is the lock holder, not this file."""
     return session_dir(key, home) / "watch.pid"
 
 
 def lock_path(key: str, home: Optional[Path] = None) -> Path:
+    """``watch.lock``: the coordinator's flock for its whole life."""
     return session_dir(key, home) / "watch.lock"
 
 
 def coordinator_alive(key: str, home: Optional[Path] = None) -> bool:
-    """True when a coordinator currently holds the advisory flock on ``watch.lock``."""
+    """True when a coordinator currently holds the advisory flock on ``watch.lock``.
+
+    Probes by *taking* the lock non-blocking and releasing it: an EACCES/EAGAIN
+    answer means someone holds it, any other error (including "no file") means
+    nobody does. The probe is a momentary hold, which is why ``run_watch``
+    retries its own lock a few times at startup instead of exiting on the first
+    refusal.
+
+    This is used by ``follow`` to decide whether it needs to watch
+    ``state.db-wal`` itself. A false "alive" costs a missed redraw until the
+    next timer wake; a false "dead" costs a redundant watch, not a wrong screen.
+    """
     lp = lock_path(key, home)
     if not lp.is_file():
         return False
@@ -138,6 +190,17 @@ def coordinator_alive(key: str, home: Optional[Path] = None) -> bool:
 
 
 def atomic_write(path: Path, text: str) -> bool:
+    """Replace ``path`` with ``text`` via a sibling temp file + ``os.replace``.
+
+    Readers see either the old file or the new one: this is what makes a
+    half-written ``layout.json`` impossible and what lets ``follow`` treat the
+    session directory as a change signal. Returns False instead of raising.
+
+    Not a transaction by itself: the temp name is fixed, so concurrent writers
+    must hold the layout lock (``update_layout`` does) or they can clobber each
+    other's temp file. No fsync: a crash can lose the last write, but can never
+    leave a truncated document.
+    """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
@@ -149,6 +212,13 @@ def atomic_write(path: Path, text: str) -> bool:
 
 
 def read_layout(key: str, home: Optional[Path] = None) -> Dict:
+    """The layout document, or ``{}`` when it is missing or unreadable.
+
+    ``{}`` is "nothing recorded", not "nothing exists": callers must treat every
+    key as optional (they do — every read is ``.get``). Callers that intend to
+    write use ``update_layout`` so this read is not the one that gets written
+    back minutes later.
+    """
     try:
         return json.loads(layout_path(key, home).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -164,6 +234,10 @@ def _layout_lock(key: str, home: Optional[Path] = None):
     that was mid-flight while another process published a change silently
     reverted it: `up` then `logs` dropped tail_panes, and the coordinator could
     drop an aux entry. The lock makes the update a transaction.
+
+    Degraded path: if the lock file cannot be opened the body still runs,
+    unlocked. That keeps a read-only or full-disk home working for commands
+    that only read; it also means last-writer-wins is back for that one update.
     """
     path = session_dir(key, home) / ".layout.lock"
     try:
@@ -183,7 +257,18 @@ def _layout_lock(key: str, home: Optional[Path] = None):
 
 
 def update_layout(key: str, mutate, home: Optional[Path] = None) -> Dict:
-    """Read, apply ``mutate``, write, all under the layout lock."""
+    """Read, apply ``mutate``, write, all under the layout lock.
+
+    ``mutate`` receives the current document and may change it in place, return
+    a replacement dict, or return anything else (``None``) to mean "I mutated
+    it". The write happens unconditionally, so it stamps ``updated`` even when
+    nothing changed; callers that would rewrite the same document every pass
+    compare before/after themselves (``reconcile_tabs`` does).
+
+    Returns the document as written, which is what the caller should continue
+    to reason about: it may contain changes made by another process while this
+    one was working.
+    """
     with _layout_lock(key, home):
         layout = read_layout(key, home)
         result = mutate(layout)
@@ -194,6 +279,11 @@ def update_layout(key: str, mutate, home: Optional[Path] = None) -> Dict:
 
 
 def write_layout(key: str, layout: Dict, home: Optional[Path] = None) -> bool:
+    """Serialise and atomically replace the document, stamping ``updated``.
+
+    Low-level escape hatch for tests and the initial write; live code goes
+    through ``update_layout`` so it cannot revert a concurrent change.
+    """
     layout["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
     return atomic_write(layout_path(key, home),
                         json.dumps(layout, indent=2, sort_keys=True))
@@ -202,7 +292,29 @@ def write_layout(key: str, layout: Dict, home: Optional[Path] = None) -> bool:
 # --------------------------------------------------------------------------- kqueue
 
 class WatchSet:
-    """kqueue wrapper over vnodes. `sync(paths)` reconciles the watch set."""
+    """kqueue wrapper over vnodes. `sync(paths)` reconciles the watch set.
+
+    One descriptor per watched path, held for as long as it is wanted, plus an
+    optional wake pipe for a signal. Three properties matter:
+
+    * **identity is the inode**, not the path. A file replaced while watched
+      (``atomic_write``, log rotation) keeps its old descriptor on an unlinked
+      inode and would fire nothing ever again; ``sync`` re-opens on a
+      ``(st_dev, st_ino)`` change.
+    * **the set is capped** (``_MAX_WATCH_DIRS``/``_MAX_WATCH_FILES``) because
+      the process inherits the launchd soft ``RLIMIT_NOFILE`` (256 on macOS)
+      and must leave room for the descriptors it is not watching. The cap keeps
+      the *caller-priority prefix*, never an arbitrary subset.
+    * **events are not queued per path**: ``wait`` returns a count and records
+      the ids that fired in ``fired_fds``; ``sync`` re-arms everything with
+      ``KQ_EV_CLEAR``. A pass therefore knows which files changed, not in what
+      order, which is all the throttle needs.
+
+    ``close()`` releases every descriptor including the wake pipe. It does not
+    unregister the wake fd with the interpreter (``signal.set_wakeup_fd``);
+    that is fine only for a process that closes the set on its way out, which
+    ``follow`` does.
+    """
 
     def __init__(self) -> None:
         self.kq = select.kqueue()
@@ -236,6 +348,12 @@ class WatchSet:
             pass
 
     def _add(self, fd: int) -> None:
+        """Arm a vnode filter, edge-triggered with auto-clear.
+
+        ``KQ_EV_CLEAR`` resets the state after delivery, so one append yields
+        one wake rather than a permanently-fired descriptor. A failure is
+        ignored: a path that cannot be watched degrades to the timer wake.
+        """
         try:
             self.kq.control(
                 [select.kevent(fd, filter=select.KQ_FILTER_VNODE,
@@ -255,6 +373,19 @@ class WatchSet:
         return (st.st_dev, st.st_ino)
 
     def sync(self, dirs: Sequence[Path], files: Sequence[Path]) -> None:
+        """Make the watched set exactly ``dirs`` + ``files``, in priority order.
+
+        Order is preserved (``dict.fromkeys``) and load-bearing: the caps below
+        are applied by skipping the tail, so the caller puts ``state.db``,
+        ``state.db-wal`` and ``reviews.json`` at the head of ``files`` and they
+        are the ones that survive a constrained process.
+
+        Removal happens first and for two reasons: the path is no longer wanted,
+        or its inode changed (stat failure counts as changed). Then additions
+        fill up to the caps. A directory that cannot be opened (deleted between
+        listing and sync) is skipped silently; the next listing brings its
+        replacement.
+        """
         # Preserve caller priority order (dict.fromkeys) so critical singleton
         # files at the head of `files` (state.db, state.db-wal, reviews.json)
         # are never dropped when len(files) exceeds _MAX_WATCH_FILES.
@@ -308,6 +439,9 @@ class WatchSet:
 
         The handler only writes a byte to a pipe that the kqueue watches, so
         nothing is raised into whatever the process happens to be doing.
+
+        Any failure leaves ``_wake_fd`` None and the loop falls back to timer
+        wakes; a resize then arrives at the next pass instead of instantly.
         """
         import signal
         try:
@@ -339,6 +473,14 @@ class WatchSet:
         self.fired_fds.clear()
 
     def wait(self, timeout: Optional[float]) -> int:
+        """Wait up to ``timeout`` for vnode/signal events; return how many fired.
+
+        Records each fired descriptor in ``fired_fds`` (the coordinator uses it
+        to tell "only the database changed" from "a delegation changed").
+        ``signal_woke`` says a resize arrived, which the follower treats as
+        "discard the last frame and redraw". ``EINTR`` is a normal return of 0,
+        not an error: a signal that is not a resize must not kill the loop.
+        """
         self.signal_woke = False
         try:
             events = self.kq.control(None, 64, timeout)
@@ -353,7 +495,14 @@ class WatchSet:
         return len(events)
 
     def drain(self, quiet_for: float = _DEBOUNCE_S, max_wait: float = 0.35) -> None:
-        """Coalesce a short burst of events into one render."""
+        """Coalesce a short burst of events into one render.
+
+        One append can raise two events (``NOTE_EXTEND`` on the file, plus the
+        directory's ``NOTE_WRITE`` if the file was created), and a task start
+        writes a header and then its first event. Waiting for a quiet window
+        turns those into one pass without delaying by more than ``max_wait`` —
+        a busy producer must not be able to defer the redraw forever.
+        """
         deadline = time.monotonic() + max_wait
         while time.monotonic() < deadline:
             if not self.wait(quiet_for):
@@ -367,9 +516,32 @@ def collect_paths(
 
     Returned ``files`` are ordered by priority so ``WatchSet._MAX_WATCH_FILES``
     always retains ``state.db``/``state.db-wal``, ``reviews.json``, manifests,
-    and active transcripts. Transcripts of already-completed delegations are
-    not opened in kqueue: they are immutable once settled, and opening 150+
-    historical log files per process wastes descriptors.
+    and active transcripts. Transcripts of delegations that settled more than 8
+    delegations ago are not opened in kqueue: they are immutable once settled,
+    and opening 150+ historical log files per process wastes descriptors.
+
+    Composition, in the order it is returned:
+
+    * ``dirs``: the Hermes home (only for its own file creation, when watching
+      the DB), the hermes-tmux state dir (``reviews.json`` appears there), the
+      nearest existing ancestors of ``live/`` (a brand-new profile has no live
+      root yet), the live root, and up to 40 delegation dirs;
+    * ``files``: ``state.db``, ``state.db-wal``, ``reviews.json``, then every
+      manifest of the selected dirs, then the logs of live delegations, then the
+      logs of up to 8 completed delegations from that same sample.
+
+    The last group is not redundant: Hermes can flush a final line *after* the
+    manifest flips, and that late write is what makes a finished worker's last
+    output appear without waiting for the slow wake. Eight is margin over the
+    overview's six recent rows; older transcripts really are immutable. Because
+    the sample is ordered by name, those 8 are not "the most recent" in time —
+    they are the first 8 settled delegations the sample happens to contain.
+
+    Delegation dirs are chosen by "live, or one of the 40 lexicographically
+    greatest names". Directory names are random ids, so that is a stable sample,
+    not the newest 40 — it bounds descriptor use, and anything live is kept
+    regardless, so the cost of the imprecision is a late event on a finished
+    delegation, never a missed worker.
     """
     from .state import _manifest_has_live_task, hermes_home, live_root, read_manifest
     base = hermes_home(home)
@@ -407,7 +579,9 @@ def collect_paths(
         except OSError:
             all_children = []
         # Keep any live delegation dir even if >40 newer completed dirs exist,
-        # plus the 40 newest dirs by name.
+        # plus 40 by descending name. Names are random ids, so this is a stable
+        # sample rather than a recency order; liveness is what is actually
+        # promised here.
         all_children.sort(key=lambda p: p.name, reverse=True)
         selected: List[Path] = []
         for child in all_children:
@@ -423,10 +597,10 @@ def collect_paths(
             if mp.is_file():
                 manifests.append(mp)
                 is_live = _manifest_has_live_task(read_manifest(mp))
-            # Watch logs of all live delegations plus the 8 newest completed
-            # delegations (matching RECENT_ROWS) so a late buffered flush after
-            # completion still triggers an immediate coordinator pass, without
-            # holding FDs open on dozens of older historical delegations.
+            # Watch logs of all live delegations plus up to 8 completed ones from
+            # this sample, so a late buffered flush after completion still
+            # triggers an immediate coordinator pass, without holding FDs open on
+            # dozens of older historical delegations.
             watch_logs = is_live or (include_db and completed_with_logs < 8)
             if not is_live and watch_logs:
                 completed_with_logs += 1
@@ -446,6 +620,7 @@ def collect_paths(
 # --------------------------------------------------------------------------- tabs
 
 def _task_index(worker) -> int:
+    """``task_index`` as an int, 0 when absent or unparsable (sort key only)."""
     try:
         return int(getattr(worker, "task_index", 0) or 0)
     except (TypeError, ValueError):
@@ -468,11 +643,22 @@ def worker_order(workers: Sequence) -> List:
 
 
 def _log_path(worker) -> Optional[str]:
+    """The transcript a pane may tail, if the reader published one.
+
+    ``log_path`` is the public field. ``_log_path`` is a legacy private spelling
+    still honoured because some callers build ad-hoc worker objects by hand; a
+    real ``Worker`` always has ``log_path`` and never the underscore.
+    """
     return getattr(worker, "log_path", None) or getattr(worker, "_log_path", None)
 
 
 def _pane_env() -> Dict[str, str]:
-    """Env for panes this process creates (forked from the server, not from us)."""
+    """Env for panes this process creates (forked from the server, not from us).
+
+    Indirection so tests can replace it wholesale; the values come from
+    ``hermes_tmux.env.pane_env`` and must carry ``HERMES_HOME``/``PYTHONPATH``,
+    or the new pane reads a different profile.
+    """
     from .env import pane_env
     return pane_env()
 
@@ -481,8 +667,15 @@ def tail_command(log_path: str) -> str:
     """Pane command for one transcript.
 
     The styled follower by default; plain ``tail -F`` when the reader asked for
-    raw output or the follower cannot be located. Either way the pane shows the
-    file Hermes wrote and nothing else.
+    raw output with ``HERMES_TMUX_TRANSCRIPT=raw``. There is no third fallback:
+    if the follower cannot be located the pane shows its import error, because a
+    silent downgrade to a different renderer is worse than a visible failure
+    (the reader would not know which one produced the text). Either way the pane
+    shows the file Hermes wrote and nothing else.
+
+    ``exec`` makes the follower the pane's foreground process, which is one of
+    the provenance proofs ``_killable`` accepts; ``cd`` puts the package on the
+    import path without relying on the pane's inherited ``PYTHONPATH``.
     """
     if (os.environ.get("HERMES_TMUX_TRANSCRIPT") or "").strip().lower() == "raw":
         return "exec tail -n +1 -F %s" % shlex.quote(log_path)
@@ -492,6 +685,12 @@ def tail_command(log_path: str) -> str:
 
 
 def _kind(worker, now=None) -> str:
+    """run / stall / done / fail / other for one worker, at ``now``.
+
+    ``stall`` is derived here from transcript age and nowhere else; it is a
+    display label, not a state the reader ever stored (see
+    ``render.STALL_AFTER_S``).
+    """
     from datetime import datetime
     from . import labels
     from .render import _state_label
@@ -614,6 +813,12 @@ def _tab_format(option: str, ascii_mode: bool = False, worker: bool = True) -> s
     Derived from the global option instead of replaced, so our tabs follow the
     user's theme (index, flags, current-window highlight). A format with no
     ``#W`` is left alone: there is no name to decorate.
+
+    Returns '' when the user's format has no name slot or already carries the
+    glyph, which the caller reads as "set no window option" — inheriting the
+    user's format verbatim is the correct result in both cases. The value is a
+    snapshot taken when the window is decorated; later theme edits by the user
+    reach new tabs, not existing ones.
     """
     rc, out = tmuxio.run("show-options", "-gwv", option)
     fmt = out.rstrip("\n") if rc == 0 else ""
@@ -627,7 +832,17 @@ def _tab_format(option: str, ascii_mode: bool = False, worker: bool = True) -> s
 def decorate_window(window_id: str, header: bool = True,
                     ascii_mode: bool = False,
                     home: Optional[Path] = None) -> None:
-    """Window-scoped presentation for a window we created (never global)."""
+    """Window-scoped presentation for a window we created (never global).
+
+    ``header=True`` is a worker tab: per-pane border header, and the close mark
+    on the in-view format only. ``header=False`` is the overview: badge in the
+    tab, no border line above a pane that draws its own heading.
+
+    Also stamps ``@hx_home`` so a click handler running under a different
+    ``HERMES_HOME`` can find the layout that owns this window. Every option is
+    written with ``-w``/``-p`` on this window or pane; a failure is ignored (the
+    tab simply keeps the user's default look).
+    """
     from . import closemark
     from .state import hermes_home
     tmuxio.window_option(window_id, "@hx_home", str(hermes_home(home)))
@@ -649,6 +864,14 @@ def decorate_window(window_id: str, header: bool = True,
 
 
 def _set_if_changed(record: Dict, field: str, value: str, apply) -> bool:
+    """Write ``value`` through ``apply`` only when it differs from ``record``.
+
+    Two jobs: an idle workspace issues no tmux subprocess for decoration, and a
+    failed write is retried next pass instead of being memoized as done (the
+    record only advances when ``apply`` returns true). The cached value lives in
+    the tab record so the next pass can compare without asking tmux what it
+    currently shows.
+    """
     if record.get(field) == value:
         return False
     if apply(value):
@@ -658,7 +881,13 @@ def _set_if_changed(record: Dict, field: str, value: str, apply) -> bool:
 
 
 def _active_window(session_id: str) -> str:
-    """Window the reader is looking at, '' when nobody is attached."""
+    """Window the reader is looking at, '' when nobody is attached.
+
+    ``#{session_attached}`` is a client count; 0 means the session has no
+    viewer, so nothing is "in view" and no tab is protected from retiring. A
+    malformed answer is treated the same way: the conservative mistake here is
+    to let a tab go, not to keep eight tabs forever.
+    """
     out = tmuxio.format_of(session_id, "#{session_attached} #{window_id}")
     parts = out.split()
     if len(parts) != 2 or parts[0] in ("", "0"):
@@ -672,6 +901,11 @@ def _windows_in_view(session_id: str) -> set:
     Sessions of one group share the windows but each has its own current
     window, so a tab can be on screen in a second terminal while the session
     the workspace is anchored to shows something else.
+
+    Empty ``session_id`` yields the empty set (``group_sessions('')`` is ``[]``
+    and the fallback list is ``['']``, whose active window is ''). A layout with
+    no recorded session therefore treats nothing as in view — every finished tab
+    becomes retirable, and a failure's attention clock starts at once.
     """
     views = {_active_window(sid) for sid in (tmuxio.group_sessions(session_id) or [session_id])}
     views.discard("")
@@ -679,6 +913,12 @@ def _windows_in_view(session_id: str) -> set:
 
 
 def _settled_at(worker) -> Optional[float]:
+    """Epoch seconds of the worker's last known activity, or None.
+
+    Used only to decide whether a finished worker is recent enough to deserve a
+    tab. None means "no timestamp I can trust" (a log time with no date), which
+    the caller treats as history rather than opening a tab for it.
+    """
     from .render import _activity_at
     activity = _activity_at(worker)
     return activity.timestamp() if activity is not None else None
@@ -703,6 +943,29 @@ def reconcile_tabs(key: str, workers: Sequence, home: Optional[Path] = None,
       tab; running tabs are never closed to make room;
     * only panes proven to be ours are closed. A tab the reader split keeps
       their pane and is forgotten by the layout instead of being torn down.
+
+    Mechanics. The pass reads ``layout.json`` once, snapshots ``tabs``/
+    ``dismissed`` (``tabs0``/``dismissed0``), then spends as long as tmux takes
+    creating or closing windows. The write is therefore a merge of this pass's
+    *delta* onto whatever is on disk at write time (``_merge``), not a rewrite
+    of the snapshot. ``before`` is the serialised snapshot used to skip the write
+    entirely when the pass changed nothing.
+
+    Two pieces of bookkeeping are easy to miss:
+
+    * ``dismissed`` is permanent while the worker is still listed. It is how a
+      closed tab, a retired tab, and a pane the reader moved elsewhere stay
+      closed; ``open`` removes an entry, and a pass drops one only once the
+      worker is no longer in the reader's list.
+    * ``unknown`` marks tabs whose window read returned nothing. tmux not
+      answering is not evidence that a pane moved, so those tabs are left
+      exactly as they are for the pass — not decorated, not retired, not
+      forgotten.
+
+    Cost: roughly seven tmux calls per existing tab per pass (existence and
+    ownership, each asked twice, plus the window read and the window ownership
+    check), plus one ``new-window`` per tab created. The caller throttles passes
+    to 1 Hz, which is what keeps that affordable.
     """
     from . import labels
     from .render import ATTENTION_TTL_S
@@ -713,6 +976,8 @@ def reconcile_tabs(key: str, workers: Sequence, home: Optional[Path] = None,
     session_id = layout.get("session_id") or tmuxio.current_session_id() or ""
     created = float(layout.get("created") or now)
     ascii_mode = bool(layout.get("ascii"))
+    # Deep-enough copies: the snapshot is what the merge compares against, so it
+    # must not alias the working maps.
     tabs: Dict[str, Dict] = {str(k): dict(v) for k, v in (layout.get("tabs") or {}).items()
                              if isinstance(v, dict)}
     dismissed: Dict[str, float] = dict(layout.get("dismissed") or {})
@@ -757,6 +1022,11 @@ def reconcile_tabs(key: str, workers: Sequence, home: Optional[Path] = None,
     kinds: Dict[str, str] = {}
     for wkey, tab in tabs.items():
         worker = by_key.get(wkey)
+        # A worker this pass does not know about — dropped by the reader's row
+        # limit, or the reader returned nothing at all — has no kind, and
+        # "other" is not run/stall, so the tab is treated as settled and starts
+        # ageing out. A transient empty list therefore starts every live tab's
+        # linger clock; the tab is only closed once that clock runs out.
         kind = _kind(worker) if worker is not None else "other"
         kinds[wkey] = kind
         if kind in ("run", "stall"):
@@ -783,6 +1053,9 @@ def reconcile_tabs(key: str, workers: Sequence, home: Optional[Path] = None,
         if not _retirable(wkey):
             continue
         tab = tabs[wkey]
+        # A failure nobody looked at is an alert, and an alert that never clears
+        # is noise. It keeps its tab until the attention TTL expires, then goes
+        # the same way as any other finished work.
         if kinds.get(wkey) == "fail" and "seen" not in tab:
             if now - tab["settled"] > ATTENTION_TTL_S:
                 _retire(wkey)
@@ -791,6 +1064,8 @@ def reconcile_tabs(key: str, workers: Sequence, home: Optional[Path] = None,
             _retire(wkey)
 
     # 5. Open tabs for new work, oldest first.
+    #    `dismissed` is consulted here and nowhere else: it is the whole rule
+    #    that a tab the reader closed does not come back.
     for worker in worker_order(workers):
         wkey = str(getattr(worker, "key", ""))
         log_path = _log_path(worker)
@@ -849,6 +1124,8 @@ def reconcile_tabs(key: str, workers: Sequence, home: Optional[Path] = None,
             dismissed.pop(wkey)
 
     if json.dumps([tabs, dismissed], sort_keys=True) != before:
+        # Only this pass's delta is written. `duplicated` is how a first-tab
+        # collision with `open` comes back so the loser can clean up its pane.
         def _apply(current: Dict) -> Dict:
             # This pass read the layout before doing seconds of tmux work.
             # `open` may have published a tab in the meantime, so only what
@@ -870,6 +1147,18 @@ def reconcile_tabs(key: str, workers: Sequence, home: Optional[Path] = None,
 
 
 def _twice(check, target: str) -> bool:
+    """Ask a negative-answerable question twice; true if either answer is true.
+
+    A "no" here can forget a tab permanently (the worker is written into
+    ``dismissed``), so one failed tmux call must not be allowed to hide live
+    work. Two immediate calls turn a lost subprocess into a retry, not a
+    decision.
+
+    It is a mitigation, not a guarantee: two failures in a row still answer
+    "no". The remaining exposure is a tmux that is down for the duration of both
+    calls, and that condition also fails the session liveness check, which ends
+    the coordinator instead of letting it act on the answer.
+    """
     return bool(check(target)) or bool(check(target))
 
 
@@ -884,6 +1173,22 @@ def _merge(current: Dict, before: Dict, after: Dict,
 
     Returns the keys this pass added that someone else had already added: the
     other record stands, and the caller owns cleaning up what it built.
+
+    The four cases, explicitly:
+
+    * unchanged (``before[k] == after[k]``) — nothing to do, even if ``current``
+      has moved on; someone else's newer value wins.
+    * changed by this pass — write it unconditionally. Other writers add or
+      remove whole records rather than editing a tab's ``seen``/``settled``/
+      glyph, so the overwrite is safe in practice. The interleaving this does
+      not protect is a ``close`` landing between the read and the write: the
+      record is restored for one pass, then step 1 of the next pass sees the
+      dead pane and dismisses it again (the dismissal ``close`` wrote stands).
+    * removed by this pass — remove only when ``current`` still holds the value
+      this pass saw. If another process replaced it, that replacement stands
+      (``open`` re-recording a pinned tab while the pass was retiring it).
+    * added by this pass — write it unless someone else added the same key
+      first, in which case the other record wins and the key is reported.
     """
     lost: List[str] = []
     for name, value in after.items():
@@ -901,14 +1206,26 @@ def _merge(current: Dict, before: Dict, after: Dict,
 
 
 def seen_keys(layout: Dict) -> List[str]:
-    """Workers whose tab has been looked at, or closed by the reader."""
+    """Workers whose tab has been looked at, or closed by the reader.
+
+    Both facts suppress an alert: an acknowledged failure and a dismissed tab
+    are "handled" from the overview's point of view. This is the only bridge
+    from layout state into the renderer's attention classification, which is why
+    it takes a bare layout rather than reading one itself.
+    """
     keys = [k for k, tab in (layout.get("tabs") or {}).items()
             if isinstance(tab, dict) and "seen" in tab]
     return keys + list((layout.get("dismissed") or {}).keys())
 
 
 def tab_indexes(layout: Dict) -> Dict[str, str]:
-    """worker key -> tmux window index of its tab (what the status line shows)."""
+    """worker key -> tmux window index of its tab (what the status line shows).
+
+    Queried live rather than recorded, because a window's index changes when
+    earlier windows are closed and a stale index in the overview would point at
+    somebody else's window. Missing windows are simply absent: the overview then
+    shows the worker without a tab number.
+    """
     tabs = layout.get("tabs") or {}
     if not tabs:
         return {}
@@ -919,7 +1236,13 @@ def tab_indexes(layout: Dict) -> Dict[str, str]:
 
 
 def overview_glyph(workers: Sequence, layout: Dict, ascii_mode: bool = False) -> str:
-    """Badge on the overview tab: running count, and what needs a look."""
+    """Badge on the overview tab: running count, and what needs a look.
+
+    Composed from the same classification the overview body uses, so the tab and
+    the pane can never disagree about how many workers need attention. A quiet
+    workspace gets a dim ``-``/hollow circle rather than an empty string: a tab
+    with no glyph at all looks broken.
+    """
     from . import labels
     from . import render as render_mod
     counts = render_mod.summary(render_mod.classify(
@@ -937,7 +1260,13 @@ def overview_glyph(workers: Sequence, layout: Dict, ascii_mode: bool = False) ->
 
 
 def load_view(key: str, home: Optional[Path] = None) -> Tuple[List, str, Dict]:
-    """(workers, failure note, layout) for one render."""
+    """(workers, failure note, layout) for one render.
+
+    The note is non-empty only when the reader itself failed. That distinction
+    matters: "state reader failed: ..." is a different, true statement, while an
+    empty list alone would be rendered as "no delegations found", which is a
+    claim this function cannot make.
+    """
     from . import state as state_mod
     note = ""
     try:
@@ -954,7 +1283,13 @@ def compose(key: str, home: Optional[Path] = None, session_label: str = "",
             width: int = 110, height: Optional[int] = None,
             colour: bool = False, *,
             preloaded: Optional[Tuple[Sequence, str, Dict]] = None) -> str:
-    """The overview text for this session at the given size."""
+    """The overview text for this session at the given size.
+
+    ``preloaded`` lets a pass that has just read state share it with the render
+    instead of re-reading the manifests (the coordinator does this every pass).
+    A renderer exception falls back to an empty-but-labelled overview: showing
+    nothing is acceptable, showing a traceback in the reader's pane is not.
+    """
     from . import render as render_mod
     from .state import live_root
     workers, note, layout = preloaded if preloaded is not None else load_view(key, home)
@@ -973,7 +1308,13 @@ def compose(key: str, home: Optional[Path] = None, session_label: str = "",
 def render_and_publish(key: str, home: Optional[Path] = None,
                        session_label: str = "", *,
                        preloaded: Optional[Tuple[Sequence, str, Dict]] = None) -> str:
-    """Write the plain overview to render.txt; the pane redraws when it changes."""
+    """Write the plain overview to render.txt; the pane redraws when it changes.
+
+    Plain, uncoloured, default width: this file is the *signal*, not the
+    picture. Each follower composes its own coloured frame at its own pane size;
+    writing the same bytes twice is skipped so the vnode does not wake the pane
+    for nothing.
+    """
     text = compose(key, home, session_label, preloaded=preloaded)
     current = ""
     try:
@@ -986,7 +1327,58 @@ def render_and_publish(key: str, home: Optional[Path] = None,
 
 
 def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
-    """Main loop of the coordinator. Returns an exit code."""
+    """Main loop of the coordinator. Returns an exit code.
+
+    Startup, in order, each step load-bearing:
+
+    1. **gate** — off means exit 0 before touching anything.
+    2. **key** — passed by the caller that built the layout; a ``run-shell``
+       child has no ``TMUX_PANE`` and would derive a different key, read an empty
+       layout, and reconcile nothing.
+    3. **state dir** — create it, or give up (1).
+    4. **``flock`` on ``watch.lock``** — this is the single-coordinator
+       guarantee, and the lock is held for the process's whole life. A short
+       retry absorbs the momentary hold a ``coordinator_alive``/``_lock_held``
+       probe takes; after that, refusing the lock means a real coordinator owns
+       the workspace and this process exits 0 (success: the job is already being
+       done).
+    5. **pid file** — written for ``down``, a hint that is only believed after
+       ``_pid_is_watcher`` corroborates it.
+    6. **SIGTERM → KeyboardInterrupt** — so ``down``'s signal leaves through the
+       normal exit path: lock released, pid file removed, exit 0. The
+       ``run-shell`` wrapper's exit-0 discipline depends on this.
+    7. **owner server pid** — captured once. A tmux server that dies without
+       killing its children (crash, SIGKILL) leaves this process alive while a
+       new server answers on the same socket; window ids on that server come
+       from a different sequence, so continuing would rename or split into
+       windows this workspace never created. Identity is the pid, not the path.
+
+    Each pass: reload state (if due) → ``reconcile_tabs`` → restore missing
+    permanent aux windows → publish ``render.txt`` → refresh the overview badge
+    → wait for events. The pass runs *before* the first wait, because ``up`` has
+    just written the layout and any delegation that already existed raised no
+    vnode event; waiting first would leave tabs unbuilt for a whole interval.
+
+    Waiting and coalescing: ``watcher.wait`` is given ``_TICK_S`` whenever a tab
+    is settled or a worker is running (both need a clock), else
+    ``_SESSION_CHECK_S``. A real event is followed by a throttle: sleep out the
+    remainder of ``_MIN_RENDER_INTERVAL_S`` in slices, then ``wait(0)`` to absorb
+    anything that arrived meanwhile; if the floor has already passed, ``drain``
+    coalesces the burst instead.
+
+    The database fast path skips a full reload when *only* the home/state.db/
+    state.db-wal descriptors fired, the live root is a real directory, the
+    previous full pass is recent enough, and ``async_delegations`` is
+    byte-identical. That is what keeps a chatty parent's WAL writes from
+    re-reading every transcript. It is bounded by ``last_full_pass_mono`` so a
+    continuous stream of unrelated writes cannot starve a real pass forever.
+
+    Exit conditions, all returning 0: another server pid answers the socket, or
+    the recorded session no longer resolves (its own id must match — a missing
+    target exits 0 on tmux 3.8 and must not read as "alive"). ``KeyboardInterrupt``
+    from SIGTERM exits 0 too. The ``finally`` block closes the kqueue, deletes
+    the pid file only if it still names this process, and releases the lock.
+    """
     if not enabled():
         return 0
     # `key` comes from the caller that built the layout: a run-shell child has
@@ -1042,6 +1434,10 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
     from .state import db_delegations, hermes_home, live_root
     base = hermes_home(home)
     watcher = WatchSet()
+    # Pass bookkeeping. `last_pass_mono` is the throttle clock, `last_full_pass_mono`
+    # bounds the database fast path, `last_reload_mono` paces a full re-read when
+    # nothing fires. `workers`/`note`/`last_db_rows` are reused on a timer wake:
+    # the timer exists to age tabs and notice what is in view, not to re-read.
     last_pass_mono = 0.0
     last_full_pass_mono = 0.0
     last_liveness_mono = time.monotonic()
@@ -1078,6 +1474,9 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
             # Keep permanent `hx:mail` and (when enabled) `hx:testbench` alive across crashes without stealing focus.
             # Re-verify server ownership before mutating layout/windows so a coordinator racing
             # `kill-server` + server restart never creates windows on the new server or rewrites old layout.json.
+            # The assignment into the local document after a successful rebuild is display-only:
+            # ensure_aux_window already published the id through update_layout, and writing the
+            # whole document here would be the lost-update bug again.
             mail_wid = ((layout.get("aux") or {}).get("mail")) or ""
             mail_sid = layout.get("session_id") or ""
             if mail_sid and (
@@ -1136,12 +1535,16 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
                 running = any(getattr(w, "state", "") == "running" for w in workers)
                 fired = watcher.wait(_TICK_S if (pending or running) else _SESSION_CHECK_S)
                 if fired:
+                    # Enforce the floor rather than trusting the wait: a WAL write
+                    # wakes the kqueue immediately, so the sleep is the throttle.
                     rem = _MIN_RENDER_INTERVAL_S - (time.monotonic() - last_pass_mono)
                     if rem > 0:
                         while True:
                             rem = _MIN_RENDER_INTERVAL_S - (time.monotonic() - last_pass_mono)
                             if rem <= 0:
                                 break
+                            # Short slices, not one long sleep: a SIGTERM must
+                            # land promptly, and the remaining time can shrink.
                             time.sleep(min(rem, 0.25))
                         watcher.wait(0)
                     else:
@@ -1175,6 +1578,9 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
                                 return 0
                             if not tmuxio.session_alive(layout.get("session_id") or ""):
                                 return 0
+                        # Nothing this workspace owns changed: stay in the wait
+                        # loop. `reload_state` is left exactly as it was — only
+                        # the paths that actually decide about a pass set it.
                         continue
                     reload_state = True
                 else:
@@ -1214,6 +1620,13 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
 # --------------------------------------------------------------------------- follow
 
 def _draw(text: str, pane_id: str, size: Optional[Tuple[int, int]] = None) -> None:
+    """Overwrite the pane in place: home, per line erase, no scroll.
+
+    The frame is written from the top with the cursor hidden, so a redraw is a
+    replacement rather than an append and the reader's scroll position is never
+    touched. A write failure (pane gone, EIO) is swallowed: the loop's next
+    pane-existence check is what ends it.
+    """
     width, height = size if size is not None else tmuxio.pane_size(pane_id)
     lines = text.splitlines()
     if len(lines) > height:
@@ -1251,7 +1664,31 @@ def compose_for_pane(home: Optional[Path] = None, session_label: str = "",
 
 
 def run_follow(home: Optional[Path] = None, key: Optional[str] = None) -> int:
-    """Pane-side display loop: redraw when the live root or layout changes."""
+    """Pane-side display loop: redraw when the live root or layout changes.
+
+    Structure of one iteration, in this order and for these reasons:
+
+    1. **pane exists?** Asked first, every time. tmux does not reliably deliver
+       SIGHUP when a server is killed outright, so this check is the only thing
+       that stops a follower from outliving its pane (an orphan was observed
+       7.5 minutes after its server went).
+    2. compose at the pane's current size, and draw only when the text or the
+       size changed — a no-op redraw would still cost a full escape sequence.
+    3. decide whether to watch the database: not while the coordinator holds
+       ``watch.lock``, because it already watches ``state.db-wal`` and rewrites
+       ``render.txt``; watching it here too is what made the follower burn CPU on
+       every parent chat write.
+    4. wait: 2 s while the text says RUNNING, 60 s otherwise. The bound exists so
+       a pane degrades (stale but truthful) instead of freezing when nothing
+       fires.
+
+    ``SIGWINCH`` clears the last frame so the next draw happens at the new size
+    immediately. Exit is 0 on pane disappearance and on ``KeyboardInterrupt``; the
+    ``finally`` closes the kqueue and restores the tty (no-echo off). This loop
+    installs no SIGTERM handler — only ``run_watch`` converts SIGTERM to
+    ``KeyboardInterrupt`` — so a SIGTERM here takes the default disposition (143)
+    and skips the tty restore.
+    """
     if not enabled():
         print("hermes-tmux: disabled (%s)" % _reason())
         return 0

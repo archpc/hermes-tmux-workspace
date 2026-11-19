@@ -3,6 +3,50 @@
 Every command is safe to run at any time: with the gate off, outside tmux, or
 with a half-built workspace, it degrades to a message and exit 0. Nothing here
 kills a pane, window, or session it did not create.
+
+The surface, and what each command owns:
+
+==========================  ===================================================
+`up`                        build or repair this session's workspace: overview
+                            window (`agents`), `hx:mail`, `hx:testbench`, the
+                            coordinator, the click binding. Idempotent.
+`down`                      close every pane of ours on this session, then the
+                            state directory, then the server-wide click binding
+                            if no workspace is left anywhere.
+`status`                    print the overview. The only command designed to
+                            work outside tmux and in a pipe.
+`rerender`                  force one render; outside tmux it renders to stdout.
+`follow` / `watch`          the two loops (delegated to `watch`).
+`logs|tests|debug|rea|mail|testbench`
+                            ensure one `hx:<role>` window and focus it.
+`tests --run`               run the suite in `hx:tests` and record `tests.log`.
+`run`                       `up`, then exec the agent in the current pane.
+`worker N` / `open REF`     focus a worker tab; `open` creates it for finished
+                            work and marks it pinned.
+`close [@N]`                close the *view* of one worker tab (never the worker).
+`close-mark on|off|status`  repair/remove the click binding and the marks.
+`tail LOG`                  print and follow one transcript.
+`review …`                  record or run an independent review.
+
+Two invariants run through the whole file:
+
+1. **Ownership.** A window is ours only if it carries `@hx` as its *own* window
+   option, and a pane is closable only through `tmuxio.close_pane`, which
+   requires the pane's own `@hx`, our tail/python foreground, or a non-empty
+   `pane_start_command`. Names are never an address, and a window id from a
+   layout file only ever *nominates* a window (`cmd_down`), never authorises
+   touching anything inside it.
+2. **The reader's pane is never written to.** Anything started through
+   `tmux run-shell` must be silent and exit 0, because tmux prints a job's
+   output — or a line about its non-zero exit — into the active pane. Every
+   such command here is wrapped `… >/dev/null 2>&1; true`, and the coordinator
+   logs to `watch.log` instead of stdout.
+
+State lives in `watch.session_dir(key)`; the layout document is the only shared
+mutable state and every write goes through `watch.update_layout` (locked
+read-modify-write). `cmd_up` additionally serialises the whole build on a
+server-wide lock, because two `up`s that both find no overview would each build
+one.
 """
 
 from __future__ import annotations
@@ -50,6 +94,12 @@ def _self_command(*args: str) -> str:
     Environment is embedded explicitly: processes started through
     ``tmux run-shell -b`` inherit the *server's* environment, not the pane's,
     so an inherited HERMES_HOME would silently point at the wrong profile.
+
+    The command is ``cd <repo> && exec env K=V … <python> -m hermes_tmux …``.
+    Callers that need the shell to survive the child (so they can append
+    ``; true`` or a log redirect) call ``.replace("&& exec env ", "&& env ", 1)``
+    — that is why the exact string matters. Changing the prefix silently breaks
+    `_start_watcher` and `_close_handler`, which both depend on it.
     """
     root = _repo_root()
     env = pane_env()
@@ -187,6 +237,18 @@ def _start_watcher(key: str) -> bool:
 # --------------------------------------------------------------------------- up
 
 def cmd_up(args) -> int:
+    """Build or repair the workspace in the pane's session. Exit 0 unless tmux
+    refused to create something.
+
+    Three preconditions, each with its own message rather than an exception: a
+    disabled gate, no tmux, or a window that could not be created. Outside tmux
+    `up` is a no-op *by design* — `status` is the command that still works, and
+    the message says so.
+
+    Serialised on `_server_lock()` before anything is read: the two things `up`
+    does at the end (wrap the click binding, create the overview) are both
+    check-then-act, and two concurrent `up`s each seeing "no overview" built two.
+    """
     if not gate.enabled():
         print("hermes-tmux: %s" % gate.disabled_reason())
         return 0
@@ -203,6 +265,23 @@ def cmd_up(args) -> int:
 
 @contextlib.contextmanager
 def _server_lock():
+    """Serialise workspace construction on this server (not just this session).
+
+    Two locks, always in this order, both ``flock``:
+
+    * ``hx-srv-<uid>-<server digest>.lock`` beside the tmux socket (or in the
+      temp dir when the socket's directory is not writable): one `up` per
+      server, because the click binding and `_any_workspace_on_server` are
+      server-wide facts. Taking this first means the per-home lock below is never
+      contended by two processes that would then fight over the same window.
+    * ``<state_root>/up.lock``: per HERMES_HOME. Two profiles on one server
+      still build independently; this one only stops two `up`s of the *same*
+      profile from interleaving their layout writes.
+
+    The digest is derived by asking for a key with a dummy session id and taking
+    its first component: the same server-pid digest `watch.session_key` uses, so
+    a replaced server never shares a lock file with its predecessor.
+    """
     digest = tmuxio.session_key(session_id="x").split("-", 1)[0]
     sock_raw = (os.environ.get("TMUX") or "").split(",", 1)[0]
     lock_dir = Path(sock_raw).parent if sock_raw and Path(sock_raw).parent.is_dir() else Path(tempfile.gettempdir())
@@ -240,6 +319,20 @@ def _anchor(layout: Dict) -> Tuple[str, str]:
 
 
 def _up() -> int:
+    """The body of `up`, already under the server lock.
+
+    Reads once, decides, then writes: the layout is read at entry, mutated in
+    memory, and published at the end through `update_layout` (so a concurrent
+    `open`/`logs` that added its own tab or aux record is not reverted). The
+    fields it owns are `session_id`, `session_name`, `workers_window`,
+    `overview_pane`, `created` and `ascii`; it never writes `tabs`, `aux`,
+    `dismissed` or `seen`.
+
+    Order is load-bearing: the overview window must exist and be marked before
+    `decorate_window` (which derives its format from the *global* option), and
+    `created` must be published before the coordinator starts, or the first tab
+    pass would treat work that finished a second ago as new.
+    """
     key = tmuxio.session_key()
     _ensure_state_dir(key)
     layout = watch.read_layout(key)
@@ -285,6 +378,9 @@ def _up() -> int:
     overview = ""
     recorded = layout.get("overview_pane") or ""
     for pane in panes:
+        # `created` (the window was made by this call) relaxes the id match: the
+        # first pane of a window we just made is ours by construction, and its
+        # recorded id cannot exist yet.
         if pane["ours"] and "python" in (pane["command"] or "").lower() \
                 and (not recorded or pane["pane_id"] == recorded or created):
             overview = pane["pane_id"]
@@ -318,11 +414,15 @@ def _up() -> int:
             print("hermes-tmux: close mark not installed (%s)" % why)
 
     def _apply(current):
+        """Publish our fields without touching tabs/aux/dismissed."""
         current["session_id"] = session_id
         current["session_name"] = session_name
         current["workers_window"] = window_id
         current["overview_pane"] = overview
         # Work that finished before this moment is history, not a tab.
+        # setdefault: a repaired workspace keeps its original birthday, so
+        # `up` on a healthy session never reclassifies yesterday's failures as
+        # today's attention.
         current.setdefault("created", time.time())
         current["ascii"] = labels.ascii_only()
         return current
@@ -347,6 +447,30 @@ def _up() -> int:
 # --------------------------------------------------------------------------- down
 
 def cmd_down(args) -> int:
+    """Close everything of ours on this session; report panes/windows separately.
+
+    Deliberately does **not** check the gate: a reader who disabled the
+    workspace must still be able to remove the one an earlier shell built.
+
+    Order, and why each step precedes the next:
+
+    1. Stop the coordinator (identity-checked, `_watcher_pid`). While it lives it
+       would reconcile the emptying window set and reopen worker windows between
+       our pane closes.
+    2. Enumerate targets: every window on this session that carries our marker,
+       plus every window id recorded in the layout (the marker can be lost after
+       a server restart). Recorded ids only *nominate*; the per-pane proof inside
+       `tmuxio.close_pane` decides. Closing is one pane at a time so a reader
+       shell split into one of our windows survives with its window.
+    3. Refuse to delete the state directory while any process still holds the
+       coordinator lock — that lock holder would otherwise be orphaned beside a
+       fresh, empty state directory.
+    4. Restore the server-wide click binding only when no workspace or owned
+       window remains anywhere on the server (re-checked under the lock).
+
+    Windows are counted by diffing the window set from before the closes, since
+    tmux destroys a window implicitly with its last pane and would report "gone".
+    """
     if not tmuxio.in_tmux():
         print("hermes-tmux: not inside tmux.")
         return 0
@@ -423,6 +547,18 @@ def cmd_down(args) -> int:
 # --------------------------------------------------------------------------- status
 
 def cmd_status(args) -> int:
+    """Print the overview; the one command that works outside tmux and in a pipe.
+
+    ``--json`` is the machine surface and prints stable field names only (no
+    derived labels), so a consumer never has to parse prose. Text mode asks the
+    terminal for its width and renders for it, defaulting to 110 columns when
+    stdout is not a tty; ``--all`` lifts both the worker limit and the RECENT
+    row cap, which is what the "+ N older" line points at.
+
+    Layout-derived context (tab numbers, seen keys, workspace birthday) is read
+    only when inside tmux; outside, the same render runs with none of it, which
+    is why `status` in a pipe shows no tab numbers rather than wrong ones.
+    """
     from . import render as render_mod
     from . import state as state_mod
     from .state import live_root
@@ -599,7 +735,28 @@ def ensure_aux_window(
     Shared by ``cmd_aux`` (interactive ``hermes-tmux mail|logs|...``), ``_up``
     (permanent ``hx:mail`` startup), and ``watch`` (detached crash recovery).
     Returns ``(window_id, status)`` where status is ``opened``, ``rebuilt``,
-    ``running``, or ``existing``.
+    ``running``, ``existing``, or the two failures ``failed`` / ``stale_server``.
+
+    Resolution order for the window: the recorded id, if it still exists *and*
+    is still ours; then a name lookup inside the anchor session. That lookup is
+    exact-or-"name + space" (the badge suffix `free_window_name`/`watch` add),
+    and it requires our marker, so a user window that happens to be called
+    `hx:mail` is never adopted. A `#N` collision suffix is *not* matched: if a
+    foreign window already held the name when we created ours, a later pass will
+    find nothing by name and create a second window — the recorded id covers that
+    case for every caller that writes one.
+
+    ``home`` re-points the pane's `HERMES_HOME` and, for a non-default home,
+    its mail/TestBench stores. It is how the tests and `watch`'s recovery build
+    a tab for a profile other than the caller's.
+
+    ``owner_pid`` is the server pid the caller believed in. It is re-checked
+    before every tmux mutation: a server replaced on the same socket during this
+    call would otherwise receive writes aimed at its predecessor, and the window
+    created in that window of time is removed again if it turned out to be ours.
+
+    Focusing is a separate step at the end, so a failure between creation and
+    focus cannot leave the reader looking at a half-built pane.
     """
     name = "hx:" + role
     shell = os.environ.get("SHELL") or "/bin/zsh"
@@ -686,6 +843,23 @@ def ensure_aux_window(
 
 
 def _run_tests_in_aux(key: str, session_id: str, sdir: Path, layout: dict) -> int:
+    """Run the suite in `hx:tests`, wait for its receipt, return its status.
+
+    Three guards, each for a failure that was observed:
+
+    * `<state>/tests-run.lock`, non-blocking: a second `tests --run` says so
+      instead of starting a second run that would overwrite `tests.log`.
+    * if the caller *is* the tests pane, run in place. Respawning the pane the
+      command was typed in would kill the shell that is waiting for the answer.
+    * a startup grace of 5 s: the pane's shell touches `started` before the
+      Python runner begins. Without that evidence, stop after 5 s and report 1 —
+      otherwise a runner that never imported (bad interpreter, missing module)
+      would look like a 7-minute hang.
+
+    The deadline is 420 s against the manifest's 360 s bound, leaving room for
+    startup and cleanup. A `cancel` file appearing (Ctrl-C in the caller, which
+    also touches it) is reported as 130, not as a suite failure.
+    """
     from .suite_run import run, testbench_binary
 
     with (sdir / "tests-run.lock").open("a") as lock:
@@ -735,6 +909,19 @@ def _run_tests_in_aux(key: str, session_id: str, sdir: Path, layout: dict) -> in
 
 
 def cmd_aux(args) -> int:
+    """Ensure one `hx:<role>` window and focus it (or run the suite for `tests`).
+
+    The session the aux window is created in is the *recorded* one while it
+    lives, otherwise the current session — the same anchor rule `up` uses, so a
+    second terminal cannot build the permanent tabs in a different session of
+    the same group and end up with two `hx:mail`s.
+
+    Exit status: 0 for "opened/focused", 1 for a refused run (`tests --run` with
+    a disabled gate, outside tmux, or already running). A plain aux command
+    outside tmux stays 0 with a message: it is a navigation command, and a
+    script calling it from a cron job should not treat "no workspace here" as an
+    error.
+    """
     role = args.role
     run_requested = getattr(args, "run", False)
     if not gate.enabled():
@@ -793,7 +980,16 @@ def cmd_debug_report(args) -> int:
 
 
 def cmd_run(args) -> int:
-    """`up`, then exec the agent in this pane. The workspace never owns this pane."""
+    """`up`, then exec the agent in this pane. The workspace never owns this pane.
+
+    `exec` (rather than a subprocess) so the agent replaces this process and no
+    wrapper outlives it. The pane is deliberately *not* marked: it is the
+    reader's agent window, and `down` must leave it standing.
+
+    127 when the binary cannot be executed, which is the shell's convention for
+    "command not found" and lets a caller distinguish it from the agent's own
+    exit status.
+    """
     cmd_up(args)
     argv = list(args.args or [])
     if argv and argv[0] == "--":
@@ -807,7 +1003,12 @@ def cmd_run(args) -> int:
 
 
 def _tabs_in_order(layout: Dict) -> List[Tuple[str, Dict]]:
-    """Worker tabs as the status line shows them: by window index."""
+    """Worker tabs as the status line shows them: by window index.
+
+    A tab with no recorded index sorts last instead of raising or sorting as 0:
+    the index is a tmux fact that can be missing after a hand-edit, and a missing
+    number is not tab number one.
+    """
     indexes = watch.tab_indexes(layout)
 
     def _index(item) -> int:
@@ -819,6 +1020,12 @@ def _tabs_in_order(layout: Dict) -> List[Tuple[str, Dict]]:
 
 
 def cmd_worker(args) -> int:
+    """Focus the Nth worker tab, numbering from 1 in status-line order.
+
+    The order comes from the layout's recorded window indices (`tab_indexes`),
+    not from the dict order: tab order is what the reader sees, and a tab whose
+    index is unknown sorts last rather than pretending to be first.
+    """
     if not tmuxio.in_tmux():
         print("hermes-tmux: not inside tmux.")
         return 0
@@ -841,6 +1048,16 @@ def cmd_open(args) -> int:
     """Open (or focus) the transcript tab of any worker, finished ones included.
 
     A tab opened this way is the reader's: it stays until they close it.
+
+    Reference matching, in order: exact ``<last8>#<task>``, or the bare last 8
+    of the delegation id. A bare id that matches several tasks of one delegation
+    resolves to task 0 (the head task) rather than to whichever came first in
+    the list — an arbitrary sibling would be a coin flip presented as a choice.
+
+    The record this writes is the same shape the coordinator writes, plus
+    ``pinned``: the coordinator may retire an unpinned tab when its worker
+    leaves, and must never retire one the reader opened on purpose. ``dismissed``
+    is cleared so a tab closed by hand can be brought back.
     """
     if not gate.enabled():
         print("hermes-tmux: %s" % gate.disabled_reason())
@@ -915,6 +1132,12 @@ def _close_handler() -> str:
     Silent and always 0: tmux shows the output of a ``run-shell`` job, and a
     line about one that ends non-zero, in the active pane in view mode, which
     is the reader's own pane.
+
+    ``#{client_name}`` is passed so the result message goes to the client that
+    clicked, and ``#{mouse_status_range}`` carries the window id (``hxc@N``) —
+    both are expanded by tmux at click time, not here. ``--quiet`` makes
+    `cmd_close` print nothing and exit 0 whatever it decided: a refusal (not a
+    worker tab) is not an error the reader can act on.
     """
     command = _self_command("close", "--quiet", "--client", "#{client_name}",
                             "#{mouse_status_range}").replace("&& exec env ", "&& env ", 1)
@@ -932,7 +1155,15 @@ def _server_keys(home: Optional[Path] = None) -> List[str]:
 
 
 def _any_workspace_on_server(exclude_key: str = "") -> bool:
-    """True when any owned window or live watcher remains on this tmux server."""
+    """True when any owned window or live watcher remains on this tmux server.
+
+    Two independent answers, either of which keeps the click binding in place:
+    any window on the server carrying our marker (another profile's workspace,
+    or worker tabs opened without `up`), or a live coordinator for any *other*
+    session key of this server. The second covers a workspace whose windows were
+    all closed by hand while its coordinator still runs — restoring the binding
+    under it would leave a server-wide list-keys change with no owner.
+    """
     rc, all_wids = tmuxio.run("list-windows", "-a", "-F", "#{window_id}")
     if rc == 0:
         for line in all_wids.splitlines():
@@ -972,7 +1203,23 @@ def _tab_of_window(window_id: str) -> Tuple[Optional[Path], str, str, Dict]:
 
 
 def cmd_close(args) -> int:
-    """Close the view of one worker tab. The worker itself is not touched."""
+    """Close the view of one worker tab. The worker itself is not touched.
+
+    Two ways in: a click (`{"target": "hxc@12"}`, `--quiet`, `--client`) or a
+    command line (`hermes-tmux close @12`, or no target = the window this
+    command runs in). The target is validated by `closemark.parse_target` first;
+    a string that is not a window id is refused instead of being handed to tmux
+    as a target expression.
+
+    Refusal reasons are distinct exit codes when not quiet — 2 bad target, 3 no
+    such window, 4 not a worker tab / nothing of ours in it — because a script
+    needs to tell "I aimed wrong" from "there was nothing to close". Quiet mode
+    always exits 0, so the click binding never produces a tmux error line.
+
+    The message is honest about the two things a reader may not expect: the
+    worker is *still running* (this closed the view, not the job), and a pane
+    they split into that tab was left in place (the window survives with it).
+    """
     quiet = bool(getattr(args, "quiet", False))
     client = getattr(args, "client", "") or ""
 
@@ -1028,7 +1275,19 @@ def cmd_close(args) -> int:
 
 
 def cmd_close_mark(args) -> int:
-    """Turn the clickable mark on or off for this server without rebuilding anything."""
+    """Turn the clickable mark on or off for this server without rebuilding anything.
+
+    Candidate windows are the intersection of "owned" (marker as own option) and
+    "recorded as a worker tab in some layout of this server" — including layouts
+    of other HERMES_HOME profiles, discovered through the `@hx_home` stamp on each
+    owned window. Without that breadth, `close-mark on` from one profile would
+    silently skip the tabs of another, and `status` would undercount them.
+
+    `on` installs the binding first and then marks windows; a failed install
+    still reports what it marked, and the exit status follows the binding, since
+    that is the part the reader asked for. `off` restores the binding *and*
+    unmarks, so a server can be returned to its pre-tool state in one command.
+    """
     if not tmuxio.in_tmux():
         print("hermes-tmux: not inside tmux.")
         return 0
@@ -1359,6 +1618,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    """Dispatch one subcommand; 2 with help when none was given, 130 on Ctrl-C.
+
+    Only `KeyboardInterrupt` is caught. Everything else propagates: a bug in a
+    read path must be visible as a traceback in the pane that ran it, not
+    converted into an exit status that looks like a policy refusal.
+    """
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "func", None):

@@ -18,6 +18,39 @@
 #   export HERMES_TMUX=0       no workspace bootstrap for this shell
 #   TMUX_ATTACH_SOCKET=name    private server (`tmux -L name`), for tests
 #   TMUX_ATTACH_CONFIG=path    private config (`tmux -f path`), for tests
+#
+# ---------------------------------------------------------------------------
+# Contract (what the rest of the tool assumes about this file)
+#
+# * This file is installed verbatim as ~/.local/bin/tmux-attach. It is the only
+#   copy that runs, so the repository copy and the installed copy must be kept
+#   byte-identical:
+#       shasum -a 256 scripts/tmux-attach ~/.local/bin/tmux-attach
+#   Edit here, then reinstall. Editing the installed copy makes the repo's copy
+#   a lie, and a comment-only divergence is still a divergence: the installed
+#   text is what a reader debugs at 3am.
+#
+# * This script owns exactly one decision: attach, or create and attach. When
+#   no workspace exists it starts `hermes-tmux up` in a detached pane and gets
+#   out of the way. It duplicates no workspace logic — no window names, no
+#   markers, no layouts — so the workspace can change without this script
+#   changing.
+#
+# * Health is read from what the workspace stamped on its own windows, never
+#   from this shell's environment: `@hx` (ours), `@hx_key` (which workspace),
+#   `@hx_home` (which HERMES_HOME built it). The pid file is then read from
+#   *that* home. Reading `$HERMES_HOME` here instead was a real defect: a
+#   terminal whose shell profile differs from the server's re-bootstrapped on
+#   every attach, because it looked for a pid file in a different profile.
+#
+# * A bootstrap pane is not a tab: `new-window -d` never selects it, `-d` never
+#   moves an attached client, `remain-on-exit off` means it cannot linger, and a
+#   dead one is removed rather than blocking repair forever.
+#
+# * Both isolation variables exist so tests can drive a private `-L` server and
+#   never reach the default socket. Unset them and behaviour is exactly the old
+#   behaviour: tmux resolves $TMUX or the default socket.
+# ---------------------------------------------------------------------------
 
 emulate -L zsh
 setopt pipe_fail
@@ -109,6 +142,11 @@ hx_home() {        # Hermes state root, as this shell resolves it
 # whose HERMES_HOME differs from the server's from re-bootstrapping forever.
 # Names are compared with the `#N` suffix `free_window_name` adds when a foreign
 # window already holds `agents` or `hx:mail`.
+#
+# Deliberately NOT checked: pane contents, layouts, the overview pane, aux tabs
+# beyond `hx:mail`. "Healthy" here means "the workspace exists and has a live
+# coordinator", not "nothing is wrong anywhere" — `hermes-tmux up` is the repair
+# for everything else, and it is idempotent.
 workspace_healthy() {   # $1 = exact session name; true when nothing to build
   local s=$1 row name ours rest key home key_found="" home_found="" mail=0 pid
   local rows=$(tmx list-windows -t "=$s" \
@@ -154,6 +192,8 @@ ensure_workspace() {    # $1 = exact session name, the only session touched
   case ${(L)${HERMES_TMUX:-}} in
     (0|false|no|off|disable|disabled) return 0 ;;
   esac
+  # Costs one `list-windows` on every attach; that is the price of never
+  # bootstrapping a workspace that is already there.
   workspace_healthy "$s" && return 0
   if [[ $DRY == 1 ]]; then
     print "bootstrap workspace: $s"

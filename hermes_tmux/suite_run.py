@@ -1,4 +1,28 @@
-"""Run the workspace regression through TestBench in the hx:tests pane."""
+"""Run the workspace regression through TestBench in the hx:tests pane.
+
+One job: start `testbench run <repo> --profile regression --suite
+full-tmux-regression --stream`, copy its output to the pane *and* to
+`tests.log`, and report the exit status through a receipt file.
+
+Contract with the caller (`cli._run_tests_in_aux`), all three via paths in the
+receipt's directory — the caller never reads this process's stdout:
+
+* `started` is touched once the runner actually begins. Absent after a short
+  grace period, the caller stops waiting: a Python that never imported (bad
+  interpreter, cwd, import error) must not hang the command for seven minutes.
+* `exit` is written atomically (`<name>.tmp` then replace) with the decimal
+  status, so a reader never sees a half-written number.
+* `cancel` appearing at any time is treated as an interrupt, not a failure.
+
+Signals: SIGINT, SIGHUP and SIGTERM are all converted into a SIGINT sent to
+TestBench, because its Python unwinds its isolation cleanup on SIGINT and does
+not on SIGHUP — the sandbox would leak a server. The reported status is
+`128 + signum` so a caller can tell "the user cancelled" (130) from "the suite
+failed" (1).
+
+Neither `tests.log` nor the pane is the source of truth for the exit status;
+the receipt is. `tests.log` is only what a human reads afterwards.
+"""
 from __future__ import annotations
 
 import codecs
@@ -18,6 +42,15 @@ def testbench_binary() -> str:
 
 
 def run(repo: Path, log_path: Path, binary: str, cancel: Path | None = None) -> int:
+    """Stream one TestBench run; return its status (128+signal when interrupted).
+
+    Output is written twice on purpose: the pane is the live view, the log is
+    the record that survives the pane being closed. A write to the pane that
+    fails (pane gone) is swallowed; the run continues and still waits for
+    TestBench to clean up, because abandoning it would leave its sandbox
+    behind. The log write is not guarded the same way — if `tests.log` cannot
+    be written the whole thing is broken and the exception should surface.
+    """
     proc = None
     interrupted = None
 
@@ -99,6 +132,12 @@ def run(repo: Path, log_path: Path, binary: str, cancel: Path | None = None) -> 
 
 
 def main() -> int:
+    """`python -m hermes_tmux.suite_run REPO LOG BINARY [RECEIPT]`.
+
+    The receipt path is optional so the command can be run by hand; the pane
+    launcher always passes one (see `cli._aux_command`, role "tests"), and the
+    shell fallback there writes the status itself if this module never starts.
+    """
     repo, log_path, binary, *receipt_arg = sys.argv[1:]
     rc = 1
     receipt = Path(receipt_arg[0]) if receipt_arg else None
