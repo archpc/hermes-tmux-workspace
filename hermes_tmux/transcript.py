@@ -20,6 +20,28 @@ Long entries are clipped with an explicit ``(+N chars)`` marker and the path of
 the full transcript is printed first, so a reader always knows there is more
 and where it is. Lines that are not events are shown as written.
 ``HERMES_TMUX_TRANSCRIPT=raw`` restores plain ``tail -F``.
+
+The invariant every branch below serves: **one event, one terminal line.** No
+event is dropped and none is merged into another. The only two suppressions are
+exact duplicates the writer itself produces — the ``think`` line that is the
+first 80 characters of the ``assistant`` line after it, and the ``start`` copy
+of the goal the ``user``/kickoff line already stated — plus the fixed six-line
+file header, which the pane border repeats. Anything else that is not an event
+is printed verbatim and dimmed: a foreign or truncated line is evidence, and
+hiding it would make the view lie by omission.
+
+Format the follower relies on (written by Hermes, not by us):
+
+    HH:MM:SS role | text
+
+with roles ``user, start, think, assistant, tool, result, final``. A line that
+does not match is "not an event", not an error. The parse is deliberately
+anchored on the timestamp: it is the one field the writer always emits, so a
+role name we have never seen still renders under its own name.
+
+Why a follower instead of `tail -F`: `tail -F` prints bytes, so ESC sequences in
+tool output would reach the terminal and OSC 52 in a tool result would write the
+reader's clipboard. Everything here goes through `labels.defuse` first.
 """
 
 from __future__ import annotations
@@ -52,6 +74,9 @@ _MARGIN = 2
 #: Characters shown per event type before clipping. What the worker said is
 #: the substance of a transcript and gets room; a tool call or result is
 #: evidence that something happened and gets one line (fitted to the pane).
+#: Measured in characters, not cells — this is a "how much text is worth
+#: printing" budget, not geometry; the geometry happens later in `_fit`.
+#: A type missing here falls back to 480 in `_line`.
 _MAX_CHARS = {"assistant": 4000, "think": 240, "goal": 700, "context": 320,
               "error": 480, "other": 480}
 
@@ -115,6 +140,22 @@ class Formatter:
     The writer emits a ``think`` line that is the first 80 characters of the
     ``assistant`` line that follows it. Showing both doubles the transcript, so
     a ``think`` is held until the next line shows whether it was a preview.
+
+    State, and what resets it:
+
+    * ``_held`` — the pending ``think``. Flushed by `flush()` (nothing followed
+      within one wait), by a non-matching line, or by `run_tail` when the file is
+      replaced: a held line belongs to the file it came from.
+    * ``_goal_shown`` — set by the ``user``/kickoff line; suppresses the
+      ``start`` line that restates the same goal. Never reset within one file.
+    * ``_seen_event`` — gates header suppression. Once a real event has been
+      rendered, a line that *looks* like the header is shown verbatim: at that
+      point it is either a quote inside the transcript or a second file
+      concatenated onto this one, and both are evidence.
+
+    ``width`` is mutable on purpose: `run_tail` refreshes it from the pane before
+    every batch, so a resized pane fits the next lines it prints. Lines already
+    printed are the terminal's to re-wrap.
     """
 
     def __init__(self, width: int = 100, colour: bool = False,
@@ -131,6 +172,13 @@ class Formatter:
     # -- public -------------------------------------------------------------
 
     def feed(self, line: str) -> List[str]:
+        """Consume one raw line; return the display lines it produces (may be none).
+
+        Defusing happens first and unconditionally: the file is untrusted input
+        (tool output, a quoted file, a model answer), and nothing below is safe
+        on a raw ESC/OSC byte. One OSC 52 would set the reader's clipboard; CSI
+        can clear the pane.
+        """
         line = line.rstrip("\r\n")
         # Transcript text is untrusted (tool output, quoted files, a model's
         # answer). Nothing below is safe on a raw ESC/OSC byte: one OSC 52 in a
@@ -155,6 +203,9 @@ class Formatter:
         out: List[str] = []
         if self._held is not None:
             held, self._held = self._held, None
+            # The preview is the assistant text truncated by the writer, often
+            # with an ellipsis appended; strip both before comparing, so a
+            # "…"-terminated preview is still recognised as a preview.
             preview = held["text"].rstrip(".\u2026 ")
             if not (event["role"] == "assistant" and event["text"].startswith(preview)):
                 out.extend(self._render(held))
@@ -177,7 +228,10 @@ class Formatter:
         """Clip to ``room`` display columns. Never wider, and never a half-written marker.
 
         The count of hidden characters is shown when it fits whole; in a pane
-        too narrow for that, a bare ellipsis says the entry was clipped.
+        too narrow for that, a bare ellipsis says the entry was clipped. The
+        count is refined once after the marker's own width is known, then the
+        kept prefix is trimmed until prefix+marker fits — so the marker is
+        either whole or absent, never truncated into "…(+12 ch".
         """
         room = max(0, room)
         if labels.cell_width(text) <= room:
@@ -247,6 +301,13 @@ class Formatter:
         return out + [""]
 
     def _render_result(self, ts: str, text: str) -> List[str]:
+        """``tool ok 0.4s: …`` / ``✗ ERROR 0.4s  <message>`` as one line each.
+
+        An ERROR result is the one entry printed without fitting: it wraps. Its
+        message is preferred over the raw JSON payload (`labels.error_text`),
+        because a reader needs the sentence and the JSON stays in the file. An
+        unparsable result is still printed, dimmed and fitted — never dropped.
+        """
         match = _RESULT_RE.match(text)
         if match is None:
             return [self._line(ts, "  ", text, "other", DIM, fit=True)]
@@ -266,6 +327,14 @@ class Formatter:
         return [self._line(ts, head, preview, "other", DIM, fit=True)]
 
     def _render_final(self, ts: str, text: str) -> List[str]:
+        """The last line of a run: status + duration, or only an unusual exit reason.
+
+        Two forms exist in the file: ``final status=… duration=…`` and
+        ``end status=… exit_reason=…``. The second repeats the status the first
+        already printed, so it renders only when the reason is news (interrupted,
+        max_iterations, …) — otherwise a normal finish would end with two lines
+        saying the same thing.
+        """
         s = self.style
         fields = dict(_FINAL_KV.findall(text.split("summary:", 1)[0]))
         status = fields.get("status", "")
@@ -337,7 +406,31 @@ def _emit(lines: List[str]) -> bool:
 
 
 def run_tail(path: str, follow: bool = True) -> int:
-    """Print the transcript at ``path`` readably and keep following it."""
+    """Print the transcript at ``path`` readably and keep following it.
+
+    Three loops' worth of care in one function; the states that matter:
+
+    * ``offset``/``pending`` are a byte cursor and an unterminated line. Only
+      complete lines are fed to the formatter, so a line split by the writer's
+      own buffering is never rendered twice or half.
+    * ``ident`` is ``(st_dev, st_ino)``, not the size. A replacement file that
+      is larger than the old offset would otherwise be read from the middle,
+      showing half a line and silently skipping the beginning. On a change of
+      identity the held ``think`` is flushed (it belongs to the old file) and the
+      formatter starts fresh.
+    * a shrink (``size < offset``) is a truncation: start from zero.
+    * a file that can be stat'd but not read (permissions, a transient
+      replacement) waits for the next change instead of spinning.
+
+    Liveness: every `_PANE_CHECK_S` the pane is asked whether it still exists,
+    because a tmux server killed outright does not reliably hang up its panes'
+    processes — an observed follower outlived its server by 7.5 minutes.
+    Without ``TMUX_PANE`` (run by hand) the check is skipped.
+
+    The terminal is borrowed, not owned: echo off and the cursor hidden only
+    while following with colour, both restored in ``finally``. `tail --no-follow`
+    is a normal command in a normal shell and must leave it usable.
+    """
     colour = colour_enabled()
     ascii_mode = labels.ascii_only()
     fmt = Formatter(_pane_width(), colour, ascii_mode)

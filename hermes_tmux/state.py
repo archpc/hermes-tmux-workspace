@@ -4,12 +4,49 @@ Turns Hermes delegation artifacts (live transcripts, manifests, the
 ``async_delegations`` table, and the review registry) into normalized
 ``Worker`` records.
 
+Four surfaces, one record per (delegation, task):
+
+* **S1 transcript** ``.../live/<did>/task-<n>.log`` — append-only, one
+  ``HH:MM:SS role | text`` line per event. The only source of per-task
+  *activity*: phase, tool calls, last error, last message, summary, duration,
+  first/last event time.
+* **S2 manifest** ``.../live/<did>/manifest.json`` — the task list, the goal,
+  per-task ``status``/``exit_reason``/``log``, the delegation's ``started``
+  date. Rewritten in place, so a read can land mid-write and must be retried
+  silently.
+* **S3 rows** ``state.db`` table ``async_delegations`` — terminal state and
+  ``result_json`` per-task verdicts; ``task_json`` carries the authoritative
+  task index -> transcript path map. Also the only surface that knows about
+  independently-completed unit rows (``<did>-<k>``).
+* **Review registry** ``cache/hermes-tmux/reviews.json`` — written only by a
+  reviewer run that actually executed. Its absence means ``unreviewed``; it is
+  never inferred from a worker's own summary.
+
+State precedence (see ``_resolve_state``): per-task DB verdict > terminal batch
+DB verdict > manifest status > "running" (transcript exists, no ``final``) >
+``unknown``. Silence in a transcript is not completion; a transcript that stops
+mid-run stays ``running`` until the display layer derives ``stall`` from its age
+(``render.STALL_AFTER_S``), which is a label, not a verdict.
+
 Ground rules for this module:
 
 * Standard library only, Python 3.9 compatible.
 * Read-only: nothing here writes to Hermes state, logs, or config.
 * Total functions: every public entry point returns a best-effort value on
   any I/O, parse, or sqlite error. None of them raise.
+* No invented facts: cost/token fields are absent while a task runs, review
+  status is never guessed, and a task's quality is not this module's business.
+
+Caching. ``parse_log`` and ``read_manifest`` memoize on
+``(st_dev, st_ino, st_size, st_mtime_ns)`` in process-global dicts capped at
+``_STAT_CACHE_MAX``. A transcript may be megabytes and an unchanged one must
+not be re-read on every SQLite WAL wake; including the inode means an atomic
+replace (a rotated or rewritten log) invalidates instead of serving the old
+file's parse. Cached values are copied out so a caller cannot mutate the cache.
+
+Worker ``key`` is ``"<delegation_id>#<task_index>"``. It is the map key in
+``layout.json['tabs']`` and therefore part of the on-disk contract with
+``watch``: changing its format would orphan every recorded tab.
 """
 
 from __future__ import annotations
@@ -38,11 +75,12 @@ KNOWN_ROLES = (
     "final",
 )
 
-#: ``state`` values in ``async_delegations`` that are *not* terminal.
-#: ``async_delegations.state`` values that mean "still live". Hermes'
-#: ``_LIVE_STATES`` is ``{"running", "stalling", "finalizing"}``; ``stalling`` and
-#: ``finalizing`` are easy to mistake for verdicts, and treating either as
-#: terminal would freeze a worker's row at a state it has not reached yet.
+#: ``async_delegations.state`` values that mean "still live", so they may never
+#: be read as a terminal verdict. Hermes' own ``_LIVE_STATES`` is
+#: ``{"running", "stalling", "finalizing"}``; ``stalling`` and ``finalizing``
+#: are easy to mistake for verdicts, and treating either as terminal would
+#: freeze a worker's row at a state it has not reached yet. The rest are
+#: accepted spellings seen in manifests and older rows: they are all "not done".
 NON_TERMINAL_DB_STATES = frozenset(
     {
         "running",
@@ -57,13 +95,20 @@ NON_TERMINAL_DB_STATES = frozenset(
     }
 )
 
+#: One event line: time of day, role, then the text after a single pipe. The
+#: header Hermes writes first does not match, which is why header lines simply
+#: disappear from the stream instead of needing a skip count.
 _EVENT_RE = re.compile(
     r"^(?P<ts>\d{2}:\d{2}:\d{2})\s+(?P<role>[A-Za-z_][A-Za-z0-9_]*)\s*\|(?P<text>.*)$"
 )
+#: ``duration=12.3s`` in a ``final`` line; the only timing Hermes records.
 _DURATION_RE = re.compile(r"duration=(?P<value>-?\d+(?:\.\d+)?)s")
 _SUMMARY_MARK = "summary: "
 _TOOL_ARROW = "-> "
 
+#: Columns this module knows how to use. Read by whitelist rather than ``*``
+#: because a Hermes upgrade may add or drop columns and a missing one must
+#: degrade to "not available", not to a failed query for the whole table.
 _DESIRED_DB_COLUMNS = (
     "delegation_id",
     "parent_session_id",
@@ -105,11 +150,13 @@ def live_root(home: Optional[Path] = None) -> Path:
 
 
 def _reviews_path(home: Optional[Path]) -> Path:
+    """The advisory review registry; absent until a reviewer run records one."""
     base = Path(home).expanduser() if home is not None else hermes_home()
     return base / "cache" / "hermes-tmux" / "reviews.json"
 
 
 def _db_path(home: Optional[Path]) -> Path:
+    """Hermes' own SQLite database. Opened read-only, never created here."""
     base = Path(home).expanduser() if home is not None else hermes_home()
     return base / "state.db"
 
@@ -119,6 +166,12 @@ def _db_path(home: Optional[Path]) -> Path:
 
 
 def _empty_log() -> Dict[str, Any]:
+    """The parse result for "no transcript yet": nothing known, nothing inferred.
+
+    ``has_final`` and ``error_pending`` are the two fields that stand in for
+    verdicts, and both default to "not seen". ``events`` is parse-time scratch
+    only; it is emptied in every copy handed out.
+    """
     return {
         "phase": "none",
         "tool_count": 0,
@@ -151,7 +204,12 @@ def _tool_name(text: str) -> Optional[str]:
 
 
 def _parse_event_line(line: str) -> Optional[Dict[str, str]]:
-    """Parse one ``HH:MM:SS role | text`` line; None when malformed."""
+    """Parse one ``HH:MM:SS role | text`` line; None when malformed.
+
+    Out-of-range clock fields are rejected rather than normalised, so a
+    timestamp-shaped header or a truncated write cannot become an event with a
+    nonsense time (which would then drive the stall label).
+    """
     try:
         match = _EVENT_RE.match(line.rstrip("\n").rstrip("\r"))
         if match is None:
@@ -172,12 +230,21 @@ def _parse_event_line(line: str) -> Optional[Dict[str, str]]:
         return None
 
 
+#: One parsed log body per path, keyed by stat signature. Process-global on
+#: purpose: every reader in this process sees the same Hermes profile, and a
+#: per-call cache would be rebuilt on each of the coordinator's passes.
 _STAT_CACHE_MAX = 512
 _LOG_CACHE: Dict[str, Tuple[Tuple[int, int, int, int], Dict[str, Any]]] = {}
 _MANIFEST_CACHE: Dict[str, Tuple[Tuple[int, int, int, int], Dict[str, Any]]] = {}
 
 
 def _stat_sig(path: Path) -> Optional[Tuple[int, int, int, int]]:
+    """(dev, ino, size, mtime_ns) or None when the file is unreadable.
+
+    The inode is what makes an atomic replace invalidate the cache: os.replace
+    keeps the path and changes the inode, so size and mtime alone could agree by
+    coincidence and serve a stale parse.
+    """
     try:
         st = os.stat(path)
     except OSError:
@@ -186,6 +253,12 @@ def _stat_sig(path: Path) -> Optional[Tuple[int, int, int, int]]:
 
 
 def _copy_log(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    """Shallow copy with ``events`` emptied: callers get facts, not the stream.
+
+    The event list exists only while a log is being folded into fields; keeping
+    it would double memory for a finished transcript and invite a caller to
+    treat a cached list as stable.
+    """
     out = dict(parsed)
     out["events"] = []
     return out
@@ -201,6 +274,11 @@ def parse_log(path: Path) -> Dict[str, Any]:
     keying by stat metadata avoids re-reading megabytes of historical logs on
     unrelated SQLite WAL wakeups while immediately invalidating on any append
     or atomic file replacement.
+
+    The whole file is read on a miss; there is no incremental offset. That is
+    deliberate: a transcript is appended to, never rewritten in place, but the
+    file can also be replaced wholesale, and a byte offset would then splice two
+    different files together. The cost is bounded by the stat cache.
     """
     p = Path(path)
     key = str(p)
@@ -262,6 +340,9 @@ def parse_log(path: Path) -> Dict[str, Any]:
         elif role == "assistant":
             last_message = text or last_message
         elif role == "result":
+            # A result is the verdict on the call before it. A success clears
+            # the marker as surely as a new call does: the label must describe
+            # the worker now, not its worst moment.
             if "ERROR" in text:
                 last_error = text
                 error_pending = True
@@ -298,7 +379,14 @@ def parse_log(path: Path) -> Dict[str, Any]:
 
 
 def read_manifest(path: Path) -> Dict[str, Any]:
-    """Read one manifest (stat-cached). Returns ``{}`` for missing or invalid files."""
+    """Read one manifest (stat-cached). Returns ``{}`` for missing or invalid files.
+
+    Hermes rewrites the manifest in place, so a read can land mid-write and see
+    truncated JSON. That returns ``{}`` and is *not* cached, so the next pass
+    (the write changes the stat signature) sees the finished file. ``{}`` must
+    therefore never be read as "this delegation has no tasks": it means "no
+    answer this time".
+    """
     p = Path(path)
     key = str(p)
     sig = _stat_sig(p)
@@ -326,6 +414,10 @@ def _manifest_has_live_task(manifest: Dict[str, Any]) -> bool:
 
     Keeps long-running delegations from being evicted out of ``load_manifests``
     when more than ``limit`` short-lived delegations start after them.
+
+    A task with no status counts as live only while the delegation is not
+    ``completed``: a missing status in a finished manifest is "Hermes did not
+    write one", not "still running".
     """
     tasks = manifest.get("tasks")
     if isinstance(tasks, list) and tasks:
@@ -346,7 +438,18 @@ def _manifest_has_live_task(manifest: Dict[str, Any]) -> bool:
 def load_manifests(
     home: Optional[Path] = None, limit: int = 40
 ) -> List[Tuple[Path, Dict[str, Any]]]:
-    """Load ``(manifest_path, manifest)`` pairs, active first then newest first."""
+    """Load ``(manifest_path, manifest)`` pairs, active first then newest first.
+
+    Two stable sorts, in this order, are what matter:
+
+    1. ``(started, delegation_id)`` descending — newest first;
+    2. live-before-settled — a stable partition, so the newest-first order
+       survives inside each half.
+
+    ``limit`` is applied *after* that, so live work can never be pushed out by
+    a burst of short finished delegations (the failure this ordering exists to
+    prevent). A negative ``limit`` means "all"; ``0`` means none.
+    """
     root = live_root(home)
     found: List[Tuple[Path, Dict[str, Any]]] = []
     try:
@@ -400,6 +503,13 @@ def db_delegations(home: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
 
     Missing file or table yields ``{}``. A locked database yields whatever
     rows could be read before the busy timeout expired.
+
+    Opened as ``file:...?mode=ro`` with a 0.5 s busy timeout: this must never
+    create the database, upgrade a journal, or block the writer. A short
+    timeout that returns partial rows is acceptable because every caller treats
+    a differing answer as "reload"; one that blocked would stall the coordinator
+    behind a chatty parent. The whole table is read, unfiltered — Hermes does
+    not index by state, and a row's state can change after the query anyway.
     """
     path = _db_path(home)
     try:
@@ -449,7 +559,13 @@ def db_delegations(home: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
 
 
 def load_reviews(home: Optional[Path] = None) -> Dict[str, Any]:
-    """Load the review registry, always returning a dict with a ``reviews`` list."""
+    """Load the review registry, always returning a dict with a ``reviews`` list.
+
+    Any unreadable or malformed file is "no reviews recorded", which the display
+    renders as ``unreviewed``. That is the honest answer: the registry is the
+    only evidence that a review ran, so its absence cannot mean "passed" or
+    "not needed".
+    """
     path = _reviews_path(home)
     try:
         with path.open("r", encoding="utf-8", errors="replace") as handle:
@@ -482,6 +598,10 @@ def review_for(
 
     An exact ``(delegation_id, task_index)`` match wins; a record with
     ``task_index`` of ``None`` applies to the whole delegation.
+
+    The first exact match wins and the first delegation-wide record is the
+    fallback, so a later duplicate cannot silently replace an earlier verdict.
+    ``{}`` means "no review recorded", which the renderer shows as unreviewed.
     """
     records = _registry_records(reviews)
     fallback: Dict[str, Any] = {}
@@ -521,7 +641,18 @@ def is_reviewer_delegation(reviews: Dict[str, Any], delegation_id: str) -> bool:
 
 @dataclass
 class Worker:
-    """One normalized unit of delegation work."""
+    """One normalized unit of delegation work.
+
+    ``key`` is the identity used everywhere else (``<delegation_id>#<index>``);
+    ``delegation_id`` alone identifies the batch, and one batch may have several
+    tasks, so a tab per delegation would aggregate siblings.
+
+    ``state`` is the resolved verdict from ``_resolve_state`` (Hermes' own
+    vocabulary passed through where possible, plus ``running``/``unknown``).
+    ``exit_reason`` is *how the run stopped*, never whether the work is good.
+    ``phase`` is the last transcript role, which is what the worker was doing,
+    not a status.
+    """
 
     delegation_id: str
     task_index: int
@@ -569,6 +700,18 @@ def _db_row_for_task(
     per task under ``<delegation_id>-<k>`` with ``task_json.task_indexes`` naming
     the covered task index(es), while ``manifest.json`` stays keyed by the base
     ``delegation_id``. Check suffixed unit rows first, then the batch row.
+
+    Branch order, precisely:
+
+    1. any ``<did>-*`` row whose ``task_json.task_indexes`` contains this index
+       (the authoritative unit map);
+    2. the bare ``-<k>`` suffix as a convention fallback — but only when no
+       batch row exists, since a batch row is the row that actually governs;
+    3. the batch row ``db_rows[delegation_id]``, else ``None``.
+
+    Everything here is defensive about types: ``task_json`` is a JSON *string*
+    in the column, and a garbled one must skip that row rather than fail the
+    whole read.
     """
     prefix = delegation_id + "-"
     for key, row in db_rows.items():
@@ -603,7 +746,15 @@ def _db_row_for_task(
 def _db_task_verdict(
     db_row: Optional[Dict[str, Any]], task_index: int, unit_task_count: int
 ) -> Tuple[Optional[str], Optional[str]]:
-    """Extract per-task ``(status, exit_reason)`` from ``db_row['result_json']``."""
+    """Extract per-task ``(status, exit_reason)`` from ``db_row['result_json']``.
+
+    ``unit_task_count`` is how many tasks this row's payload may cover, i.e. the
+    count of the unit the row belongs to: 1 for an independent-completion unit,
+    the manifest's task count for a batch row. It only decides whether a payload
+    without a usable ``results`` entry may be read as this task's verdict — a
+    single-task payload is unambiguous, a multi-task one is not, and guessing
+    there is what once marked a failed sibling ``completed``.
+    """
     if not db_row:
         return (None, None)
     raw = db_row.get("result_json")
@@ -669,6 +820,10 @@ def _resolve_state(
     failure/interruption in ``manifest_status``, whereas non-success batch DB
     verdicts (``failed``, ``unknown`` from crash recovery, ``interrupted``)
     still override stale ``running`` manifests.
+
+    Two things this deliberately does not do: it never turns "no final line"
+    into a terminal state (that is ``running``, and later a display-only stall
+    label), and it never invents ``completed`` from a clean-looking transcript.
     """
     if isinstance(task_db_status, str) and task_db_status.strip():
         if task_db_status.strip().lower() not in NON_TERMINAL_DB_STATES:
@@ -724,6 +879,16 @@ def _task_log_path(
     manifest_path: Path, task: Dict[str, Any], index: int,
     transcripts: Optional[Dict[str, str]] = None,
 ) -> Optional[Path]:
+    """Where this task's transcript should be, in decreasing order of authority.
+
+    1. the manifest's own ``log`` field (absolute path the writer used);
+    2. the dispatch-time map in ``task_json.task_transcripts`` (authoritative
+       when the manifest was written before the path was known);
+    3. ``task-<n>.log`` beside the manifest, a naming convention only.
+
+    Returning a path does not mean the file exists; ``_workers_for_manifest``
+    stats it and refuses to publish a ``log_path`` it has not seen.
+    """
     declared = task.get("log")
     if isinstance(declared, str) and declared.strip():
         return Path(declared).expanduser()
@@ -746,6 +911,11 @@ def _combine_started(
     date the delegation started. Neither alone is a usable timestamp, so when
     both are present prefer the log's time on the manifest's date. Falls back
     to whichever one exists.
+
+    A result with no date part (log time only) is passed through as-is. The
+    renderer's datetime parser then yields nothing, so the stall label is not
+    computed for that worker — better than inventing today's date, which would
+    silently make an old run look fresh.
     """
     if isinstance(first_ts, str) and re.match(r"^\d{2}:\d{2}:\d{2}$", first_ts):
         if isinstance(manifest_started, str) and len(manifest_started) >= 10:
@@ -776,8 +946,15 @@ def load_workers(
 ) -> List[Worker]:
     """Build normalized ``Worker`` records, running first.
 
-    Ordering: running workers first, then by ``delegation_started`` descending,
-    then by ``task_index``. Never raises.
+    Ordering: running workers first, then ``delegation_started`` descending,
+    then ``task_index`` ascending within one delegation. Achieved with three
+    stable sorts applied least-significant-first; the final order is the one
+    the caller sees. ``limit`` is applied after sorting, and a negative limit
+    means "all" (``status --all``, ``open``, ``review`` use it so they are not
+    blind past the 40th worker). Never raises.
+
+    Records with no readable manifest are simply absent; this function never
+    reports a worker it could not substantiate.
     """
     workers: List[Worker] = []
     try:
@@ -841,6 +1018,8 @@ def _workers_for_manifest(
     tasks = manifest.get("tasks")
     if not isinstance(tasks, list):
         tasks = []
+    # Floored at 1: a malformed manifest still describes one unit, and a count
+    # of 0 would make _db_task_verdict treat a batch payload as unambiguous.
     manifest_task_count = max(len(tasks), 1)
 
     workers: List[Worker] = []
@@ -851,12 +1030,18 @@ def _workers_for_manifest(
         try:
             index = int(index_value)
         except (TypeError, ValueError):
+            # A manifest task without a usable index is addressed by position;
+            # the key still has to be unique inside this delegation.
             index = position
 
         task_db_row = _db_row_for_task(db_rows, delegation_id, index)
         transcripts = dict(base_transcripts)
         if task_db_row is not base_db_row:
+            # An independent-completion unit carries its own map, which is more
+            # specific than the batch row's. Merge rather than replace so a
+            # partial unit map cannot hide a path the batch row knew.
             transcripts.update(_task_transcripts(task_db_row))
+        # A unit row speaks for one task; the batch row may conflate all of them.
         unit_count = 1 if (task_db_row is not None and task_db_row is not base_db_row) else manifest_task_count
         task_db_status, task_db_exit = _db_task_verdict(task_db_row, index, unit_count)
 
@@ -874,6 +1059,8 @@ def _workers_for_manifest(
             if log_exists:
                 log = parse_log(log_path)
 
+        # Manifest status is what Hermes recorded for the task; _resolve_state
+        # decides whether a DB verdict outranks it.
         status = task.get("status")
         state = _resolve_state(
             task_db_row, status, log_exists, log,
