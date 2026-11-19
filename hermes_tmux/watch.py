@@ -757,7 +757,20 @@ def reconcile_tabs(key: str, workers: Sequence, home: Optional[Path] = None,
     kinds: Dict[str, str] = {}
     for wkey, tab in tabs.items():
         worker = by_key.get(wkey)
-        kind = _kind(worker) if worker is not None else "other"
+        if worker is None:
+            # Missing from the list is not evidence the work finished. A wholly
+            # empty read (locked DB, hiccup) is "unknown": leave every tab as it
+            # was so a transient outage cannot retire live work. When the list is
+            # non-empty but THIS worker is absent (pruned, or stranded past the
+            # load window), start a missing clock; only after ATTENTION_TTL_S does
+            # it become retirable, so a zombie tab cannot starve MAX_TABS forever.
+            if by_key:
+                tab.setdefault("missing_since", now)
+                if now - tab["missing_since"] > ATTENTION_TTL_S and "settled" not in tab:
+                    tab["settled"] = now
+            continue
+        tab.pop("missing_since", None)
+        kind = _kind(worker)
         kinds[wkey] = kind
         if kind in ("run", "stall"):
             tab.pop("settled", None)
@@ -778,8 +791,11 @@ def reconcile_tabs(key: str, workers: Sequence, home: Optional[Path] = None,
         return ("settled" in tab and not tab.get("pinned")
                 and tab.get("window") not in active and wkey not in unknown)
 
-    # 4. Let finished work leave.
+    # 4. Let finished work leave. A wholly empty read is "unknown", not "all
+    #    finished": skip retirement so a transient outage cannot close tabs.
     for wkey in list(tabs):
+        if not by_key:
+            break
         if not _retirable(wkey):
             continue
         tab = tabs[wkey]

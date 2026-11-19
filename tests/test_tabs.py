@@ -696,6 +696,150 @@ class TabsTest(unittest.TestCase):
                 self.assertNotIn(wkey, (watch.read_layout(key, home).get("tabs") or {}),
                                  "an unviewed settled tab outlived the linger")
 
+    # -- 6b ---------------------------------------------------------------
+    def test_transient_empty_worker_list_does_not_dismiss_a_live_tab(self):
+        # A running tab's worker can vanish from a read (locked DB, hiccup).
+        # Missing != finished: an empty list must not stamp the tab settled,
+        # retire it past the linger, or dismiss it so it never comes back.
+        with Sandbox() as box:
+            box.export("HERMES_TMUX_LINGER_S", "1")
+            deleg = "deleg_empty001"
+            box.add_delegation(deleg, [{"goal": "keep running"}])
+            self._up(box)
+            layout = self._wait_tabs(box, 1)
+            wkey = "%s#0" % deleg
+            pane = layout["tabs"][wkey]["pane"]
+            key = box.key()
+            box.stop_coordinator()
+
+            with inproc(box, linger="1"):
+                from hermes_tmux import state, watch
+                home = Path(box.home)
+                workers = state.load_workers(home)
+                self.assertTrue([w for w in workers if w.key == wkey],
+                                "fixture worker is not readable")
+                original = watch._active_window
+                watch._active_window = lambda session_id: ""  # out of view
+                try:
+                    t0 = time.time()
+                    watch.reconcile_tabs(key, workers, home, now=t0)
+                    tab = (watch.read_layout(key, home).get("tabs") or {}).get(wkey) or {}
+                    self.assertTrue(tab, "the running tab vanished on a normal pass")
+                    self.assertNotIn("settled", tab,
+                                     "a running tab was marked settled: %r" % tab)
+
+                    # Transient empty read, then a sustained one past the linger.
+                    watch.reconcile_tabs(key, [], home, now=t0 + 2.0)
+                    tab = (watch.read_layout(key, home).get("tabs") or {}).get(wkey) or {}
+                    self.assertTrue(tab, "an empty read retired a live tab")
+                    self.assertNotIn("settled", tab,
+                                     "an empty read stamped a live tab settled: %r" % tab)
+
+                    watch.reconcile_tabs(key, [], home, now=t0 + 120.0)
+                    layout_now = watch.read_layout(key, home)
+                    tab = (layout_now.get("tabs") or {}).get(wkey) or {}
+                    self.assertTrue(tab,
+                                    "a sustained empty read permanently dismissed live "
+                                    "work (layout=%r)" % layout_now)
+                    self.assertTrue(_pane_exists(pane),
+                                    "the live tab's pane was closed by an empty read")
+                    self.assertNotIn(wkey, layout_now.get("dismissed") or {},
+                                     "the live worker was dismissed: %r"
+                                     % (layout_now.get("dismissed"),))
+
+                    # Recovery: the worker is listable again; the tab stays.
+                    watch.reconcile_tabs(key, workers, home, now=t0 + 130.0)
+                    tab = (watch.read_layout(key, home).get("tabs") or {}).get(wkey) or {}
+                    self.assertTrue(tab, "the tab did not survive recovery")
+                    self.assertTrue(_pane_exists(pane))
+                finally:
+                    watch._active_window = original
+
+    # -- 6c ---------------------------------------------------------------
+    def test_worker_absent_from_a_nonempty_list_retires_after_the_ttl(self):
+        # A worker pruned (or stranded past the load window) while others are
+        # still listed must not become a permanent zombie tab starving MAX_TABS.
+        # It survives a grace (ATTENTION_TTL_S), then retires and frees its slot.
+        with Sandbox() as box:
+            box.export("HERMES_TMUX_LINGER_S", "1")
+            deleg_a, deleg_b = "deleg_zomb0001", "deleg_live0001"
+            box.add_delegation(deleg_a, [{"goal": "pruned work"}])
+            box.add_delegation(deleg_b, [{"goal": "still listed"}])
+            self._up(box)
+            layout = self._wait_tabs(box, 2)
+            ka = "%s#0" % deleg_a
+            pane_a = layout["tabs"][ka]["pane"]
+            key = box.key()
+            box.stop_coordinator()
+            with inproc(box, linger="1"):
+                from hermes_tmux import state, watch
+                from hermes_tmux.render import ATTENTION_TTL_S
+                home = Path(box.home)
+                workers = state.load_workers(home)
+                present = [w for w in workers if w.key != ka]
+                self.assertTrue(present, "the read must be non-empty for this case")
+                original = watch._active_window
+                watch._active_window = lambda session_id: ""
+                try:
+                    t0 = time.time()
+                    watch.reconcile_tabs(key, present, home, now=t0)
+                    tab = (watch.read_layout(key, home).get("tabs") or {}).get(ka) or {}
+                    self.assertTrue(tab, "a missing tab was retired immediately")
+                    self.assertIn("missing_since", tab)
+                    self.assertNotIn("settled", tab)
+
+                    watch.reconcile_tabs(key, present, home, now=t0 + ATTENTION_TTL_S - 1)
+                    self.assertIn(ka, watch.read_layout(key, home).get("tabs") or {},
+                                  "a missing tab retired before the TTL grace")
+
+                    # Past the grace it becomes settled, then retires after linger.
+                    watch.reconcile_tabs(key, present, home, now=t0 + ATTENTION_TTL_S + 1)
+                    watch.reconcile_tabs(key, present, home, now=t0 + ATTENTION_TTL_S + 10)
+                    lay = watch.read_layout(key, home)
+                    self.assertNotIn(ka, lay.get("tabs") or {},
+                                     "a zombie tab outlived the TTL grace (layout=%r)" % lay)
+                    self.assertFalse(_pane_exists(pane_a),
+                                     "the zombie tab's pane was not closed")
+                finally:
+                    watch._active_window = original
+
+    # -- 6d ---------------------------------------------------------------
+    def test_missing_worker_that_returns_within_the_ttl_keeps_its_tab(self):
+        with Sandbox() as box:
+            box.export("HERMES_TMUX_LINGER_S", "1")
+            deleg_a, deleg_b = "deleg_back0001", "deleg_live0002"
+            box.add_delegation(deleg_a, [{"goal": "briefly unlistable"}])
+            box.add_delegation(deleg_b, [{"goal": "still listed"}])
+            self._up(box)
+            layout = self._wait_tabs(box, 2)
+            ka = "%s#0" % deleg_a
+            pane_a = layout["tabs"][ka]["pane"]
+            key = box.key()
+            box.stop_coordinator()
+            with inproc(box, linger="1"):
+                from hermes_tmux import state, watch
+                home = Path(box.home)
+                workers = state.load_workers(home)
+                present = [w for w in workers if w.key != ka]
+                original = watch._active_window
+                watch._active_window = lambda session_id: ""
+                try:
+                    t0 = time.time()
+                    watch.reconcile_tabs(key, present, home, now=t0)
+                    watch.reconcile_tabs(key, present, home, now=t0 + 60.0)
+                    self.assertIn(ka, watch.read_layout(key, home).get("tabs") or {})
+                    # The worker is listable again: the tab stays, clocks clear.
+                    watch.reconcile_tabs(key, workers, home, now=t0 + 120.0)
+                    tab = (watch.read_layout(key, home).get("tabs") or {}).get(ka) or {}
+                    self.assertTrue(tab, "a returning worker lost its tab")
+                    self.assertTrue(_pane_exists(pane_a))
+                    self.assertNotIn("missing_since", tab,
+                                     "the missing clock was not cleared on recovery: %r" % tab)
+                    self.assertNotIn("settled", tab,
+                                     "a returning running tab was marked settled: %r" % tab)
+                finally:
+                    watch._active_window = original
+
     # -- 7 ----------------------------------------------------------------
     def test_failed_tab_survives_the_linger_until_it_is_seen(self):
         with Sandbox() as box:
