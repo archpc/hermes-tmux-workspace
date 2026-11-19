@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests / macos-15 / py${{ matrix.python }}
+    runs-on: macos-15
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: tmux
+        run: brew list tmux >/dev/null 2>&1 || brew install tmux
+      - name: unittest
+        env:
+          # Private socket dir so test tmux servers never touch a default
+          # socket. The tests already use private -L servers and per-sandbox
+          # HERMES_HOME; this keeps socket files off the shared /tmp root.
+          TMUX_TMPDIR: ${{ runner.temp }}/tmux-sockets
+        run: |
+          mkdir -p "$TMUX_TMPDIR"
+          # real_hermes_tabs skips itself: no Hermes runtime is installed on the
+          # runner, so _resolve_runtime() finds no launcher on PATH.
+          python -W default -m unittest discover -s tests -p 'test_*.py' -v
