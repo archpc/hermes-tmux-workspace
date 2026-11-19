@@ -45,7 +45,8 @@ CONFIG = "/dev/null"
 AGENTS = "agents"
 MAIL = "hx:mail"
 TESTBENCH = "hx:testbench"
-PERMANENT_TABS = (AGENTS, MAIL, TESTBENCH)
+COORD = "hx:coord"
+PERMANENT_TABS = (AGENTS, MAIL, TESTBENCH, COORD)
 BOOTSTRAP = "hx:bootstrap"
 
 

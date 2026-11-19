@@ -791,6 +791,8 @@ class IntegrationTest(unittest.TestCase):
                     from hermes_tmux import cli as _cli
                     static_tabs = [AGENTS, "hx:mail"] + (
                         ["hx:testbench"] if _cli.testbench_tab_enabled() else []
+                    ) + (
+                        ["hx:coord"] if _cli.coord_tab_enabled() else []
                     )
                     expected_owned = count + len(static_tabs)
                     self.assertEqual(len(box.own_windows()), expected_owned,

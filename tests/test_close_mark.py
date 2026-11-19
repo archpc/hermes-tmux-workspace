@@ -197,8 +197,20 @@ class CloseMarkTest(unittest.TestCase):
             try:
                 self.assertTrue(wait_for(
                     lambda: T._format(box.name, "#{session_attached}") == "1", timeout=10))
-                # 1. a click on the tab's name selects it
+                # 1. a click on the tab's name selects it. Pin the current window to
+                # the reader (the current-window status format is wider than the normal
+                # one) and wait for the status line to STOP changing: the overview glyph
+                # and worker state glyphs settle asynchronously, and a drifting glyph
+                # shifts every tab column, racing the hand-reconstructed status line.
+                _tmux("select-window", "-t", box.pane_id)
                 text = _status_text(box)
+                _stable_deadline = time.time() + 15
+                while time.time() < _stable_deadline:
+                    time.sleep(0.4)
+                    _again = _status_text(box)
+                    if _again == text:
+                        break
+                    text = _again
                 self.assertNotIn(closemark.MARK, text, "a tab not in view shows a mark: %r" % text)
                 client.click(text.index("click me"))
                 self.assertTrue(wait_for(

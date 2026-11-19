@@ -1118,6 +1118,25 @@ def run_watch(home: Optional[Path] = None, key: Optional[str] = None) -> int:
                 )
                 if restored_tb:
                     layout.setdefault("aux", {})["testbench"] = restored_tb
+            from . import cli as cli_mod_coord
+            coord_wid = ((layout.get("aux") or {}).get("coord")) or ""
+            if mail_sid and cli_mod_coord.coord_tab_enabled() and (
+                not coord_wid
+                or not tmuxio.window_exists(coord_wid)
+                or not any(p["ours"] for p in tmuxio.list_panes(coord_wid))
+            ):
+                live_srv = tmuxio.server_pid()
+                if owner_pid and live_srv != owner_pid:
+                    return 0
+                if not tmuxio.session_alive(mail_sid):
+                    return 0
+                restored_coord, _ = cli_mod_coord.ensure_aux_window(
+                    key, mail_sid, "coord", focus=False,
+                    after_window=tb_wid or mail_wid or layout.get("workers_window"), home=home,
+                    owner_pid=owner_pid,
+                )
+                if restored_coord:
+                    layout.setdefault("aux", {})["coord"] = restored_coord
             render_and_publish(key, home, session_label, preloaded=(workers, note, layout))
             window_id = layout.get("workers_window")
             # Decorating is a write to someone else's window if that id names a
