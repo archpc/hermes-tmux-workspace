@@ -46,6 +46,13 @@ needs_tmux = true
 description = "Real offline Hermes CLI through Ctrl-b Shift-C: distinct sessions, independent /exit, user-owned windows"
 
 [[suite]]
+name = "mutmut-display-gate"
+adapter = "mutmut"
+profile = "mutation"
+timeout_s = 1800.0
+description = "mutmut over render/labels/transcript/gate/env vs the hermetic fast layer (disposable staged copy, Seatbelt)"
+
+[[suite]]
 name = "full-tmux-regression"
 adapter = "python_unittest"
 profile = "regression"
