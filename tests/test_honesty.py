@@ -1,9 +1,41 @@
-"""Unit tests for the honesty rules the display depends on.
+"""The claims the display makes, and the ones it refuses to make.
 
-Each test here pins a claim the pane makes (or refuses to make): the error mark
-belongs to the *latest* call, `stall` follows the last recorded activity rather
-than the start time, a reader failure is not rendered as "no delegations", and a
-negated verdict is not a PASS.
+Each class pins one honesty rule. They are not styling tests: every assertion
+is about whether the pane states something the recorded evidence supports.
+
+* **Silence is not failure, and it is not completion.** A running worker with a
+  recent event stays RUNNING; the same worker quiet past ``STALL_AFTER_S``
+  (600 s) is labelled with how long it has been quiet — a display-only label,
+  never a verdict. A timestamp in the future (a transcript time joined to a
+  manifest date across midnight) is clamped, not treated as hours stale.
+* **An error mark belongs to the latest call.** ``error_pending`` is cleared by
+  a new tool call or a successful result, so a worker that recovered stops
+  claiming a failure it no longer has; the earlier call is still named.
+* **A reader failure is not an empty workspace.** An exception while reading
+  Hermes state renders as a failure line plus an explicit "not an empty
+  workspace"; only a genuinely empty read says "No delegations yet."
+* **A verdict is only what the reviewer said.** ``_verdict_of`` prefers an
+  explicit label, takes the last such label, honours negation and typographic
+  apostrophes, ignores enumerations ("PASS or FAIL"), and returns None rather
+  than guessing. Recording PASS for a review that said FAIL is the failure mode
+  that matters.
+* **Watcher identity is the lock, not the command line.** A pid is only the
+  coordinator if it holds the session's lock; a forged argv is not enough.
+* **A review needs the work it judges.** ``review run`` refuses a missing
+  worker or a transcript not on disk, and records nothing; a manual record does
+  not attribute itself to a reviewer model that never ran.
+* **``tests --run`` runs the suite it advertises**, in the pane it names. A
+  missing receipt directory is swallowed by ``suite_run.main()``, whose receipt
+  write is best-effort: a ``FileNotFoundError`` there is re-raised only when the
+  receipt's parent still exists, so the runner's own exit status is returned
+  unchanged rather than replaced by a fabricated success. The test pins 127
+  because the runner was invoked with an empty TestBench binary.
+
+Runtime notes: no tmux server, but two tests spawn real child processes (to be
+seen by ``ps``/``lsof``) and one calls ``cli.cmd_review`` with a stub args
+object. Those children sleep for 30 s and are killed in ``finally``. The ``ps``
+skip on argv order guards nothing for key ``abc``: no ``watch.lock`` exists, so
+the lock gate answers False before any ``ps`` comparison.
 """
 
 from __future__ import annotations
@@ -57,9 +89,23 @@ def _detail(text, needle="audit"):
 
 
 class StallRuleTest(unittest.TestCase):
+    """Stall is derived from the latest activity, never from the start time.
+
+    ``now`` is a class constant so every case is deterministic. Glyphs are the
+    unicode pair (``●`` run, ``◐`` stall) — the assertions use the character,
+    not the word alone, because a row can carry the word and the wrong glyph.
+    """
+
     now = datetime(2026, 11, 12, 12, 0, 0)
 
     def test_recent_activity_keeps_a_long_run_running(self):
+        """Eight hours elapsed, one minute quiet: still RUNNING.
+
+        This is the case where using ``started`` instead of ``last_event``
+        would mislabel a healthy long run as stalled. The absence of the
+        silence wording is asserted too, so "RUNNING" cannot be satisfied by a
+        row that also claims no output.
+        """
         w = _Worker(started="2026-11-12 08:00:00",
                     last_event="2026-11-12 11:59:00", state="running")
         text = render.render([w], now=self.now, width=120)
@@ -70,6 +116,13 @@ class StallRuleTest(unittest.TestCase):
         self.assertIn("RUNNING", text)
 
     def test_silence_past_the_threshold_is_stall(self):
+        """One hour quiet is stall; the row says how long, not "failed".
+
+        The wording distinction is the test: "no output for 1h00m" describes
+        silence, "run ended" would claim the process stopped. Both the stall
+        glyph and the absence of the terminal phrase are asserted, so the test
+        fails if the label drifts toward a verdict.
+        """
         w = _Worker(started="2026-11-12 08:00:00",
                     last_event="2026-11-12 11:00:00", state="running")
         text = render.render([w], now=self.now, width=120)
@@ -80,7 +133,12 @@ class StallRuleTest(unittest.TestCase):
         self.assertNotIn("run ended", text)
 
     def test_future_timestamp_does_not_stall(self):
-        """A midnight-crossing transcript date must not look hours stale."""
+        """A midnight-crossing transcript date must not look hours stale.
+
+        The event (00:05) is dated after ``now`` (12:00 on the 12th) because the
+        log only carries a time of day; the renderer clamps the activity to
+        ``now`` instead of computing a negative quiet period or ~24 h of silence.
+        """
         w = _Worker(started="2026-11-12 23:50:00",
                     last_event="2026-11-13 00:05:00", state="running")
         text = render.render([w], now=self.now, width=120)
@@ -90,7 +148,21 @@ class StallRuleTest(unittest.TestCase):
 
 
 class ErrorMarkTest(unittest.TestCase):
+    """The failure marker describes the worker *now*, not its worst moment.
+
+    ``_Worker`` defaults ``error_pending=False`` and the two cases differ only
+    in that flag while both carry ``last_error``. That is the discrimination:
+    the presence of an error string alone must not produce "last call failed".
+    """
+
     def test_only_the_latest_call_can_mark_an_error(self):
+        """A recovering worker keeps its last call named, drops the failure claim.
+
+        First half: pending error + error text renders the wording. Second half:
+        same error text, flag cleared — the call is still named (the transcript
+        is not hidden) but "last call failed" must not appear. Without the
+        second half a renderer that always prints the marker would pass.
+        """
         pending = _Worker(error_pending=True, last_error="terminal ERROR exit 1")
         text = render.render([pending], width=120)
         # v3 states the failure in words on the row's detail line.
@@ -104,13 +176,22 @@ class ErrorMarkTest(unittest.TestCase):
 
 
 class ReaderFailureTest(unittest.TestCase):
+    """Two different empty-looking pages, and the difference is the claim.
+
+    `render.render_empty` takes ``note`` as an explicit failure channel. These
+    tests call it directly rather than provoking a real exception, because the
+    contract under test is the wording split, not the exception plumbing.
+    """
+
     def test_reader_failure_is_not_rendered_as_empty(self):
+        """A failure note is repeated verbatim and never softened to "empty"."""
         text = render.render_empty(width=100, note="state reader failed: boom")
         self.assertIn("state reader failed: boom", text)
         self.assertNotIn("no delegations found", text)
         self.assertIn("reader failure", text)
 
     def test_empty_workspace_still_says_empty(self):
+        """No note means genuinely empty — and must not invent a failure word."""
         text = render.render_empty(width=100)
         # v3 headline for a genuinely empty workspace.
         self.assertIn("No delegations yet.", text)
@@ -119,21 +200,44 @@ class ReaderFailureTest(unittest.TestCase):
 
 
 class VerdictTest(unittest.TestCase):
+    """``cli._verdict_of``: label class first, then last label, then prose.
+
+    The order of the rule loop is what makes "result: tests pass … Verdict:
+    FAIL" a FAIL: label *class* priority (VERDICT > CONCLUSION > RESULT >
+    OVERALL) is checked before position, so an explicit verdict anywhere beats
+    a generic label earlier in the document. Within a class, the last label that
+    yields a decision wins, because reviews conclude at the end. Only when no
+    label class decides does unlabelled prose get a say.
+
+    A label followed solely by an enumeration ("PASS or FAIL") is not a
+    decision, and no verdict at all returns None — never a guess.
+    """
+
     def test_explicit_verdict_label_wins(self):
+        """A labelled token is taken from the label, not the first token in text."""
         self.assertEqual(cli._verdict_of("... VERDICT: PASS ... FAIL elsewhere"), "PASS")
         self.assertEqual(cli._verdict_of("verdict=fail"), "FAIL")
 
     def test_negated_pass_is_not_a_pass(self):
+        """Negation inverts the token; "not a pass" is a FAIL, not an absence."""
         self.assertEqual(cli._verdict_of("The work does not pass review."), "FAIL")
         self.assertEqual(cli._verdict_of("no pass possible here"), "FAIL")
 
     def test_markdown_emphasis_does_not_hide_the_label(self):
+        """``*``/``_``/``#``/backtick and curly quotes are stripped before matching."""
         self.assertEqual(cli._verdict_of("**Verdict: FAIL** although pass rates rose"),
                          "FAIL")
         self.assertEqual(cli._verdict_of("## Verdict: **PASS**"), "PASS")
 
     def test_reviewer_prose_shapes_seen_in_practice(self):
-        """These are the exact strings an earlier parser got wrong."""
+        """The exact strings an earlier parser got wrong, as a table.
+
+        Reading the table as a spec: ``Verdict (PASS or FAIL): FAIL`` must skip
+        the enumeration and take the third token; ``Verdict: PASS or FAIL``
+        states nothing; a generic "result: … pass" must lose to a later
+        ``Verdict: FAIL``; ``pass or fail? pass.`` must take the trailing answer;
+        and the three apostrophe forms (ASCII and U+2019) must all negate.
+        """
         cases = {
             "Verdict (PASS or FAIL): FAIL. The goal was not met.": "FAIL",
             "On the second pass through the transcript I found fabricated "
@@ -157,13 +261,33 @@ class VerdictTest(unittest.TestCase):
             self.assertEqual(cli._verdict_of(text), want, repr(text))
 
     def test_absent_verdict_stays_none(self):
+        """No token and empty text both return None: silence is not a PASS."""
         self.assertIsNone(cli._verdict_of("some prose with no verdict"))
         self.assertIsNone(cli._verdict_of(""))
 
 
 class WatcherIdentityTest(unittest.TestCase):
+    """A pid file is a hint; the coordinator is whoever holds ``watch.lock``.
+
+    Read the fixtures carefully, because the mechanism is narrower than the test
+    names suggest: ``_pid_is_watcher`` asks `_lock_holder` (an ``lsof -t`` on the
+    lock path) *before* it looks at the command line, and returns False when no
+    process holds the lock. Neither fixture ever holds the lock, so both
+    assertions are decided at that gate. They pin "no lock ⇒ not the
+    coordinator" — the property ``down`` and ``follow`` rely on — not the argv
+    comparison that runs when a holder exists.
+    """
+
     def test_a_process_mentioning_the_words_is_not_the_watcher(self):
-        """A spoofed command line is not enough: the watcher must hold the lock."""
+        """A forged command line with the right words is still not the watcher.
+
+        The child is a real Python sleeping 30 s whose *extra* argv spells
+        ``-m hermes_tmux watch --key guardkey``; Python ignores everything after
+        ``-c``, so ``ps`` shows the words while nothing has opened the lock.
+        The lock file is created but left unheld, so ``lsof`` names no pid and
+        the check fails — which is exactly the case a recycled pid would
+        present.
+        """
         tmp = tempfile.TemporaryDirectory()
         try:
             os.environ["HERMES_HOME"] = tmp.name
@@ -185,6 +309,16 @@ class WatcherIdentityTest(unittest.TestCase):
             tmp.cleanup()
 
     def test_key_must_match_exactly(self):
+        """A process under a different key is not this key's watcher.
+
+        The child is a forged ``python -c "import time; time.sleep(30)"`` whose
+        *extra* argv spells ``-m hermes_tmux watch --key other``; Python ignores
+        everything after ``-c``. The assertion asks about key ``abc``, for which
+        no ``watch.lock`` exists, so ``cli._pid_is_watcher`` returns False at the
+        lock gate before it ever runs ``ps``: neither the key match nor the
+        command-line comparison is exercised. The argv-order skip guards nothing
+        in this case.
+        """
         proc = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(30)",
              "-m", "hermes_tmux", "watch", "--key", "other"])

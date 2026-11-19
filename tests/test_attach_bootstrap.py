@@ -19,6 +19,46 @@ Isolation rules, so this file can never reach the user's server or state:
 Every assertion reads what tmux actually holds (window names, the windows' own
 ``@hx``/``@hx_key`` options, ``watch.pid``, process liveness), never a log line
 the script wrote about itself.
+
+Why a pty and a shim, not a plain subprocess: the hook's first guards are
+``[[ -t 0 && -t 1 ]]`` and ``[[ ${TERM:-dumb} == dumb ]]``. A pipe would make
+every run exit at the guard and the tests would pass by never running anything.
+So ``run_hook`` allocates a pty pair, runs ``/bin/zsh <script>`` with the slave
+on all three fds in its own session, and drains the master while the child runs.
+``--dry-run`` and the opt-out tests are the only cases where no tmux work is
+expected, and they still go through the same pty path.
+
+The shim on PATH (``self.bin/tmux``) forwards every argument to the real tmux
+and answers only ``attach-session`` itself, printing ``attach intercepted``.
+That is the one step a test cannot let happen: a real attach needs a client and
+would block until it is killed. Because the shim forwards everything else, the
+hook still drives a genuinely fresh server, and ``attach intercepted`` in the
+output is the proof that execution reached the end of the decision, not that it
+stopped early.
+``hermes-tmux`` and ``python3`` are symlinked into the same directory so the
+hook's ``$commands[hermes-tmux]`` lookup finds this checkout and this
+interpreter, not whatever is installed for the user.
+
+Readiness, and the timing that follows from it: the hook returns as soon as it
+has started ``up`` in a detached ``hx:bootstrap`` pane, so nothing is
+synchronous. ``build_ready`` polls for the full set of stamped windows *plus* a
+live coordinator pid; ``assert_no_bootstrap_window`` waits for the bootstrap
+window to disappear, because the pane closes a moment after ``up`` exits and the
+window outliving that is the leak. The 1.0 s sleeps in the no-op tests are slack
+for "a bootstrap, if wrongly started, would have run by now"; the real
+assertions are equalities on window lists, pids, and log mtimes, so a slow
+machine costs time rather than correctness.
+
+Known timing sensitivity (two tests, stated rather than papered over):
+``test_16`` and ``test_17`` assert on the state of an existing ``hx:bootstrap``
+pane as the hook finds it. A dead pane must be removed and repaired; a live one
+must mean "one bootstrap in flight" and nothing else may be started. Both depend
+on the pane still having the state the fixture created when the hook lists it —
+a ``remain-on-exit off`` server or an unusually slow start can turn the live
+pane dead mid-run, and then the hook legitimately starts a second one and the
+equality fails on timing, not on the guard. The fixture asserts its own
+precondition (``test_16``'s "fixture: no dead bootstrap pane") so that case
+fails where it is introduced rather than three assertions later.
 """
 
 from __future__ import annotations
@@ -57,6 +97,10 @@ _SOCKET_DIR = {"dir": None}
 
 
 def _tmux(*args: str, timeout: float = 20.0):
+    # Every call carries the private socket and the empty config; TMUX_TMPDIR is
+    # added only once a test has set _SOCKET_DIR, so the helper and the hook
+    # resolve `-L <name>` to the same directory. `-f /dev/null` keeps the user's
+    # tmux.conf (options, hooks, base-index) out of the result entirely.
     env = dict(os.environ)
     if _SOCKET_DIR["dir"]:
         env["TMUX_TMPDIR"] = _SOCKET_DIR["dir"]
@@ -66,6 +110,10 @@ def _tmux(*args: str, timeout: float = 20.0):
 
 
 def _wait_for(predicate, timeout: float = 60.0, interval: float = 0.2):
+    # A poll, not a sleep: the workspace is built by a detached pane, so the
+    # observable states (a window appearing, a pid file, a window closing) are
+    # unordered in time. The trailing call re-evaluates once after the deadline
+    # so the caller's return value is the final state, not the last poll's.
     deadline = time.time() + timeout
     while time.time() < deadline:
         value = predicate()
@@ -77,6 +125,10 @@ def _wait_for(predicate, timeout: float = 60.0, interval: float = 0.2):
 
 def _windows(session: str):
     """[(window_id, name, @hx, @hx_key)] for one exact session."""
+    # "=session" is an exact target; a bare name is a prefix match, so "main"
+    # would also match "main-2" and the test_07 assertions would read the wrong
+    # session's windows. A non-zero rc or empty output is [] — for a session
+    # that does not exist yet that is the honest answer, not an error.
     rc, out = _tmux("list-windows", "-t", "=%s" % session,
                     "-F", "#{window_id}|#{window_name}|#{@hx}|#{@hx_key}")
     if rc != 0 or not out.strip():
@@ -89,10 +141,16 @@ def _window_ids(session: str):
 
 
 def _named(session: str, name: str):
+    # Exact name match. Callers that must tolerate the `#N` suffix a foreign
+    # window forces (test_14) assert on the specific suffixed name instead, so
+    # this helper stays unambiguous.
     return [w for w in _windows(session) if w[1] == name]
 
 
 def _current_window(session: str) -> str:
+    # The active window of the session's current client. test_10 compares this
+    # before and after the hook: `new-window -d` must not change it, and an
+    # attach that re-selected a window would.
     rc, out = _tmux("display-message", "-p", "-t", "=%s:" % session, "#{window_id}")
     return out.strip() if rc == 0 else ""
 
@@ -103,6 +161,9 @@ def _sessions():
 
 
 def _coordinator_pid(key: str, home: Path):
+    # Read the pid file of *this* key under *this* home. 0 and unparsable both
+    # become None: `kill(0, 0)` would probe this process group, so the sentinel
+    # must never be a real-looking pid.
     pidfile = home / "cache" / "hermes-tmux" / "sessions" / key / "watch.pid"
     if not pidfile.is_file():
         return None
@@ -114,6 +175,9 @@ def _coordinator_pid(key: str, home: Path):
 
 
 def _alive(pid) -> bool:
+    # `kill(pid, 0)` only: enough to see the process, and deliberately not a
+    # stronger identity check. The hook's own guard does the identity check, and
+    # a pid recycled inside a test window is not a case these tests create.
     if not pid:
         return False
     try:
@@ -129,6 +193,10 @@ def _processes_for(key: str):
     The `sh -c` wrapper tmux uses for `run-shell -b` carries the same words on
     its command line, so matching is on the exact trailing command instead.
     """
+    # Matching the *tail* (`endswith`) is what excludes the wrapper: its command
+    # line continues past the coordinator invocation with `; true` and the log
+    # redirect, so an endswith test cannot match it. test_06 counts these to
+    # prove repeated attaches leave exactly one watch and one follow.
     proc = subprocess.run(["ps", "-Ao", "pid=,command="], capture_output=True, text=True)
     tails = ("hermes_tmux watch --key %s" % key, "hermes_tmux follow --key %s" % key)
     pids = []
@@ -144,15 +212,25 @@ class AttachBootstrap(unittest.TestCase):
     # ---------------- sandbox ----------------
 
     def setUp(self):
+        # One temporary root per test holds everything the run may touch: HOME
+        # (so the hook's `hx_home` default lands here), HERMES_HOME, the tmux
+        # socket directory, and the shim PATH. Nothing outside this tree can be
+        # read or written by the hook.
         self.tmp = Path(tempfile.mkdtemp(prefix="hx_attach_"))
         self.home = self.tmp / "home"
         self.home.mkdir()
         self.tmux_tmpdir = self.tmp / "tmux"
         self.tmux_tmpdir.mkdir()
+        # Module-level because `_tmux` is module-level and the directory is
+        # per-test; the hook gets the same value through its environment, which
+        # is what makes `-L <name>` resolve identically on both sides.
         _SOCKET_DIR["dir"] = str(self.tmux_tmpdir)
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
         shim = self.bin / "tmux"
+        # Forward everything except `attach-session`, which answers and exits 0.
+        # `exec` at the end matters: without it the shim would keep a shell alive
+        # and the hook's exit status would be the shell's, not tmux's.
         shim.write_text(
             "#!/bin/sh\n"
             "for a in \"$@\"; do\n"
@@ -160,6 +238,10 @@ class AttachBootstrap(unittest.TestCase):
             "done\n"
             "exec %s \"$@\"\n" % _TMUX)
         shim.chmod(0o755)
+        # The launcher and this interpreter are addressed by absolute path in
+        # the shim's directory: the hook resolves `hermes-tmux`/`python3` from
+        # PATH, and a bootstrap window would otherwise run an installed copy —
+        # or none at all.
         for name, target in (("hermes-tmux", LAUNCHER), ("python3", sys.executable)):
             link = self.bin / name
             if not link.exists():
@@ -167,6 +249,10 @@ class AttachBootstrap(unittest.TestCase):
         self._killed = False
 
     def tearDown(self):
+        # kill-server first, then wait for the session list to empty: the server
+        # answers `list-sessions` for a moment after being told to stop, and
+        # removing the temp tree under a live server leaves processes pointing at
+        # deleted paths.
         _tmux("kill-server")
         _wait_for(lambda: not _sessions(), 10)
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -175,6 +261,12 @@ class AttachBootstrap(unittest.TestCase):
     # ---------------- running the hook ----------------
 
     def env(self, **extra):
+        # A complete, minimal environment rather than a copy of this process's:
+        # HOME, PATH, LANG, TERM, HERMES_HOME and three isolation variables
+        # (TMUX_TMPDIR, TMUX_ATTACH_SOCKET, TMUX_ATTACH_CONFIG) are the whole
+        # contract. `extra` overrides by name, and a None value *removes* the
+        # variable — that is how "a terminal with no HERMES_HOME at all"
+        # (test_13) and "no HERMES_TMUX" are expressed.
         env = {
             "HOME": str(self.tmp),
             "PATH": "%s:/usr/bin:/bin:/usr/sbin:/sbin" % self.bin,
@@ -194,22 +286,36 @@ class AttachBootstrap(unittest.TestCase):
 
     def run_hook(self, args=(), reply="", timeout=90.0, **extra):
         """Run the hook on a pty; return (rc, output)."""
+        # Both ends of the pty are needed: the hook reads the *guard* from its
+        # fds (a pipe fails `[[ -t 0 ]]`) and, in the picker path, reads a reply
+        # from the same fd. `start_new_session=True` gives the child its own
+        # process group so a wedged run can be killed with one SIGKILL to the
+        # group instead of orphaning tmux children.
         master, slave = pty.openpty()
         try:
             proc = subprocess.Popen(["/bin/zsh", str(SCRIPT), *args],
                                     stdin=slave, stdout=slave, stderr=slave,
                                     env=self.env(**extra), close_fds=True,
                                     start_new_session=True)
+            # The child holds the slave now; this process must drop it or the
+            # master never reports EOF.
             os.close(slave)
             slave = -1
+            # A reply is written before draining: the picker prompt is printed
+            # before it reads, so there is no deadlock, and a pty buffers it.
             if reply:
                 os.write(master, reply.encode())
+            # Drain while the child runs. Reading to EOF is what lets the child
+            # exit: a pty's buffer is small, and a child blocked writing to a
+            # full pty never reaches `exec attach-session`.
             chunks = []
             deadline = time.time() + timeout
             while time.time() < deadline:
                 try:
                     data = os.read(master, 65536)
                 except OSError:
+                    # EIO on the master is the normal "child side closed" signal
+                    # on macOS, not an error worth failing on.
                     break
                 if not data:
                     break
@@ -228,6 +334,9 @@ class AttachBootstrap(unittest.TestCase):
             try:
                 rc = proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
+                # The hook runs `exec tmux attach-session`; the shim answers at
+                # once, so reaching this branch means a guard or tmux call wedged.
+                # Kill the whole group, then collect the status.
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 rc = proc.wait(timeout=10)
             return rc, b"".join(chunks).decode("utf-8", "replace")
@@ -240,6 +349,11 @@ class AttachBootstrap(unittest.TestCase):
 
     def build_ready(self, session="main", home=None):
         """Wait until the bootstrap produced the whole workspace."""
+        # "Ready" is four facts read from tmux and the filesystem: `agents`
+        # carries @hx=1 and a non-empty @hx_key; every permanent tab exists and
+        # is marked; and the coordinator named by that key is alive. Requiring
+        # all of them is what makes `assert_clean_workspace` afterwards meaningful
+        # — otherwise a duplicate check could run against a half-built layout.
         def ready():
             agents = _named(session, AGENTS)
             if not agents or agents[0][2] != "1" or not agents[0][3]:
@@ -248,6 +362,8 @@ class AttachBootstrap(unittest.TestCase):
                 found = _named(session, tab)
                 if not found or found[0][2] != "1":
                     return False
+            # The pid is read from the home the *window* was built under, not
+            # from this test's env: that is the rule the hook itself follows.
             return _alive(_coordinator_pid(agents[0][3], home or self.home))
         return _wait_for(ready)
 
@@ -259,9 +375,18 @@ class AttachBootstrap(unittest.TestCase):
                         "temporary bootstrap window left behind: %r" % _named(session, BOOTSTRAP))
 
     def bootstrap_logs(self, session):
+        # The hook writes `<HERMES_HOME>/cache/hermes-tmux/bootstrap-<session>.log`
+        # only when it actually builds. Its mtime is therefore the observable for
+        # "a bootstrap ran", used where the window would already be gone.
         return list((self.home / "cache" / "hermes-tmux").glob("bootstrap-*.log"))
 
     def assert_clean_workspace(self, session, expect_shell=True):
+        # Exactly one of each permanent tab (a duplicate is what a rebuild that
+        # does not recognise existing windows produces), no bootstrap window, and
+        # — with expect_shell — at least one window whose *name* is not in
+        # PERMANENT_TABS, i.e. the shell the session was created with. The test is
+        # on the name, not on an @hx ownership mark; this is the clause that
+        # catches a bootstrap that "cleaned up" the reader's window.
         names = [w[1] for w in _windows(session)]
         for tab in PERMANENT_TABS:
             self.assertEqual(1, names.count(tab), "duplicate or missing %s window: %r" % (tab, names))

@@ -1,5 +1,43 @@
-"""Regression tests for WatchSet inode replacement, ordered FD priority,
-active-only log watching, and run_watch throttle enforcement.
+"""WatchSet identity/caps, path selection, and the coordinator's throttle (HX-1/4).
+
+What is under test, and why each one costs descriptors or CPU when wrong:
+
+* **Inode identity.** A watched file replaced atomically (``os.replace``) keeps
+  the old FD on an unlinked inode, which never fires again. ``WatchSet.sync``
+  compares ``(st_dev, st_ino)`` and reopens, so later in-place appends still
+  wake the loop. A path-only check passes the first assertion and fails the
+  event one.
+* **Cap by caller priority.** ``_MAX_WATCH_FILES`` (256) is a ceiling under
+  ``RLIMIT_NOFILE``, not a promise: macOS often gives a login shell 256 soft
+  descriptors, which the kqueue FD and stdio eat into. ``sync`` must keep the
+  caller's prefix (``state.db``, ``state.db-wal``, ``reviews.json``) and drop
+  the tail — never an arbitrary subset.
+* **Path selection.** Completed delegations are immutable, so watching all of
+  them was pure descriptor cost. ``collect_paths`` keeps the logs of live
+  delegations plus a bounded settled sample (8) and drops the rest; the test
+  asserts on a log outside that sample. The DB files are first because a WAL
+  write to any table is the most common wake.
+* **Throttle.** ``state.db-wal`` is written on every Hermes event, so an
+  unthrottled vnode loop re-reads transcripts many times a second.
+  ``_MIN_RENDER_INTERVAL_S`` (1 s) is a floor enforced by sleeping, not by
+  trusting ``wait`` to wait. Separately, a WAL commit that does not change
+  ``async_delegations`` must not trigger a reconcile pass at all.
+
+Platform and isolation. ``WatchSet`` is kqueue-only, so these tests require a
+BSD/macOS Python; there is no skip for a platform without ``select.kqueue``.
+The coordinator tests deliberately keep the *real* ``reconcile_tabs`` and fence
+it off with `no_live_tmux`: ``tmuxio`` shells out to bare ``tmux``, whose target
+is ``$TMUX`` or ``$TMUX_TMPDIR/tmux-<uid>/default``. Both are severed, so a
+fixture can never touch the developer's server. The coordinator's tmux calls then
+land on an empty socket directory: reads fail there, while some commands
+(``new-session``) start a fresh, empty server on that socket rather than
+failing — either way the developer's server is untouched, which is the point.
+
+Timing. The throttle test measures wall-clock gaps, so it asserts bounds (at
+most 3 passes in 1.6 s, at least 0.85 s between the first two) rather than an
+exact count; a loaded machine can only make it slower, which the upper bound
+already allows for. The WAL test needs the first pass to have happened before
+the unrelated commits start, hence the 0.15 s lead-in.
 """
 
 from __future__ import annotations
@@ -17,7 +55,13 @@ from hermes_tmux import cli, state, watch
 
 
 def _watch_fd_capacity() -> int:
-    """Descriptors this process can still open, used to size the watch cap."""
+    """Descriptors this process can still open, used to size the watch cap.
+
+    Soft ``RLIMIT_NOFILE`` unless it is unlimited, in which case the cap itself
+    is the bound. The ``/dev/fd`` listing holds one descriptor while it runs, so
+    one is subtracted back out; a failure to list yields 0 used, which is the
+    permissive direction (the caller re-checks the result against a floor).
+    """
     import resource
     soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
     if soft in (resource.RLIM_INFINITY, -1):
@@ -69,6 +113,18 @@ def run_mocked_coordinator(
     ``reconcile_tabs`` keeps its real implementation: the tests measure how
     often it runs. That means the only thing standing between the test and the
     developer's tmux server is ``no_live_tmux`` and the two patches below.
+
+    Each patch removes one way the loop could reach a real server or block:
+    ``server_pid`` is pinned to a constant so the owner-identity check is
+    stable (the same value is returned on every later call); ``session_alive``
+    is the test's clock, so the loop exits when the test says so rather than
+    after a timeout; ``ensure_aux_window`` returns "nothing" so permanent
+    ``hx:mail``/``hx:testbench`` recovery does not create windows; and TestBench
+    auto-creation is disabled because no ``hx:testbench`` is wanted here.
+
+    ``HERMES_TMUX=1`` is forced inside the fixture because TestBench's own
+    isolation exports ``HERMES_TMUX=0``; without it ``run_watch`` would return
+    before its first pass and every measurement would be vacuous.
     """
     with mock.patch.dict(os.environ, {"HERMES_TMUX": "1"}), \
          no_live_tmux(tmux_tmpdir), \
@@ -81,6 +137,13 @@ def run_mocked_coordinator(
 
 
 class WatchSetAndPerfRegressions(unittest.TestCase):
+    """One temporary root per test; tmux (where implicated) is fenced off.
+
+    ``tmux_tmp`` is deliberately outside the developer's ``TMUX_TMPDIR`` and
+    created only by `no_live_tmux`, so an accidental real tmux call finds an
+    empty socket directory rather than a live server.
+    """
+
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="hx_c2c3_")
         self.base = Path(self._tmp.name)
@@ -105,6 +168,9 @@ class WatchSetAndPerfRegressions(unittest.TestCase):
             os.replace(tmp, p)
             new_ino = p.stat().st_ino
             self.assertNotEqual(old_ino, new_ino)
+            # Consume the rename event first: otherwise the later `wait` could
+            # return >0 from the replace itself and the test would pass without
+            # the new inode ever being watched.
             ws.drain(quiet_for=0.03)
 
             ws.sync([], [p])
@@ -137,6 +203,8 @@ class WatchSetAndPerfRegressions(unittest.TestCase):
         ws = watch.WatchSet()
         try:
             # Measured after WatchSet() so the kqueue descriptor is counted.
+            # Below 32 there is not enough room to show that the cap keeps a
+            # prefix at all: any implementation would fit the whole list.
             expected = min(watch._MAX_WATCH_FILES, _watch_fd_capacity())
             if expected < 32:
                 self.skipTest("only %d descriptors available; cap cannot be exercised" % expected)
@@ -154,8 +222,15 @@ class WatchSetAndPerfRegressions(unittest.TestCase):
             ws.close()
 
     def test_collect_paths_skips_completed_delegation_logs_and_prioritizes_db(self) -> None:
-        """Completed delegations never append to task-*.log again; opening kqueue
-        FDs on 150+ historical logs wastes descriptors in both watch and follow.
+        """Completed delegations must not hold FDs on every historical log.
+
+        Ten settled delegations (30 logs) and one running one (2 logs). The
+        assertion is that the DB pair heads the list, both running logs are
+        watched, and ``deleg_done0000``'s log is not — that name is last in
+        reverse-name order, hence outside the eight settled logs `collect_paths`
+        keeps. Watching *some* settled logs is intentional (a late flush after
+        the manifest flips must still wake a pass), so the test asserts on the
+        tail of the sample rather than on "no completed log".
         """
         home = self.base / "home"
         live = home / "cache" / "delegation" / "live"
@@ -199,12 +274,24 @@ class WatchSetAndPerfRegressions(unittest.TestCase):
         # Running logs ARE watched
         self.assertIn(str(rd / "task-0.log"), file_strs)
         self.assertIn(str(rd / "task-1.log"), file_strs)
-        # Completed logs are NOT watched
+        # Older completed logs are NOT watched (outside the 8-strong sample)
         self.assertNotIn(str(live / "deleg_done0000" / "task-0.log"), file_strs)
 
     def test_run_watch_enforces_min_render_interval_under_continuous_live_writes(self) -> None:
-        """Rapid live transcript/manifest writes (every 40ms) must not defeat
-        _MIN_RENDER_INTERVAL_S by waking watcher.wait(remaining) early.
+        """Rapid writes must not defeat the throttle by waking the wait early.
+
+        A writer appends every 40 ms while the coordinator runs for 1.6 s. If
+        the loop re-entered on the bare vnode event, passes would be ~40 ms
+        apart; the bounds are at most 3 passes total and at least 0.85 s between
+        the first two (the slight slack under 1.0 s absorbs measurement of the
+        pass itself). ``passes`` is appended by a wrapper around the *real*
+        ``reconcile_tabs``, so a pass means reconciliation ran, not that a timer
+        fired.
+
+        ``session_alive`` is the stop signal: it returns True only before
+        ``stop_at``, so the loop's own liveness check ends it and the test does
+        not depend on SIGTERM. The writer thread is joined with a timeout so a
+        failure cannot hang the suite.
         """
         home = self.base / "whome"
         dd = home / "cache" / "delegation" / "live" / "deleg_spam0001"
@@ -253,9 +340,20 @@ class WatchSetAndPerfRegressions(unittest.TestCase):
             self.assertGreaterEqual(passes[1] - passes[0], 0.85)
 
     def test_unrelated_wal_writes_skip_reconcile_until_delegations_change(self) -> None:
-        """Writes to unrelated tables in state.db-wal must not trigger full
-        reconcile_tabs passes when async_delegations is unchanged, but an actual
-        async_delegations update must still reconcile promptly.
+        """Unrelated WAL churn must not reconcile; a delegation change must.
+
+        Two phases against one WAL database: 15 commits to ``messages`` (~40 ms
+        apart), then one insert into ``async_delegations``. The snapshot of
+        ``len(passes)`` taken between phases must be exactly 1 — the initial
+        pass — because ``run_watch``'s fast path compares the ``async_delegations``
+        rows and skips the reload when only DB descriptors fired and the rows are
+        unchanged. After the real insert, at least one more pass must have run,
+        proving the fast path is a shortcut, not a permanent blind spot.
+
+        The connection is opened ``check_same_thread=False`` because the writer
+        is a separate thread. ``fake_session_alive`` stops the loop once both
+        phases have been observed, so the test ends on its own evidence rather
+        than on a fixed deadline; the 5 s deadline is only a hang guard.
         """
         import sqlite3
         home = self.base / "walhome"

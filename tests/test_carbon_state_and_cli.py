@@ -1,5 +1,35 @@
-"""Regression tests for delegation state reconciliation, manifest retention,
-stat-cached log/manifest reads, and CLI history/outside-tmux commands.
+"""State reconciliation, retention past 40 workers, and CLI reach (HX-2/3/7).
+
+Four claims, each a repair from `docs/AUDIT-AND-REPAIR-REPORT.md`:
+
+* A multi-task batch whose ``async_delegations.state`` is ``completed`` still
+  reports each task's own terminal verdict. Hermes writes that single row after
+  delivering mixed results, so a batch-level ``completed`` must not overwrite a
+  per-task ``interrupted``/``error``. The per-task verdict is read from
+  ``result_json.results`` and, failing that, from the manifest's task status.
+* An independently-completed unit row (``<did>-<k>``) applies to the task
+  indexes it names in ``task_json.task_indexes``; it must not be read as the
+  verdict for its sibling. ``state._db_row_for_task`` also carries a ``-<k>``
+  suffix fallback (``int(suffix) - 1 == task_index``, used only when no batch
+  row exists), so a unit row with no ``task_json`` is still applied by suffix to
+  its own task.
+* A still-running morning worker is never pushed out of the default 40-row
+  window by 42 newer finished delegations, and ``status --all`` /
+  ``review record`` can still reach workers past that window.
+* ``rerender`` outside tmux prints a render and creates no
+  ``sessions/nosock-unknown`` directory. The stat caches re-read only when
+  ``(st_dev, st_ino, st_size, st_mtime_ns)`` changes, and a caller mutating a
+  returned dict cannot poison them.
+
+Fixtures are real files and a real SQLite table, not mocked readers. The rules
+under test are precedence and ordering inside ``load_workers``; stubbing it
+would only assert the stub. The database fixture creates the eight columns
+``state._DESIRED_DB_COLUMNS`` selects by whitelist, so an added Hermes column
+would simply not be read rather than break these tests.
+
+CLI behaviour is exercised through a subprocess with a private ``HERMES_HOME``,
+so the assertions describe the process boundary (exit codes, JSON on stdout,
+files created) rather than an in-process call.
 """
 
 from __future__ import annotations
@@ -20,6 +50,10 @@ REPO = Path(__file__).resolve().parent.parent
 PY = sys.executable
 
 HEADER = (
+    # The writer emits five fixed lines before any event; `parse_log` does not
+    # special-case them — they simply fail the event regex and are skipped. The
+    # header is here so the fixture looks like a real transcript, not because
+    # anything parses it.
     "=== Hermes subagent live transcript ===\n"
     "delegation: {did}   task: {idx}\n"
     "goal: {goal}\n"
@@ -29,6 +63,13 @@ HEADER = (
 
 
 class StateAndCliRegressions(unittest.TestCase):
+    """One temporary ``HERMES_HOME`` per test; nothing outside it is touched.
+
+    Failures here are ordering/priority failures, so isolation is what makes
+    them reproducible: no cache from another test's paths, no repository state
+    file, no developer profile.
+    """
+
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="hx_c1c4_")
         self.home = Path(self._tmp.name)
@@ -37,6 +78,14 @@ class StateAndCliRegressions(unittest.TestCase):
         self._tmp.cleanup()
 
     def _write_deleg(self, did: str, started: str, tasks_spec: list, completed: str = None) -> Path:
+        """Write one delegation: a manifest plus one log per task, and return its dir.
+
+        ``tasks_spec`` entries carry the manifest status (and optional
+        ``exit_reason``) and the event lines appended after the header.
+        ``completed`` stamps the manifest's settlement time; it is what
+        ``_manifest_has_live_task`` reads to stop treating a status-less task as
+        live, so omitting it is how a test says "still running".
+        """
         d = self.home / "cache" / "delegation" / "live" / did
         d.mkdir(parents=True, exist_ok=True)
         tasks = []
@@ -62,6 +111,13 @@ class StateAndCliRegressions(unittest.TestCase):
         return d
 
     def _init_db(self, rows: list) -> None:
+        """Create ``async_delegations`` with the columns ``state`` reads.
+
+        ``parent_session_id``/``dispatched_at``/``completed_at`` are filled with
+        placeholders: they are selected but never influence a verdict. JSON
+        payloads default to ``{}``, which is how a test says "no result row" —
+        distinct from a malformed one only in that it parses.
+        """
         con = sqlite3.connect(str(self.home / "state.db"))
         con.execute(
             "CREATE TABLE IF NOT EXISTS async_delegations ("
@@ -125,12 +181,23 @@ class StateAndCliRegressions(unittest.TestCase):
             ],
             completed="2026-11-13 22:01:10",
         )
+        # No result_json: the DB row can only say "the batch finished". With a
+        # multi-task unit, a batch-level `completed` defers to each task's
+        # manifest status instead of being spread across the batch.
         self._init_db([{"delegation_id": "deleg_mix00002", "state": "completed"}])
         by_idx = {w.task_index: w for w in state.load_workers(self.home)}
         self.assertEqual(by_idx[0].state, "interrupted")
         self.assertEqual(by_idx[1].state, "completed")
 
     def test_independent_completion_suffixed_unit_rows_reconcile_per_task(self) -> None:
+        """Suffix rows (``-1``/``-2``) map by task index, not by delegation id.
+
+        A unit row names its tasks in ``task_json.task_indexes``. Task 0's row
+        says ``error``/``timeout`` and task 1's says ``running``; the assertion
+        is that task 0 becomes error *with its exit_reason* (the reason travels
+        with the verdict) and task 1 does not inherit it. Guessing a verdict for
+        a sibling from a single-task payload is the defect this pins.
+        """
         self._write_deleg(
             "deleg_unit0001", "2026-11-13 22:02:00",
             [
@@ -151,6 +218,15 @@ class StateAndCliRegressions(unittest.TestCase):
         self.assertEqual(by_idx[1].state, "running")
 
     def test_oldest_running_worker_survives_more_than_40_newer_completed_delegations(self) -> None:
+        """Liveness outranks recency, and ``--all``/``review`` are not blind.
+
+        Three separate limits are checked in one fixture because they share the
+        same 85-worker corpus: the default 40 must *contain* the running morning
+        worker first; ``status --all --json`` must report all 85; ``review
+        record`` must accept a worker outside the default window. The JSON count
+        is asserted on the parsed document, not on text, so a formatting change
+        cannot make it pass.
+        """
         self._write_deleg(
             "deleg_morning0", "2026-11-13 08:00:00",
             [{"goal": "Long running morning audit", "status": "running",
@@ -191,6 +267,14 @@ class StateAndCliRegressions(unittest.TestCase):
         self.assertEqual(rev.returncode, 0, rev.stdout + rev.stderr)
 
     def test_rerender_outside_tmux_does_not_create_nosock_unknown_dir(self) -> None:
+        """Outside tmux the command is a pure render: no session, no directory.
+
+        tmux is severed from the environment (``TMUX``/``TMUX_PANE`` removed)
+        rather than merely unset in the subprocess, because an inherited
+        ``$TMUX`` would make the CLI believe it is inside a session. Exit 0 plus
+        the absence of ``sessions/nosock-unknown`` is the whole assertion: the
+        bug had no other symptom than that directory appearing.
+        """
         self._write_deleg(
             "deleg_r0000001", "2026-11-13 22:00:00",
             [{"goal": "Rerender check", "status": "completed",
@@ -208,6 +292,21 @@ class StateAndCliRegressions(unittest.TestCase):
         self.assertFalse((self.home / "cache" / "hermes-tmux" / "sessions" / "nosock-unknown").exists())
 
     def test_parse_log_and_read_manifest_stat_cache_avoids_reread_and_invalidates_on_write(self) -> None:
+        """The stat cache is keyed by identity+size+mtime, and hands out copies.
+
+        Three properties: a second read of an unchanged file does no disk work;
+        mutating the returned dict does not affect the next caller (``parse_log``
+        returns a shallow copy with ``events`` emptied, ``read_manifest`` a deep
+        copy); and an append changes the signature, so the very next read sees
+        the new tool call. The last one is why size/mtime — not mtime alone —
+        are in the key.
+
+        Negative control: ``Path.read_text`` is patched to raise. Only
+        ``parse_log`` goes through it; ``read_manifest`` opens the file directly,
+        so the manifest assertion below proves the returned value is correct but
+        does *not* by itself prove no read happened. Stated here rather than
+        silently overclaimed.
+        """
         d = self._write_deleg(
             "deleg_cache001", "2026-11-13 22:00:00",
             [{"goal": "Cache test", "status": "running",
@@ -225,6 +324,8 @@ class StateAndCliRegressions(unittest.TestCase):
         first_log["tool_count"] = 999
         first_manifest["delegation_id"] = "mutated"
 
+        # Any disk read here raises. `parse_log` would re-read on a signature
+        # miss, so surviving this is the cache hit.
         with mock.patch.object(Path, "read_text", side_effect=AssertionError("unexpected disk read")):
             cached_log = state.parse_log(lp)
         self.assertEqual(cached_log["tool_count"], 1)
